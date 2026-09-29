@@ -1,10 +1,10 @@
-name: Build HyperHLE
+name: Build MetalHLE
 
 on:
   workflow_dispatch:
     inputs:
-      publish_hyperhle_release:
-        description: Publish a HyperHLE release (after all builds succeed)
+      publish_metalhle_release:
+        description: Publish a MetalHLE release (after all builds succeed)
         type: boolean
         default: false
   push:
@@ -108,7 +108,7 @@ jobs:
           
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_macOS_x86_64
+          name: MetalHLE_macOS_x86_64
           path: touchHLE.dmg
 
   build-linux:
@@ -180,7 +180,7 @@ jobs:
 
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_Linux_x86_64
+          name: MetalHLE_Linux_x86_64
           path: touchHLE_linux_bundle/
 
   build-android:
@@ -278,7 +278,7 @@ jobs:
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
 
     - name: Build for Android  
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Fork-release.apk ../HyperHLE-Fork.apk  
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/MetalHLE-2.0-release.apk ../MetalHLE-2.0.apk  
       env:  
         HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
         HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
@@ -288,8 +288,8 @@ jobs:
 
     - uses: actions/upload-artifact@main
       with:  
-        name: HyperHLE_Android_AArch64  
-        path: HyperHLE-Fork.apk
+        name: MetalHLE_Android_AArch64  
+        path: MetalHLE-2.0.apk
 
   build-win:
     runs-on: windows-2022  
@@ -332,10 +332,10 @@ jobs:
       
     - uses: actions/upload-artifact@main
       with:  
-        name: HyperHLE_Windows_x86_64  
+        name: MetalHLE_Windows_x86_64  
         path: touchHLE_windows_bundle/
 
-  check-hyperhle-release:
+  check-metalhle-release:
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/trunk') ||
@@ -351,17 +351,17 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: Check whether a HyperHLE release is due
+      - name: Check whether a MetalHLE release is due
         id: check
         env:
-          FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
-        run: ./dev-scripts/hyperhle-should-release.sh
+          FORCE_METALHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_metalhle_release && 'true' || '' }}
+        run: ./dev-scripts/metalhle-should-release.sh
 
-  publish-hyperhle-release:
-    needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win]
+  publish-metalhle-release:
+    needs: [check-metalhle-release, build-osx, build-linux, build-android, build-win]
     if: >-
-      needs.check-hyperhle-release.result == 'success' &&
-      needs.check-hyperhle-release.outputs.should_release == 'true' &&
+      needs.check-metalhle-release.result == 'success' &&
+      needs.check-metalhle-release.outputs.should_release == 'true' &&
       needs.build-osx.result == 'success' &&
       needs.build-linux.result == 'success' &&
       needs.build-android.result == 'success' &&
@@ -379,39 +379,39 @@ jobs:
       - name: Download macOS artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_macOS_x86_64
+          name: MetalHLE_macOS_x86_64
           path: artifacts/macos
       - name: Download Android artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Android_AArch64
+          name: MetalHLE_Android_AArch64
           path: artifacts/android
       - name: Download Windows artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Windows_x86_64
+          name: MetalHLE_Windows_x86_64
           path: artifacts/windows
       - name: Download Linux artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Linux_x86_64
+          name: MetalHLE_Linux_x86_64
           path: artifacts/linux
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
-      - name: Package HyperHLE release files
+      - name: Package MetalHLE release files
         env:
           GITHUB_SERVER_URL: ${{ github.server_url }}
-          FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
-          VERSION: ${{ needs.check-hyperhle-release.outputs.version }}
-          CHANGELOG_FROM: ${{ needs.check-hyperhle-release.outputs.changelog_from }}
-          CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
-        run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
-      - name: Publish HyperHLE release
+          FORCE_METALHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_metalhle_release && 'true' || '' }}
+          VERSION: ${{ needs.check-metalhle-release.outputs.version }}
+          CHANGELOG_FROM: ${{ needs.check-metalhle-release.outputs.changelog_from }}
+          CHANGELOG_LIMIT: ${{ needs.check-metalhle-release.outputs.changelog_limit }}
+        run: ./dev-scripts/package-metalhle-release.sh "$VERSION" "$CHANGELOG_FROM"
+      - name: Publish MetalHLE release
         uses: softprops/action-gh-release@master
         with:
-          tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
-          name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}
+          tag_name: ${{ needs.check-metalhle-release.outputs.version }}
+          name: MetalHLE ${{ needs.check-metalhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
           files: |
-            release/HyperHLE_*.zip
+            release/MetalHLE_*.zip
           fail_on_unmatched_files: true

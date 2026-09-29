@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated tap-sequence smoke test for touchHLE/HyperHLE on Windows and Linux/X11.
+"""Automated tap-sequence smoke test for touchHLE/MetalHLE on Windows and Linux/X11.
 
 Launches the emulator with --print-fps, performs a sequence of taps at
 coordinates relative to the emulator window, captures screenshots and checks

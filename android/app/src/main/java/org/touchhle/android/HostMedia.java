@@ -193,7 +193,7 @@ public class HostMedia {
             }
             final CountDownLatch done = new CountDownLatch(1);
             final AtomicReference<byte[]> photo = new AtomicReference<byte[]>(null);
-            HandlerThread ht = new HandlerThread("HyperHLECamera");
+            HandlerThread ht = new HandlerThread("MetalHLECamera");
             ht.start();
             final Handler handler = new Handler(ht.getLooper());
 
@@ -397,7 +397,7 @@ public class HostMedia {
                         }
                     }
                 }
-            }, "HyperHLE-Mic");
+            }, "MetalHLE-Mic");
             micThread.start();
             return true;
         } catch (Throwable t) {

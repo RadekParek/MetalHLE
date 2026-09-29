@@ -85,7 +85,7 @@
 
         <!--
           Note: the platform's `com.android.graphics.driver.prefer_angle`
-          opt-in is deliberately NOT declared. HyperHLE uses its bundled ANGLE
+          opt-in is deliberately NOT declared. MetalHLE uses its bundled ANGLE
           libraries directly whenever they are available; see
           `configure_android_angle_driver` in `src/window.rs`. Declaring the
           platform opt-in could substitute the system's ANGLE driver on

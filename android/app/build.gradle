@@ -47,13 +47,13 @@ def getTouchHLEVersionCode() {
 
 
 
-def hyperHLEKeystoreFile = System.getenv('HYPERHLE_KEYSTORE_FILE')
-def hyperHLEKeystoreB64 = System.getenv('HYPERHLE_KEYSTORE_B64')
-def hyperHLEUsesExternalKey = (hyperHLEKeystoreB64 != null && !hyperHLEKeystoreB64.trim().isEmpty()) || (hyperHLEKeystoreFile != null && !hyperHLEKeystoreFile.trim().isEmpty())
-def hyperHLEKeystorePass = System.getenv('HYPERHLE_KEYSTORE_PASSWORD') ?: 'hyperhle'
-def hyperHLEKeyAlias = System.getenv('HYPERHLE_KEY_ALIAS') ?: 'hyperhle'
-def hyperHLECommittedKeystore = file("${rootDir}/keystore/release.keystore")
-def hyperHLEHasReleaseKey = hyperHLEUsesExternalKey || hyperHLECommittedKeystore.exists()
+def metalhleKeystoreFile = System.getenv('HYPERHLE_KEYSTORE_FILE')
+def metalhleKeystoreB64 = System.getenv('HYPERHLE_KEYSTORE_B64')
+def metalhleUsesExternalKey = (metalhleKeystoreB64 != null && !metalhleKeystoreB64.trim().isEmpty()) || (metalhleKeystoreFile != null && !metalhleKeystoreFile.trim().isEmpty())
+def metalhleKeystorePass = System.getenv('HYPERHLE_KEYSTORE_PASSWORD') ?: 'hyperhle'
+def metalhleKeyAlias = System.getenv('HYPERHLE_KEY_ALIAS') ?: 'hyperhle'
+def metalhleCommittedKeystore = file("${rootDir}/keystore/release.keystore")
+def metalhleHasReleaseKey = metalhleUsesExternalKey || metalhleCommittedKeystore.exists()
 
 
 android {
@@ -61,19 +61,19 @@ android {
     compileSdkVersion 35
     signingConfigs {
         release {
-            if (hyperHLEKeystoreB64 != null && !hyperHLEKeystoreB64.trim().isEmpty()) {
-                def tmp = File.createTempFile('hyperhle', '.keystore')
-                tmp.bytes = hyperHLEKeystoreB64.decodeBase64()
+            if (metalhleKeystoreB64 != null && !metalhleKeystoreB64.trim().isEmpty()) {
+                def tmp = File.createTempFile('metalhle', '.keystore')
+                tmp.bytes = metalhleKeystoreB64.decodeBase64()
                 storeFile tmp
-            } else if (hyperHLEKeystoreFile != null && !hyperHLEKeystoreFile.trim().isEmpty()) {
-                storeFile file(hyperHLEKeystoreFile)
-            } else if (hyperHLECommittedKeystore.exists()) {
-                storeFile hyperHLECommittedKeystore
+            } else if (metalhleKeystoreFile != null && !metalhleKeystoreFile.trim().isEmpty()) {
+                storeFile file(metalhleKeystoreFile)
+            } else if (metalhleCommittedKeystore.exists()) {
+                storeFile metalhleCommittedKeystore
             }
-            if (hyperHLEHasReleaseKey) {
-                storePassword hyperHLEKeystorePass
-                keyAlias hyperHLEKeyAlias
-                keyPassword hyperHLEKeystorePass
+            if (metalhleHasReleaseKey) {
+                storePassword metalhleKeystorePass
+                keyAlias metalhleKeyAlias
+                keyPassword metalhleKeystorePass
             }
         }
         debug {
@@ -121,7 +121,7 @@ android {
     }
     buildTypes {
         release {
-            if (hyperHLEHasReleaseKey) {
+            if (metalhleHasReleaseKey) {
                 signingConfig signingConfigs.release
             } else {
                 signingConfig signingConfigs.debug
@@ -142,7 +142,7 @@ android {
         tasks["merge${variant.name.capitalize()}Assets"]
                 .dependsOn("externalNativeBuild${variant.name.capitalize()}")
         variant.outputs.all { output ->
-            outputFileName = "HyperHLE-Fork-${variant.name}.apk"
+            outputFileName = "MetalHLE-2.0-${variant.name}.apk"
         }
     }
 

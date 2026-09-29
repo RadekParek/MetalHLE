@@ -1,5 +1,5 @@
 #!/bin/sh
-# Package HyperHLE release zips and write release notes for action-gh-release.
+# Package MetalHLE release zips and write release notes for action-gh-release.
 set -eu
 
 VERSION="$1"
@@ -37,7 +37,7 @@ done
 
 macos_dmg=""
 for candidate in \
-    artifacts/macos/HyperHLE.dmg \
+    artifacts/macos/MetalHLE.dmg \
     artifacts/macos/touchHLE.dmg
 do
     if [ -e "$candidate" ]; then
@@ -48,7 +48,7 @@ done
 
 android_apk=""
 for candidate in \
-    artifacts/android/HyperHLE-Fork.apk \
+    artifacts/android/MetalHLE-2.0.apk \
     artifacts/android/touchHLE.apk
 do
     if [ -e "$candidate" ]; then
@@ -75,7 +75,7 @@ fi
 if [ -z "$CHANGELOG_FROM" ]; then
     patch="${VERSION#v1.0.}"
     if [ "$patch" = "0" ]; then
-        CHANGELOG_FROM="$(git rev-list -n 1 HEAD -- dev-scripts/hyperhle-should-release.sh)"
+        CHANGELOG_FROM="$(git rev-list -n 1 HEAD -- dev-scripts/metalhle-should-release.sh)"
     else
         CHANGELOG_FROM="v1.0.$((patch - 1))"
     fi
@@ -85,8 +85,8 @@ rm -rf release
 mkdir -p release
 
 {
-    printf '%s\n\n' "HyperHLE ${VERSION}"
-    if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
+    printf '%s\n\n' "MetalHLE ${VERSION}"
+    if [ "${FORCE_METALHLE_RELEASE:-}" = "true" ]; then
         printf '%s\n\n' "_Manual release — changelog shows the latest 5 commits._"
     fi
     printf '%s\n\n' "## Changelog"
@@ -124,7 +124,7 @@ mkdir -p release
 cd "$ROOT/dev-scripts"
 ./prepare-release.sh --prepare-files
 
-prefix="HyperHLE"
+prefix="MetalHLE"
 
 ./prepare-release.sh --create-zip-macos "$ROOT/$macos_dmg" \
     -o "$ROOT/release/${prefix}_macOS_x86_64.zip"
