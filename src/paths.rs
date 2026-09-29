@@ -101,9 +101,9 @@ pub const USER_OPTIONS_FILE: &str = "touchHLE_options.txt";
 /// Names of files the user can put a wallpaper image (for the app picker) in.
 #[allow(unused)]
 pub const WALLPAPER_FILES: &[&str] = &[
-    "touchHLE_wallpaper.png",
-    "touchHLE_wallpaper.jpg",
-    "touchHLE_wallpaper.jpeg",
+    "MetalHLE_wallpaper.png",
+    "MetalHLE_wallpaper.jpg",
+    "MetalHLE_wallpaper.jpeg",
 ];
 
 /// Name of the directory where touchHLE will store sandboxed app data, e.g.

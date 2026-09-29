@@ -481,8 +481,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     echo!();
     // Apply command-line options
     for option_arg in option_args {
-        let parse_result = options.parse_argument(&option_arg);
-        assert!(parse_result == Ok(true));
+        match options.parse_argument(&option_arg) {
+            Ok(true) => (),
+            Ok(false) => log!("Warning: ignoring unknown option {option_arg:?}"),
+            Err(error) => log!("Warning: ignoring invalid option {option_arg:?}: {error}"),
+        }
     }
 
     // Detect the executable's architecture so ARM64 slices are routed to the
