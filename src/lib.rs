@@ -26,6 +26,7 @@
 
 #[macro_use]
 mod log;
+mod licenses;
 mod a64_abi;
 mod abi;
 mod android_media;

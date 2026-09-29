@@ -15,6 +15,8 @@ Changes are categorised as follows:
 
 ## NEXT
 
+- The app picker now matches the legacy fork's home screen: scrolling icon grid, wallpaper, Add Game / Settings / Files / About buttons with their original icons, per-app context settings (device model, scale, GL driver, orientation), and full options surface (graphics API, render rotation, audio backend, memory model, texture filtering, PVRTC decoding and more).
+
 Compatibility:
 
 - Guest DNS resolution and TCP/UDP socket handling now support IPv6 results and `AF_INET6` addresses, including IPv4-mapped IPv6 addresses.

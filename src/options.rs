@@ -89,6 +89,29 @@ impl PresentMode {
 
 /// Whether host buffer swaps wait for the display's vertical refresh
 /// (`--vsync=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VsyncMode {
+    /// Android: off (the emulator paces frames itself and the Android
+    /// compositor already synchronises to the display, so a blocking swap only
+    /// adds stalls). Other platforms: leave the driver's default alone.
+    Auto,
+    /// Swap interval 1: every swap waits for the next vertical refresh.
+    On,
+    /// Swap interval 0: swaps never block.
+    Off,
+}
+
+impl VsyncMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "on" | "1" => Ok(Self::On),
+            "off" | "0" => Ok(Self::Off),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Which graphics API (or GL context flavor) to request for rendering.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum GraphicsApi {
@@ -104,6 +127,228 @@ pub enum GraphicsApi {
     Software,
     Metal,
 }
+
+/// Rotation applied to rendered pixels without changing the emulated device orientation.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum RenderRotation {
+    Default,
+    Minus90,
+    Minus180,
+    Plus90,
+    Plus180,
+}
+
+impl Default for RenderRotation {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl RenderRotation {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().trim_end_matches('\u{00b0}') {
+            "default" => Ok(Self::Default),
+            "-90" => Ok(Self::Minus90),
+            "-180" => Ok(Self::Minus180),
+            "90" => Ok(Self::Plus90),
+            "180" => Ok(Self::Plus180),
+            _ => Err(format!(
+                "Invalid render rotation {value:?}; expected default, -90, -180, 90, or 180"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Minus90 => "-90\u{00b0}",
+            Self::Minus180 => "-180\u{00b0}",
+            Self::Plus90 => "90\u{00b0}",
+            Self::Plus180 => "180\u{00b0}",
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum GlesOverrideVersion {
+    Default,
+    Gles10,
+    Gles11,
+    Gles20,
+    Gles30,
+    Gles31,
+    Gles32,
+    Metal,
+}
+
+impl GlesOverrideVersion {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "gles1.0" | "gles10" => Ok(Self::Gles10),
+            "gles1.1" | "gles11" => Ok(Self::Gles11),
+            "gles2" | "gles2.0" | "gles20" => Ok(Self::Gles20),
+            "gles3.0" | "gles30" => Ok(Self::Gles30),
+            "gles3.1" | "gles31" => Ok(Self::Gles31),
+            "gles3.2" | "gles32" => Ok(Self::Gles32),
+            "metal" => Ok(Self::Metal),
+            _ => Err(format!("Invalid GLES override version {value:?}")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Gles10 => "gles1.0",
+            Self::Gles11 => "gles1.1",
+            Self::Gles20 => "gles2",
+            Self::Gles30 => "3.0",
+            Self::Gles31 => "3.1",
+            Self::Gles32 => "3.2",
+            Self::Metal => "Metal",
+        }
+    }
+
+    pub fn graphics_api(self) -> GraphicsApi {
+        match self {
+            Self::Default => GraphicsApi::Default,
+            Self::Gles10 => GraphicsApi::GLES10,
+            Self::Gles11 => GraphicsApi::GLES11,
+            Self::Gles20 => GraphicsApi::GLES20,
+            Self::Gles30 | Self::Gles31 | Self::Gles32 => GraphicsApi::GLES30,
+            Self::Metal => GraphicsApi::Metal,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PvrtcDecoding {
+    Software,
+    Auto,
+    Driver,
+}
+
+impl Default for PvrtcDecoding {
+    fn default() -> Self {
+        Self::Software
+    }
+}
+
+impl PvrtcDecoding {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "software" | "cpu" | "decode" => Ok(Self::Software),
+            "auto" | "automatic" => Ok(Self::Auto),
+            "driver" | "native" => Ok(Self::Driver),
+            _ => Err(format!("Invalid PVRTC decoding mode {value:?}")),
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::Auto => "auto",
+            Self::Driver => "driver",
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum AudioBackend {
+    Default,
+    CoreAudio,
+    OpenSlEs,
+    AAudio,
+}
+
+impl AudioBackend {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "core" | "coreaudio" | "core-audio" => Ok(Self::CoreAudio),
+            "opensl-es" | "opensles" | "open-sl-es" => Ok(Self::OpenSlEs),
+            "aaudio" => Ok(Self::AAudio),
+            _ => Err(format!("Invalid audio backend {value:?}")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::CoreAudio => "Core audio",
+            Self::OpenSlEs => "OpenSL ES",
+            Self::AAudio => "AAudio",
+        }
+    }
+
+    pub fn driver_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::CoreAudio => "core",
+            Self::OpenSlEs => "opensl",
+            Self::AAudio => "aaudio",
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TextureFiltering {
+    Default,
+    Bilinear,
+    Trilinear,
+    Anisotropic,
+}
+
+impl TextureFiltering {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "bilinear" => Ok(Self::Bilinear),
+            "trilinear" => Ok(Self::Trilinear),
+            "anisotropic" | "anistropic" => Ok(Self::Anisotropic),
+            _ => Err(format!("Invalid texture filtering {value:?}")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bilinear => "bilinear",
+            Self::Trilinear => "trilinear",
+            Self::Anisotropic => "anisotropic",
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MemoryManagement {
+    Light,
+    Balanced,
+    Aggressive,
+}
+
+impl MemoryManagement {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "light" => Ok(Self::Light),
+            "balanced" => Ok(Self::Balanced),
+            "aggressive" | "aggresive" => Ok(Self::Aggressive),
+            _ => Err(format!("Invalid memory management mode {value:?}")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Balanced => "balanced",
+            Self::Aggressive => "aggressive",
+        }
+    }
+}
+
+pub const DEFAULT_HIGH_PERFORMANCE: bool = true;
+pub const DEFAULT_FORCE_MAX_CLOCKS: bool = true;
+pub const DEFAULT_FAST_MEMORY: bool = true;
 
 impl Default for GraphicsApi {
     fn default() -> Self {
@@ -142,29 +387,6 @@ impl GraphicsApi {
             Self::Vulkan => "Vulkan",
             Self::Software => "Software rendering",
             Self::Metal => "Metal compatibility",
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum VsyncMode {
-    /// Android: off (the emulator paces frames itself and the Android
-    /// compositor already synchronises to the display, so a blocking swap only
-    /// adds stalls). Other platforms: leave the driver's default alone.
-    Auto,
-    /// Swap interval 1: every swap waits for the next vertical refresh.
-    On,
-    /// Swap interval 0: swaps never block.
-    Off,
-}
-
-impl VsyncMode {
-    pub fn from_short_name(name: &str) -> Result<Self, ()> {
-        match name {
-            "auto" => Ok(Self::Auto),
-            "on" | "1" => Ok(Self::On),
-            "off" | "0" => Ok(Self::Off),
-            _ => Err(()),
         }
     }
 }
@@ -273,6 +495,18 @@ pub struct Options {
     pub force_composition: bool,
     pub graphics_api: GraphicsApi,
     pub metal_translator: bool,
+    pub render_rotation: RenderRotation,
+    pub audio_backend: AudioBackend,
+    pub gles_override_version: GlesOverrideVersion,
+    pub fast_memory: bool,
+    pub high_performance: bool,
+    pub force_max_clocks: bool,
+    pub texture_filtering: TextureFiltering,
+    pub pvrtc_decoding: PvrtcDecoding,
+    pub memory_management: MemoryManagement,
+    pub angle_driver: bool,
+    pub llvmpipe_fallback: bool,
+    pub custom_driver: Option<std::path::PathBuf>,
     pub custom_screen_size: Option<(u32, u32)>,
     pub verbose_logging: bool,
     /// Run the app's ARM64 slice in the 64-bit loader instead of failing.
@@ -414,6 +648,18 @@ impl Default for Options {
             force_composition: false,
             graphics_api: GraphicsApi::Default,
             metal_translator: false,
+            render_rotation: RenderRotation::default(),
+            audio_backend: AudioBackend::Default,
+            gles_override_version: GlesOverrideVersion::Default,
+            fast_memory: DEFAULT_FAST_MEMORY,
+            high_performance: DEFAULT_HIGH_PERFORMANCE,
+            force_max_clocks: DEFAULT_FORCE_MAX_CLOCKS,
+            texture_filtering: TextureFiltering::Default,
+            pvrtc_decoding: PvrtcDecoding::default(),
+            memory_management: MemoryManagement::Balanced,
+            angle_driver: false,
+            llvmpipe_fallback: false,
+            custom_driver: None,
             custom_screen_size: None,
             verbose_logging: false,
             force_64_bit: false,
@@ -677,8 +923,40 @@ impl Options {
             let api = GraphicsApi::from_short_name(value)
                 .map_err(|_| "Unrecognized --graphics-api= value".to_string())?;
             self.graphics_api = api;
+        } else if let Some(value) = arg.strip_prefix("--render-rotation=") {
+            self.render_rotation = RenderRotation::parse(value)?;
         } else if arg == "--metal-translator" {
             self.metal_translator = true;
+        } else if let Some(value) = arg.strip_prefix("--render-rotation=") {
+            self.render_rotation = RenderRotation::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--gles-override=") {
+            self.gles_override_version = GlesOverrideVersion::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--audio-backend=") {
+            self.audio_backend = AudioBackend::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--texture-filtering=") {
+            self.texture_filtering = TextureFiltering::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--pvrtc-decoding=") {
+            self.pvrtc_decoding = PvrtcDecoding::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--memory-management=") {
+            self.memory_management = MemoryManagement::parse(value)?;
+        } else if arg == "--high-performance" {
+            self.high_performance = true;
+        } else if arg == "--no-high-performance" {
+            self.high_performance = false;
+        } else if arg == "--force-max-clocks" {
+            self.force_max_clocks = true;
+        } else if arg == "--no-force-max-clocks" {
+            self.force_max_clocks = false;
+        } else if arg == "--fast-memory" {
+            self.fast_memory = true;
+        } else if arg == "--no-fast-memory" {
+            self.fast_memory = false;
+        } else if arg == "--angle-driver" {
+            self.angle_driver = true;
+        } else if arg == "--llvmpipe-fallback" {
+            self.llvmpipe_fallback = true;
+        } else if let Some(value) = arg.strip_prefix("--custom-driver=") {
+            self.custom_driver = Some(std::path::PathBuf::from(value));
         } else if arg == "--disable-metal-translator" {
             self.metal_translator = false;
         } else if let Some(value) = arg.strip_prefix("--custom-resolution=") {

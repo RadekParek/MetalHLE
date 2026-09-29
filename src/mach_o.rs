@@ -396,6 +396,22 @@ fn validate_segment_ranges(commands: &[MachCommand], file_len: usize) -> Result<
     Ok(())
 }
 
+pub fn has_both_arm_slices(bytes: &[u8]) -> bool {
+    let mut cursor = Cursor::new(bytes);
+    match OFile::parse(&mut cursor) {
+        Ok(OFile::FatFile { files, .. }) => {
+            let has_arm32 = files
+                .iter()
+                .any(|(arch, _)| arch.cputype == mach_object::CPU_TYPE_ARM);
+            let has_arm64 = files
+                .iter()
+                .any(|(arch, _)| arch.cputype == mach_object::CPU_TYPE_ARM64);
+            has_arm32 && has_arm64
+        }
+        _ => false,
+    }
+}
+
 impl MachO {
     /// Load the all the sections from a Mach-O binary (provided as `bytes`)
     /// into the guest memory (`into_mem`), and return a struct containing

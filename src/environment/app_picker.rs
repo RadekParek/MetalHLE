@@ -1,4 +1,7 @@
 //! App picker GUI.
+//!
+//! This also includes a license text viewer. The license text viewer is needed
+//! on Android, where the command-line way to view license text doesn't exist.
 
 use crate::bundle::Bundle;
 use crate::frameworks::core_graphics::cg_bitmap_context::{
@@ -6,8 +9,8 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
 };
 use crate::frameworks::core_graphics::cg_color_space::CGColorSpaceCreateDeviceRGB;
 use crate::frameworks::core_graphics::cg_context::{
-    CGContextFillRect, CGContextRelease, CGContextRestoreGState, CGContextSaveGState,
-    CGContextScaleCTM, CGContextSetRGBFillColor, CGContextTranslateCTM,
+    CGContextFillRect, CGContextRelease, CGContextScaleCTM, CGContextSetRGBFillColor,
+    CGContextTranslateCTM,
 };
 use crate::frameworks::core_graphics::cg_image::{self, kCGImageAlphaPremultipliedLast};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
@@ -29,17 +32,20 @@ use crate::image::Image;
 use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
 use crate::options::Options;
+use crate::options::RenderRotation;
 use crate::paths;
 use crate::window::DeviceOrientation;
 use crate::Environment;
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::num::NonZeroU32;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 struct AppInfo {
     path: PathBuf,
+    /// Set when the app's executable is a fat binary containing both ARM32
+    /// and ARM64 slices; the picker then asks which one to launch.
+    fat_both: bool,
     display_name: String,
     icon: Option<Image>,
     /// `NSString*`
@@ -70,10 +76,32 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
     let mut apps = Vec::new();
     let mut directories = vec![apps_dir.to_path_buf()];
     while let Some(directory) = directories.pop() {
-        for entry in std::fs::read_dir(directory)? {
-            let app_path = entry?.path();
+        let mut entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>().unwrap_or_else(|e| {
+                log!(
+                    "Warning: couldn't finish reading game directory {}: {}",
+                    directory.display(),
+                    e
+                );
+                Vec::new()
+            }),
+            Err(e) => {
+                log!(
+                    "Warning: couldn't read game directory {}: {}",
+                    directory.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let app_path = entry.path();
             let extension = app_path.extension();
-            if extension == Some(OsStr::new("app")) || extension == Some(OsStr::new("ipa")) {
+            if extension
+                .map(|ext| ext.eq_ignore_ascii_case("app") || ext.eq_ignore_ascii_case("ipa"))
+                .unwrap_or(false)
+            {
                 let (bundle, fs) = match BundleData::open_any(&app_path).and_then(|bundle_data| {
                     Bundle::new_bundle_and_fs_from_host_path(
                         bundle_data,
@@ -82,16 +110,32 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
                 }) {
                     Ok(ok) => ok,
                     Err(e) => {
-                        log!(
-                            "Warning: couldn't open app bundle {}: {} (skipping)",
-                            app_path.display(),
-                            e
-                        );
+                        if app_path
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("ipa"))
+                            && e.to_string().contains("invalid Zip archive")
+                        {
+                            log_once_fmt!(
+                                "Warning: skipping incomplete or corrupted IPA {} (replace it with a complete copy)",
+                                app_path.display()
+                            );
+                        } else {
+                            log!(
+                                "Warning: couldn't open app bundle {}: {} (skipping)",
+                                app_path.display(),
+                                e
+                            );
+                        }
                         continue;
                     }
                 };
 
                 let display_name = bundle.display_name().to_owned();
+                let fat_both = fs
+                    .read(bundle.executable_path())
+                    .map(|bytes| crate::mach_o::has_both_arm_slices(&bytes))
+                    .unwrap_or(false);
+
                 let icon = match bundle.load_icon(&fs) {
                     Ok(icon) => Some(icon),
                     Err(e) => {
@@ -102,6 +146,7 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
 
                 apps.push(AppInfo {
                     path: app_path,
+                    fat_both,
                     display_name,
                     icon,
                     display_name_ns_string: None,
@@ -117,32 +162,36 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
     Ok(apps)
 }
 
-/// Watch state for detecting a newly copied-in .ipa file.
-struct IpaWatch {
-    last_seen: Vec<(String, u64)>,
-    dirty: bool,
-    last_change: Option<Instant>,
-}
-
-/// List the .ipa files directly inside the apps directory, as (name, size).
-///
-/// The size matters: a file that is still being copied grows, and must not
-/// be opened until it is complete. This is cheap enough to poll every
-/// run-loop iteration, unlike a full [enumerate_apps], which opens every
-/// app bundle.
-fn list_top_level_ipa_files(apps_dir: &Path) -> Vec<(String, u64)> {
+fn list_top_level_ipa_files(apps_dir: &Path) -> Vec<(String, u64, u128)> {
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(apps_dir) {
+    let mut directories = vec![apps_dir.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension() == Some(OsStr::new("ipa")) {
+            let is_directory = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+            let is_game_entry = path.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("ipa") || ext.eq_ignore_ascii_case("app")
+            });
+            if is_game_entry {
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_nanos());
                 let name = path
-                    .file_name()
-                    .unwrap_or_default()
+                    .strip_prefix(apps_dir)
+                    .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                files.push((name, size));
+                files.push((name, metadata.len(), modified));
+            } else if is_directory {
+                directories.push(path);
             }
         }
     }
@@ -150,45 +199,217 @@ fn list_top_level_ipa_files(apps_dir: &Path) -> Vec<(String, u64)> {
     files
 }
 
-/// How long the .ipa listing must stay unchanged before the app grid is
-/// refreshed, so that a file that is still being copied is left alone.
+struct IpaWatch {
+    last_seen: Vec<(String, u64, u128)>,
+    dirty: bool,
+    last_change: Option<Instant>,
+}
+
 const IPA_COPY_SETTLE_TIME: Duration = Duration::from_millis(500);
 
-/// Tag set on the app-picker's icon `UIScrollView` so the shared delegate can
-/// tell it apart from any other scroll view routed to the same callbacks.
-const ICON_SCROLL_TAG: NSInteger = 0x5248;
+const IOS_VERSION_ENTRIES: &[(&str, i32)] = &[
+    ("Latest (iOS 26.6)", 0),
+    ("iOS 2.0", 1),
+    ("iOS 3.0", 2),
+    ("iOS 4.3", 3),
+    ("iOS 5.1", 4),
+    ("iOS 6.1", 5),
+    ("iOS 7.1", 6),
+    ("iOS 8.4", 7),
+    ("iOS 9.3", 8),
+    ("iOS 10.3", 9),
+    ("iOS 11.4", 10),
+    ("iOS 12.4.1", 11),
+    ("iOS 13.7", 12),
+    ("iOS 14.8.1", 13),
+    ("iOS 15.8.8", 14),
+    ("iOS 16.7.16", 15),
+    ("iOS 17.7.11", 16),
+    ("iOS 18.7.9", 17),
+    ("iOS 26.6", 18),
+];
+
+const TEXTURE_FILTERING_ENTRIES: &[(&str, crate::options::TextureFiltering)] = &[
+    ("default", crate::options::TextureFiltering::Default),
+    ("bilinear", crate::options::TextureFiltering::Bilinear),
+    ("trilinear", crate::options::TextureFiltering::Trilinear),
+    ("anisotropic", crate::options::TextureFiltering::Anisotropic),
+];
+const MEMORY_MANAGEMENT_ENTRIES: &[(&str, crate::options::MemoryManagement)] = &[
+    ("light", crate::options::MemoryManagement::Light),
+    ("balanced", crate::options::MemoryManagement::Balanced),
+    ("aggressive", crate::options::MemoryManagement::Aggressive),
+];
+const GLES_OVERRIDE_ENTRIES: &[(&str, crate::options::GlesOverrideVersion)] = &[
+    ("Default", crate::options::GlesOverrideVersion::Default),
+    ("gles1.0", crate::options::GlesOverrideVersion::Gles10),
+    ("gles1.1", crate::options::GlesOverrideVersion::Gles11),
+    ("gles2", crate::options::GlesOverrideVersion::Gles20),
+    ("3.0", crate::options::GlesOverrideVersion::Gles30),
+    ("3.1", crate::options::GlesOverrideVersion::Gles31),
+    ("3.2", crate::options::GlesOverrideVersion::Gles32),
+    ("Metal", crate::options::GlesOverrideVersion::Metal),
+];
+const AUDIO_BACKEND_ENTRIES: &[(&str, crate::options::AudioBackend)] = &[
+    ("default", crate::options::AudioBackend::Default),
+    ("Core audio", crate::options::AudioBackend::CoreAudio),
+    ("OpenSL ES", crate::options::AudioBackend::OpenSlEs),
+    ("AAudio", crate::options::AudioBackend::AAudio),
+];
+
+fn ios_version_for_tag(tag: i32) -> Option<(i32, i32, i32)> {
+    match tag {
+        0 => None,
+        1 => Some((2, 0, 0)),
+        2 => Some((3, 0, 0)),
+        3 => Some((4, 3, 0)),
+        4 => Some((5, 1, 0)),
+        5 => Some((6, 1, 0)),
+        6 => Some((7, 1, 0)),
+        7 => Some((8, 4, 0)),
+        8 => Some((9, 3, 0)),
+        9 => Some((10, 3, 0)),
+        10 => Some((11, 4, 0)),
+        11 => Some((12, 4, 1)),
+        12 => Some((13, 7, 0)),
+        13 => Some((14, 8, 1)),
+        14 => Some((15, 8, 8)),
+        15 => Some((16, 7, 16)),
+        16 => Some((17, 7, 11)),
+        17 => Some((18, 7, 9)),
+        18 => Some((26, 6, 0)),
+        _ => None,
+    }
+}
+
+fn ios_version_tag(value: Option<(i32, i32, i32)>) -> i32 {
+    match value {
+        None => 0,
+        Some((2, 0, 0)) => 1,
+        Some((3, 0, 0)) => 2,
+        Some((4, 3, 0)) => 3,
+        Some((5, 1, 0)) => 4,
+        Some((6, 1, 0)) => 5,
+        Some((7, 1, 0)) => 6,
+        Some((8, 4, 0)) => 7,
+        Some((9, 3, 0)) => 8,
+        Some((10, 3, 0)) => 9,
+        Some((11, 4, 0)) => 10,
+        Some((12, 4, 1)) => 11,
+        Some((13, 7, 0)) => 12,
+        Some((14, 8, 1)) => 13,
+        Some((15, 8, 8)) => 14,
+        Some((16, 7, 16)) => 15,
+        Some((17, 7, 11)) => 16,
+        Some((18, 7, 9)) => 17,
+        Some((26, 6, 0)) => 18,
+        _ => 0,
+    }
+}
+
+fn ios_version_label(value: Option<(i32, i32, i32)>) -> String {
+    let tag = ios_version_tag(value);
+    IOS_VERSION_ENTRIES
+        .iter()
+        .find(|(_, entry_tag)| *entry_tag == tag)
+        .map(|(label, _)| (*label).to_string())
+        .unwrap_or_else(|| "Latest (iOS 26.6)".to_string())
+}
 
 #[derive(Default)]
 struct AppPickerDelegateHostObject {
     icon_tapped: id,
-    /// Set by the icon scroll view's delegate callbacks: the page the user
-    /// swiped to (`None` when no swipe happened since the last poll).
     icon_scroll_page: Option<usize>,
-    // Set by the add-app tile; kept separately from icon_tapped because the
-    // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
+    /// Architecture-chooser choice: `Some(true)` = ARM64, `Some(false)` = ARM32.
+    arch_pick: Option<bool>,
+    arch_cancel: bool,
+    copyright_show: bool,
+    copyright_hide: bool,
+    copyright_prev: bool,
+    copyright_next: bool,
     quick_options_show: bool,
     quick_options_hide: bool,
+    settings_category: Option<usize>,
+    custom_driver_menu_toggle: bool,
+    custom_driver_selected: Option<i32>,
+    custom_driver_enabled: Option<bool>,
     scale_hack_default: bool,
     scale_hack1: bool,
+    scale_hack_half: bool,
+    scale_hack_three_quarters: bool,
     scale_hack2: bool,
     scale_hack3: bool,
     scale_hack4: bool,
+    custom_resolution: bool,
+    custom_resolution_custom: bool,
+    custom_driver_folder: bool,
+    custom_resolution_apply: bool,
+    custom_resolution_cancel: bool,
+    supported_resolution: Option<i32>,
     orientation_default: bool,
     orientation_landscape_left: bool,
     orientation_landscape_right: bool,
     orientation_portrait_upside_down: bool,
+    render_rotation: Option<RenderRotation>,
+    revert_x_axis: Option<bool>,
+    revert_y_axis: Option<bool>,
     analog_stick_tilt_controls: Option<bool>,
     network: Option<bool>,
-    show_fps: Option<bool>,
     cheat_engine: Option<bool>,
-    trace_gl_errors: Option<bool>,
-    gles_native: Option<bool>,
+    rtcs: Option<bool>,
+    /// Quick option: show FPS counter (maps to --print-fps)
+    show_fps: Option<bool>,
+    frame_pacing: Option<bool>,
+    fps_limit: Option<Option<f64>>,
+    vsync: Option<bool>,
+    battery_saver: Option<bool>,
+    ultra_battery_saver: Option<bool>,
+    frame_generation: Option<bool>,
+    skip_intros: Option<bool>,
+    high_performance: Option<bool>,
+    force_max_clocks: Option<bool>,
     fullscreen: Option<bool>,
+    fullscreen_stretched: Option<bool>,
+    angle_driver: Option<bool>,
+    log_file: Option<bool>,
+    trace_gl_errors: Option<bool>,
+    verbose_logging: Option<bool>,
+    shader_compatibility_fixes: Option<bool>,
+    fix_texture_min_filter: Option<bool>,
+    force_composition: Option<bool>,
+    fast_memory: Option<bool>,
+    force_32_bit: Option<bool>,
+    force_64_bit: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
     device_model_scroll_up: bool,
     device_model_scroll_down: bool,
+    apps_refresh_requested: bool,
+    ios_version_toggle: bool,
+    ios_version: Option<Option<(i32, i32, i32)>>,
+    core_audio: Option<bool>,
+    low_audio_quality: Option<bool>,
+    audio_backend_toggle: bool,
+    audio_backend: Option<crate::options::AudioBackend>,
+    graphics_api_toggle: bool,
+    graphics_api: Option<crate::options::GraphicsApi>,
+    gles_override_toggle: bool,
+    gles_override_version: Option<crate::options::GlesOverrideVersion>,
+    texture_filtering_toggle: bool,
+    texture_filtering: Option<crate::options::TextureFiltering>,
+    pvrtc_decoding: Option<crate::options::PvrtcDecoding>,
+    memory_management_toggle: bool,
+    memory_management: Option<crate::options::MemoryManagement>,
+    arm64_backend: Option<crate::options::Arm64Backend>,
+    arm64_fallback: Option<crate::options::Arm64Fallback>,
+    llvmpipe_fallback: Option<bool>,
+    metal_translator: Option<bool>,
+    software_rendering: Option<bool>,
+    anisotropic_filtering: Option<u8>,
+    texture_upscaler: Option<u8>,
+    no_texture_compression: Option<bool>,
+    anti_aliasing: Option<u8>,
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
@@ -220,6 +441,7 @@ const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())scrollViewDidScroll:(id)scroll_view {
+    const ICON_SCROLL_TAG: NSInteger = 0x5248;
     let tag: NSInteger = msg![env; scroll_view tag];
     if tag != ICON_SCROLL_TAG {
         return;
@@ -230,17 +452,36 @@ const CLASSES: ClassExports = objc_classes! {
     }
     let offset: CGPoint = msg![env; scroll_view contentOffset];
     let page = (offset.x / bounds.size.width).round().max(0.0) as usize;
-    env.objc
-        .borrow_mut::<AppPickerDelegateHostObject>(this)
-        .icon_scroll_page = Some(page);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).icon_scroll_page = Some(page);
 }
 
 - (())scrollViewDidEndDecelerating:(id)scroll_view {
     msg![env; this scrollViewDidScroll:scroll_view]
 }
 
-- (())addIpa {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).add_ipa = true;
+- (())copyrightInfoShow {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_show = true;
+}
+- (())copyrightInfoHide {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_hide = true;
+}
+
+- (())copyrightInfoPrevPage {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_prev = true;
+}
+- (())copyrightInfoNextPage {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_next = true;
+}
+
+
+- (())archPick32 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).arch_pick = Some(false);
+}
+- (())archPick64 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).arch_pick = Some(true);
+}
+- (())archPickCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).arch_cancel = true;
 }
 
 - (())quickOptionsShow {
@@ -249,11 +490,40 @@ const CLASSES: ClassExports = objc_classes! {
 - (())quickOptionsHide {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_options_hide = true;
 }
+- (())settingsRuntime {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_category = Some(0);
+}
+- (())settingsGraphics {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_category = Some(1);
+}
+- (())settingsSystem {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_category = Some(2);
+}
+- (())settingsVideoDisplay {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_category = Some(3);
+}
+- (())customDriverToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_driver_menu_toggle = true;
+}
+- (())customDriver:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_driver_enabled = Some(switch_state);
+}
+- (())customDriverSelected:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_driver_selected = Some(tag as i32);
+}
 - (())scaleHackDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack_default = true;
 }
 - (())scaleHack1 {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack1 = true;
+}
+- (())scaleHackHalf {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack_half = true;
+}
+- (())scaleHackThreeQuarters {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack_three_quarters = true;
 }
 - (())scaleHack2 {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack2 = true;
@@ -263,6 +533,25 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())scaleHack4 {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack4 = true;
+}
+- (())customResolution {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_resolution = true;
+}
+- (())customResolutionCustom {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_resolution_custom = true;
+}
+- (())openCustomDriverFolder {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_driver_folder = true;
+}
+- (())customResolutionApply {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_resolution_apply = true;
+}
+- (())customResolutionCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).custom_resolution_cancel = true;
+}
+- (())supportedResolution:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).supported_resolution = Some(tag as i32);
 }
 - (())orientationDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_default = true;
@@ -276,6 +565,29 @@ const CLASSES: ClassExports = objc_classes! {
 - (())orientationPortraitUpsideDown {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_portrait_upside_down = true;
 }
+- (())renderRotationDefault {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).render_rotation = Some(RenderRotation::Default);
+}
+- (())renderRotationMinus90 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).render_rotation = Some(RenderRotation::Minus90);
+}
+- (())renderRotationMinus180 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).render_rotation = Some(RenderRotation::Minus180);
+}
+- (())renderRotationPlus90 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).render_rotation = Some(RenderRotation::Plus90);
+}
+- (())renderRotationPlus180 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).render_rotation = Some(RenderRotation::Plus180);
+}
+- (())revertXAxis:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).revert_x_axis = Some(switch_state);
+}
+- (())revertYAxis:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).revert_y_axis = Some(switch_state);
+}
 - (())analogStickTiltControls:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).analog_stick_tilt_controls = Some(switch_state);
@@ -284,20 +596,17 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).network = Some(switch_state);
 }
-- (())traceGLErrors:(id)switch { // UISwitch*
+- (())cheatEngine:(id)switch {
     let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).trace_gl_errors = Some(switch_state);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).cheat_engine = Some(switch_state);
 }
-- (())glesNative:(id)switch { // UISwitch*
+- (())rtcs:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_native = Some(switch_state);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).rtcs = Some(switch_state);
 }
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).show_fps = Some(switch_state);
-    // Immediately reflect the runtime change so users see the overlay without
-    // having to re-launch or wait for the option to be applied.
-    // SAFETY: calling into the runtime-level API is safe from the UI thread.
     if switch_state {
         std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
         crate::gles::present::set_onscreen_fps_enabled(true);
@@ -306,13 +615,89 @@ const CLASSES: ClassExports = objc_classes! {
         crate::gles::present::set_onscreen_fps_enabled(false);
     }
 }
-- (())cheatEngine:(id)switch { // UISwitch*
+- (())framePacing:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).cheat_engine = Some(switch_state);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).frame_pacing = Some(switch_state);
+}
+- (())fpsLimitDynamic {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fps_limit = Some(None);
+}
+- (())fpsLimit30 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fps_limit = Some(Some(30.0));
+}
+- (())fpsLimit60 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fps_limit = Some(Some(60.0));
+}
+- (())fpsLimit120 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fps_limit = Some(Some(120.0));
+}
+- (())vsync:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).vsync = Some(switch_state);
+}
+- (())batterySaver:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).battery_saver = Some(switch_state);
+}
+- (())ultraBatterySaver:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ultra_battery_saver = Some(switch_state);
+}
+- (())frameGeneration:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).frame_generation = Some(switch_state);
+}
+- (())skipIntros:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).skip_intros = Some(switch_state);
 }
 - (())fullscreen:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fullscreen = Some(switch_state);
+}
+- (())fullscreenStretched:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fullscreen_stretched = Some(switch_state);
+}
+- (())angleDriver:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).angle_driver = Some(switch_state);
+}
+- (())logFile:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).log_file = Some(switch_state);
+}
+- (())traceGLErrors:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).trace_gl_errors = Some(switch_state);
+}
+- (())verboseLogging:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).verbose_logging = Some(switch_state);
+}
+- (())shaderCompatibilityFixes:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).shader_compatibility_fixes = Some(switch_state);
+}
+- (())fixTextureMinFilter:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(switch_state);
+}
+- (())forceComposition:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).force_composition = Some(switch_state);
+}
+- (())fastMemory:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fast_memory = Some(switch_state);
+}
+- (())force32Bit:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).force_32_bit = Some(switch_state);
+}
+- (())force64Bit:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).force_64_bit = Some(switch_state);
 }
 - (())deviceModel:(id)sender { // UIButton*
     let tag: NSInteger = msg![env; sender tag];
@@ -327,6 +712,150 @@ const CLASSES: ClassExports = objc_classes! {
 - (())deviceModelScrollDown {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_scroll_down = true;
 }
+- (())refreshApps {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).apps_refresh_requested = true;
+}
+- (())iosVersionToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_toggle = true;
+}
+- (())iosVersion:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version = Some(ios_version_for_tag(tag as i32));
+}
+- (())coreAudio:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).core_audio = Some(switch_state);
+}
+- (())lowAudioQuality:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).low_audio_quality = Some(switch_state);
+}
+- (())highPerformance:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).high_performance = Some(switch_state);
+}
+- (())forceMaxClocks:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).force_max_clocks = Some(switch_state);
+}
+
+- (())arm64Backend:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).arm64_backend = Some(if switch_state {
+        crate::options::Arm64Backend::Jit
+    } else {
+        crate::options::Arm64Backend::Interpreter
+    });
+}
+- (())arm64Fallback:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).arm64_fallback = Some(if switch_state {
+        crate::options::Arm64Fallback::Jit
+    } else {
+        crate::options::Arm64Fallback::Interpreter
+    });
+}
+- (())llvmpipeFallback:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).llvmpipe_fallback = Some(switch_state);
+}
+- (())metalTranslator:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).metal_translator = Some(switch_state);
+}
+- (())softwareRendering:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).software_rendering = Some(switch_state);
+}
+- (())anisotropicFiltering:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anisotropic_filtering = Some(tag as u8);
+}
+- (())textureUpscaler:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).texture_upscaler = Some(tag as u8);
+}
+- (())noTextureCompression:(id)switch {
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).no_texture_compression = Some(switch_state);
+}
+- (())pvrtcDecodingSoftware { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).pvrtc_decoding = Some(crate::options::PvrtcDecoding::Software); }
+- (())pvrtcDecodingAuto { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).pvrtc_decoding = Some(crate::options::PvrtcDecoding::Auto); }
+- (())pvrtcDecodingDriver { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).pvrtc_decoding = Some(crate::options::PvrtcDecoding::Driver); }
+- (())antiAliasing:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anti_aliasing = Some(tag as u8);
+}
+- (())anisotropicFiltering1 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anisotropic_filtering = Some(1); }
+- (())anisotropicFiltering2 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anisotropic_filtering = Some(2); }
+- (())anisotropicFiltering4 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anisotropic_filtering = Some(4); }
+- (())anisotropicFiltering8 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anisotropic_filtering = Some(8); }
+- (())anisotropicFiltering16 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anisotropic_filtering = Some(16); }
+- (())textureUpscaler1 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).texture_upscaler = Some(1); }
+- (())textureUpscaler2 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).texture_upscaler = Some(2); }
+- (())textureUpscaler3 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).texture_upscaler = Some(3); }
+- (())textureUpscaler4 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).texture_upscaler = Some(4); }
+- (())antiAliasing1 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anti_aliasing = Some(1); }
+- (())antiAliasing2 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anti_aliasing = Some(2); }
+- (())antiAliasing4 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anti_aliasing = Some(4); }
+- (())antiAliasing8 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).anti_aliasing = Some(8); }
+
+- (())graphicsApiToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).graphics_api_toggle = true;
+}
+- (())graphicsApi:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    let api = GRAPHICS_API_ENTRIES
+        .get(tag as usize)
+        .map(|(_, api)| *api)
+        .unwrap_or(crate::options::GraphicsApi::Default);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).graphics_api = Some(api);
+}
+- (())textureFilteringToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).texture_filtering_toggle = true;
+}
+- (())textureFiltering:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    let value = TEXTURE_FILTERING_ENTRIES
+        .get(tag as usize)
+        .map(|(_, value)| *value)
+        .unwrap_or(crate::options::TextureFiltering::Default);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).texture_filtering = Some(value);
+}
+- (())memoryManagementToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_management_toggle = true;
+}
+- (())memoryManagement:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    let value = MEMORY_MANAGEMENT_ENTRIES
+        .get(tag as usize)
+        .map(|(_, value)| *value)
+        .unwrap_or(crate::options::MemoryManagement::Aggressive);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_management = Some(value);
+}
+- (())glesOverrideToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_override_toggle = true;
+}
+- (())glesOverride:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    let value = GLES_OVERRIDE_ENTRIES
+        .get(tag as usize)
+        .map(|(_, value)| *value)
+        .unwrap_or(crate::options::GlesOverrideVersion::Default);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_override_version = Some(value);
+}
+- (())audioBackendToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).audio_backend_toggle = true;
+}
+- (())audioBackend:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    let value = AUDIO_BACKEND_ENTRIES
+        .get(tag as usize)
+        .map(|(_, value)| *value)
+        .unwrap_or(crate::options::AudioBackend::Default);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).audio_backend = Some(value);
+}
+
 - (())openFileManager {
     // Assert (see above).
     let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
@@ -340,10 +869,21 @@ const CLASSES: ClassExports = objc_classes! {
                 echo!("Couldn't open file manager at {:?}: {}", url, e);
             } else {
                 echo!("Opened game folder at {:?}, returning to the picker.", url);
+                env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).apps_refresh_requested = true;
             }
         },
         Err(e) => echo!("Couldn't open file manager: {}", e),
     }
+}
+
+- (())visitWebsite {
+    // Assert (see above).
+    let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+
+    let url = ns_string::get_static_str(env, "https://touchhle.org/");
+    let url: id = msg_class![env; NSURL URLWithString:url];
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    assert!(msg![env; ui_application openURL:url]);
 }
 
 @end
@@ -390,7 +930,7 @@ fn show_app_picker_gui(
         })
         .unwrap_or((320, 568));
     options.host_screen_size = Some(picker_canvas_size);
-    options.scale_hack = NonZeroU32::new(3).unwrap();
+    options.scale_hack = std::num::NonZeroU32::new(3).unwrap();
     log_dbg!(
         "App picker: using fixed {}x{} logical canvas at 3x internal resolution, preserving host aspect ratio.",
         picker_canvas_size.0,
@@ -430,9 +970,25 @@ fn app_picker_inner(
     let window: id = msg_class![env; UIWindow alloc];
     let window: id = msg![env; window initWithFrame:bounds];
 
-    let app_frame: CGRect = msg![env; screen applicationFrame];
+    let app_frame: CGRect = bounds;
+    let CGSize {
+        width: app_frame_width,
+        height: app_frame_height,
+    } = app_frame.size;
+    let ui_scale = picker_ui_scale(app_frame.size);
+    log_dbg!(
+        "App picker layout: logical frame {:.0}x{:.0}, UI scale {:.2}",
+        app_frame_width,
+        app_frame_height,
+        ui_scale
+    );
     let main_view: id = msg_class![env; UIView alloc];
     let main_view: id = msg![env; main_view initWithFrame:app_frame];
+    let picker_background: id =
+        msg_class![env; UIColor colorWithRed:0.93 green:0.93 blue:0.95 alpha:1.0];
+    () = msg![env; main_view setBackgroundColor:picker_background];
+    () = msg![env; main_view setOpaque:true];
+    () = msg![env; window setBackgroundColor:picker_background];
     () = msg![env; window addSubview:main_view];
 
     // Wallpaper
@@ -471,14 +1027,36 @@ fn app_picker_inner(
             },
             size: app_frame.size,
         })];
-        () = msg![env; wallpaper setAlpha:(0.5 as CGFloat)];
-        () = msg![env; main_view addSubview:wallpaper];
+        () = msg![env; wallpaper setContentMode:2];
+        () = msg![env; wallpaper setAlpha:(1.0 as CGFloat)];
+        () = msg![env; main_view insertSubview:wallpaper atIndex:0];
         have_wallpaper = true;
         break;
     }
     if !found_wallpaper {
+        if let Ok(mut resource) = paths::ResourceFile::open("MetalHLE_v7_wallpaper.png") {
+            let mut bytes = Vec::new();
+            if resource.get().read_to_end(&mut bytes).is_ok() {
+                if let Ok(image) = Image::from_bytes(&bytes) {
+                    let image = cg_image::from_image(env, image);
+                    let image: id = msg_class![env; UIImage imageWithCGImage:image];
+                    let wallpaper: id = msg_class![env; UIImageView alloc];
+                    let wallpaper: id = msg![env; wallpaper initWithImage:image];
+                    () = msg![env; wallpaper setFrame:(CGRect {
+                        origin: CGPoint { x: 0.0, y: 0.0 },
+                        size: app_frame.size,
+                    })];
+                    () = msg![env; wallpaper setContentMode:2];
+                    () = msg![env; wallpaper setAlpha:(1.0 as CGFloat)];
+                    () = msg![env; main_view insertSubview:wallpaper atIndex:0];
+                    have_wallpaper = true;
+                }
+            }
+        }
+    }
+    if !have_wallpaper {
         let CGSize { width, height } = app_frame.size;
-        log!(
+        log_dbg!(
             "No wallpaper found; filename can be one of: {}; ideal size is {}×{} pixels",
             paths::WALLPAPER_FILES.join(", "),
             width,
@@ -486,29 +1064,40 @@ fn app_picker_inner(
         );
     }
 
-    // Build label
+    // Version label
     {
         let label_frame = CGRect {
             origin: CGPoint {
                 x: 0.0,
-                y: app_picker_version_label_top(app_frame.size.height),
+                y: app_frame.size.height - 20.0 * ui_scale,
             },
             size: CGSize {
                 width: app_frame.size.width - 5.0,
-                height: APP_PICKER_VERSION_LABEL_HEIGHT,
+                height: 18.0 * ui_scale,
             },
         };
         let label: id = msg_class![env; UILabel alloc];
         let label: id = msg![env; label initWithFrame:label_frame];
         let text = ns_string::from_rust_string(
             env,
-            format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
+            format!(
+                "MetalHLE 1.0 {}{}{}",
+                crate::branding(),
+                if crate::branding().is_empty() {
+                    ""
+                } else {
+                    " "
+                },
+                crate::VERSION
+            ),
         );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
-        let font_size: CGFloat = 12.0;
-        let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
+        let font_size: CGFloat = 12.0 * ui_scale;
+        let font: id = picker_font(env, font_size);
         () = msg![env; label setFont:font];
+        () = msg![env; label setAdjustsFontSizeToFitWidth:true];
+        () = msg![env; label setMinimumFontSize:9.0];
         let text_color: id = if have_wallpaper {
             msg_class![env; UIColor whiteColor]
         } else {
@@ -520,33 +1109,7 @@ fn app_picker_inner(
         () = msg![env; main_view addSubview:label];
     }
 
-    let brand_color: id = if crate::branding() == "UNOFFICIAL" {
-        msg_class![env; UIColor redColor]
-    } else {
-        msg_class![env; UIColor grayColor]
-    };
-
-    let title_frame = CGRect {
-        origin: CGPoint { x: 12.0, y: 8.0 },
-        size: CGSize {
-            width: app_frame.size.width - 24.0,
-            height: 34.0,
-        },
-    };
-    let title: id = msg_class![env; UILabel alloc];
-    let title: id = msg![env; title initWithFrame:title_frame];
-    let text = ns_string::from_rust_string(env, HYPERHLE_FORK_NAME.to_string());
-    () = msg![env; title setText:text];
-    () = msg![env; title setTextAlignment:UITextAlignmentCenter];
-    let font_size: CGFloat = 28.0;
-    let font: id = msg_class![env; UIFont boldSystemFontOfSize:font_size];
-    () = msg![env; title setFont:font];
-    () = msg![env; title setTextColor:brand_color];
-    let bg_color: id = msg_class![env; UIColor clearColor];
-    () = msg![env; title setBackgroundColor:bg_color];
-    () = msg![env; main_view addSubview:title];
-
-    let quick_options_button_top = app_picker_quick_options_button_top(app_frame.size.height);
+    let divider = app_frame.size.height - 220.0 * ui_scale;
 
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
@@ -566,7 +1129,7 @@ fn app_picker_inner(
                 origin: CGPoint { x: 10.0, y: 10.0 },
                 size: CGSize {
                     width: app_frame.size.width - 20.0,
-                    height: quick_options_button_top - 20.0,
+                    height: divider - 20.0,
                 },
             };
             let label: id = msg_class![env; UILabel alloc];
@@ -584,55 +1147,174 @@ fn app_picker_inner(
         }
     };
 
-    // Keep the sole footer action directly above the build label, leaving the
-    // space above it available for a fourth row of app icons.
-    let buttons_row_center = app_picker_quick_options_button_center(app_frame.size.height);
-    make_button_row(
+    let buttons_row_center = divider + 48.0 * ui_scale;
+    let buttons_row2_center = divider + 136.0 * ui_scale;
+    make_app_launcher_grid(
         env,
         delegate,
         main_view,
         app_frame.size,
         buttons_row_center,
-        &[("Quick options", "quickOptionsShow")],
-        None,
+        buttons_row2_center,
     );
 
-    let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
-    // "GLES Native" starts out matching the effective option state (OFF by
-    // default, i.e. the bundled ANGLE backend), so the switch always shows
-    // what will actually be used when the app is launched.
-    let mut quick_options_gles_native = quick_options_gles_native_enabled(&env.options);
-    let quick_options_stuff = setup_quick_options(
-        env,
-        delegate,
-        main_view,
-        app_frame,
-        quick_options_cheat_engine,
-        quick_options_gles_native,
-    );
-    let mut quick_options_scale_hack: Option<NonZeroU32> = None;
+    let copyright_info_text = crate::licenses::get_text();
+    let mut copyright_info_stuff = setup_copyright_info(env, delegate, main_view, app_frame);
+    let arch_dialog = setup_arch_dialog(env, delegate, main_view, app_frame);
+    let mut copyright_info_page_idx = 0;
+
+    let host_resolutions = crate::window::host_screen_resolutions();
+    let quick_options_stuff =
+        setup_quick_options(env, delegate, main_view, app_frame, &host_resolutions);
+    // The on/off switch was removed from the UI; the driver pipeline is
+    // always considered enabled so a selected driver is honoured at launch.
+    let mut quick_options_custom_driver_enabled = true;
+    () = msg![env; (quick_options_stuff.custom_driver_btn) setEnabled:true];
+    let mut quick_options_scale_hack: Option<f32> = None;
+    let mut quick_options_custom_resolution: Option<(u32, u32)> = None;
     let mut quick_options_fullscreen: Option<()> = None;
+    let mut quick_options_fullscreen_stretched = false;
     let mut quick_options_orientation: Option<DeviceOrientation> = None;
+    let mut quick_options_render_rotation: Option<RenderRotation> = None;
+    let mut quick_options_revert_x_axis = false;
+    let mut quick_options_revert_y_axis = false;
     let mut quick_options_analog_stick_tilt_controls = true;
-    let mut quick_options_network = false;
-    let mut quick_options_show_fps = false;
-    let mut quick_options_trace_gl_errors = false;
+    let mut quick_options_network = env.options.network_access;
+    let mut quick_options_network_changed = false;
+    let mut quick_options_cheat_engine = !env.options.trainer_disabled;
+    let mut quick_options_rtcs = false;
+    let mut quick_options_show_fps = true;
+    let mut quick_options_frame_pacing = true;
+    let mut quick_options_fps_limit: Option<f64> = None;
+    let mut quick_options_frame_generation = false;
+    let mut quick_options_skip_intros = false;
+    let mut quick_options_high_performance = crate::options::DEFAULT_HIGH_PERFORMANCE;
+    let mut quick_options_force_max_clocks = crate::options::DEFAULT_FORCE_MAX_CLOCKS;
+    let mut quick_options_vsync = false;
+    let mut quick_options_battery_saver = false;
+    let mut quick_options_ultra_battery_saver = false;
+    let mut quick_options_verbose_logging = false;
+    let mut quick_options_shader_compatibility_fixes = true;
+    let mut quick_options_fix_texture_min_filter = cfg!(target_os = "android");
+    let mut quick_options_force_composition = false;
+    let mut quick_options_angle_driver = false;
+    let mut quick_options_log_file = true;
+    // Mirror the actual launch default (`Options::default()` enables GL error
+    // tracing) so the toggle reflects reality instead of showing OFF.
+    let mut quick_options_trace_gl_errors = env.options.trace_gl_errors && quick_options_log_file;
+    let mut quick_options_fast_memory = crate::options::DEFAULT_FAST_MEMORY;
+    let mut quick_options_force_32_bit = false;
+    let mut quick_options_force_64_bit = false;
     let mut quick_options_device_tag: Option<i32> = None;
     let mut quick_options_device_model_open = false;
     let mut quick_options_device_model_scroll: isize = 0;
+    let mut quick_options_ios_version: Option<(i32, i32, i32)> = None;
+    let mut quick_options_core_audio = true;
+    let mut quick_options_low_audio_quality = false;
+    let mut quick_options_graphics_api = crate::options::GraphicsApi::Default;
+    let mut quick_options_audio_backend = crate::options::AudioBackend::CoreAudio;
+    let mut quick_options_texture_filtering = crate::options::TextureFiltering::Default;
+    let mut quick_options_pvrtc_decoding = crate::options::PvrtcDecoding::Software;
+    let mut quick_options_memory_management = crate::options::MemoryManagement::Aggressive;
+    let mut quick_options_gles_override = crate::options::GlesOverrideVersion::Default;
+    let mut quick_options_arm64_backend = crate::options::Arm64Backend::Interpreter;
+    let mut quick_options_arm64_fallback = crate::options::Arm64Fallback::Interpreter;
+    let mut quick_options_llvmpipe_fallback = false;
+    let mut quick_options_metal_translator = false;
+    let mut quick_options_software_rendering = false;
+    let mut quick_options_custom_driver: Option<PathBuf> = None;
+    let mut quick_options_anisotropic_filtering = 1u8;
+    let mut quick_options_texture_upscaler = 1u8;
+    let mut quick_options_no_texture_compression = false;
+    let mut quick_options_anti_aliasing = 1u8;
 
     fn update_quick_option_buttons(env: &mut Environment, buttons: &[id], selected_idx: usize) {
         for (idx, &button) in buttons.iter().enumerate() {
-            let color: id = if idx == selected_idx {
-                msg_class![env; UIColor magentaColor]
+            let selected = idx == selected_idx;
+            let color: id = if selected {
+                msg_class![env; UIColor darkGrayColor]
             } else {
-                msg_class![env; UIColor grayColor]
+                msg_class![env; UIColor whiteColor]
+            };
+            let text_color: id = if selected {
+                msg_class![env; UIColor whiteColor]
+            } else {
+                msg_class![env; UIColor blackColor]
             };
             () = msg![env; button setBackgroundColor:color];
+            () = msg![env; button setTitleColor:text_color forState:UIControlStateNormal];
         }
     }
-    fn update_scale_hack_buttons(env: &mut Environment, buttons: &[id], value: Option<NonZeroU32>) {
-        update_quick_option_buttons(env, buttons, value.map_or(0, |v| v.get() as usize));
+    fn update_scale_hack_buttons(env: &mut Environment, buttons: &[id], value: Option<f32>) {
+        let selected = match value {
+            None => 0,
+            Some(v) if (v - 1.0).abs() < f32::EPSILON => 1,
+            Some(v) if (v - 0.5).abs() < f32::EPSILON => 2,
+            Some(v) if (v - 0.75).abs() < f32::EPSILON => 3,
+            Some(v) if (v - 2.0).abs() < f32::EPSILON => 4,
+            Some(v) if (v - 3.0).abs() < f32::EPSILON => 5,
+            Some(v) if (v - 4.0).abs() < f32::EPSILON => 6,
+            Some(_) => 0,
+        };
+        update_quick_option_buttons(env, buttons, selected);
+    }
+    fn update_quality_button_group(
+        env: &mut Environment,
+        groups: &[Vec<id>],
+        group_index: usize,
+        choices: &[u8],
+        value: u8,
+    ) {
+        if let Some(buttons) = groups.get(group_index) {
+            let selected = choices
+                .iter()
+                .position(|choice| *choice == value)
+                .unwrap_or(0);
+            update_quick_option_buttons(env, buttons, selected);
+        }
+    }
+    fn update_pvrtc_decoding_buttons(
+        env: &mut Environment,
+        groups: &[Vec<id>],
+        value: crate::options::PvrtcDecoding,
+    ) {
+        let selected = match value {
+            crate::options::PvrtcDecoding::Software => 0,
+            crate::options::PvrtcDecoding::Auto => 1,
+            crate::options::PvrtcDecoding::Driver => 2,
+        };
+        if let Some(buttons) = groups.get(3) {
+            update_quick_option_buttons(env, buttons, selected);
+        }
+    }
+    fn update_ios_version_dropdown(
+        env: &mut Environment,
+        button: id,
+        menu: id,
+        items: &[id],
+        value: Option<(i32, i32, i32)>,
+    ) {
+        let tag = ios_version_tag(value);
+        let white: id = msg_class![env; UIColor whiteColor];
+        let black: id = msg_class![env; UIColor blackColor];
+        for &item in items {
+            let item_tag: NSInteger = msg![env; item tag];
+            let selected = item_tag == tag as NSInteger;
+            let color: id = if selected {
+                settings_menu_selected_green(env)
+            } else {
+                settings_menu_gray(env)
+            };
+            () = msg![env; item setBackgroundColor:color];
+            () = msg![env; item setTitleColor:(if selected { white } else { black }) forState:UIControlStateNormal];
+        }
+        let label = ios_version_label(value);
+        let title = ns_string::from_rust_string(env, label);
+        () = msg![env; button setTitle:title forState:UIControlStateNormal];
+        () = msg![env; button setTitleColor:black forState:UIControlStateNormal];
+        () = msg![env; button layoutSubviews];
+        release(env, title);
+        () = msg![env; menu setHidden:true];
     }
     fn update_orientation_buttons(
         env: &mut Environment,
@@ -650,16 +1332,143 @@ fn app_picker_inner(
             }),
         );
     }
+    fn update_render_rotation_buttons(
+        env: &mut Environment,
+        buttons: &[id; 5],
+        value: Option<RenderRotation>,
+    ) {
+        let selected = match value {
+            None | Some(RenderRotation::Default) => 0,
+            Some(RenderRotation::Minus90) => 1,
+            Some(RenderRotation::Minus180) => 2,
+            Some(RenderRotation::Plus90) => 3,
+            Some(RenderRotation::Plus180) => 4,
+        };
+        update_quick_option_buttons(env, buttons, selected);
+    }
+    fn update_fps_limit_buttons(env: &mut Environment, buttons: &[id; 4], value: Option<f64>) {
+        let selected = match value {
+            None => 0,
+            Some(limit) if (limit - 30.0).abs() < f64::EPSILON => 1,
+            Some(limit) if (limit - 60.0).abs() < f64::EPSILON => 2,
+            Some(limit) if (limit - 120.0).abs() < f64::EPSILON => 3,
+            Some(_) => 0,
+        };
+        update_quick_option_buttons(env, buttons, selected);
+    }
+    update_ios_version_dropdown(
+        env,
+        quick_options_stuff.ios_version_btn,
+        quick_options_stuff.ios_version_menu,
+        &quick_options_stuff.ios_version_items,
+        quick_options_ios_version,
+    );
+    update_graphics_api_dropdown(
+        env,
+        quick_options_stuff.graphics_api_btn,
+        &quick_options_stuff.graphics_api_items,
+        quick_options_graphics_api,
+    );
+    update_settings_dropdown(
+        env,
+        quick_options_stuff.texture_filtering_btn,
+        &quick_options_stuff.texture_filtering_items,
+        TEXTURE_FILTERING_ENTRIES,
+        quick_options_texture_filtering as usize,
+    );
+    update_settings_dropdown(
+        env,
+        quick_options_stuff.memory_management_btn,
+        &quick_options_stuff.memory_management_items,
+        MEMORY_MANAGEMENT_ENTRIES,
+        quick_options_memory_management as usize,
+    );
+    update_settings_dropdown(
+        env,
+        quick_options_stuff.gles_override_btn,
+        &quick_options_stuff.gles_override_items,
+        GLES_OVERRIDE_ENTRIES,
+        quick_options_gles_override as usize,
+    );
+    update_settings_dropdown(
+        env,
+        quick_options_stuff.audio_backend_btn,
+        &quick_options_stuff.audio_backend_items,
+        AUDIO_BACKEND_ENTRIES,
+        quick_options_audio_backend as usize,
+    );
+    update_quality_button_group(
+        env,
+        &quick_options_stuff.quality_buttons,
+        1,
+        &[1, 2, 4, 8, 16],
+        quick_options_anisotropic_filtering,
+    );
+    update_quality_button_group(
+        env,
+        &quick_options_stuff.quality_buttons,
+        2,
+        &[1, 2, 3, 4],
+        quick_options_texture_upscaler,
+    );
+    update_pvrtc_decoding_buttons(
+        env,
+        &quick_options_stuff.quality_buttons,
+        quick_options_pvrtc_decoding,
+    );
+    () = msg![env; (quick_options_stuff.no_texture_compression_switch)
+        setOn:quick_options_no_texture_compression];
+    update_quality_button_group(
+        env,
+        &quick_options_stuff.quality_buttons,
+        0,
+        &[1, 2, 4, 8],
+        quick_options_anti_aliasing,
+    );
     update_scale_hack_buttons(
         env,
         &quick_options_stuff.scale_hack_buttons,
         quick_options_scale_hack,
     );
+    () = msg![env; (quick_options_stuff.low_audio_quality_switch)
+        setOn:quick_options_low_audio_quality];
+    () = msg![env; (quick_options_stuff.frame_generation_switch)
+        setOn:quick_options_frame_generation];
+    () = msg![env; (quick_options_stuff.skip_intros_switch)
+        setOn:quick_options_skip_intros];
+    () = msg![env; (quick_options_stuff.vsync_switch) setOn:quick_options_vsync];
+    () = msg![env; (quick_options_stuff.battery_saver_switch) setOn:quick_options_battery_saver];
+    () = msg![env; (quick_options_stuff.ultra_battery_saver_switch) setOn:quick_options_ultra_battery_saver];
+    () = msg![env; (quick_options_stuff.log_file_switch) setOn:quick_options_log_file];
+    () =
+        msg![env; (quick_options_stuff.verbose_logging_switch) setOn:quick_options_verbose_logging];
+    () = msg![env; (quick_options_stuff.verbose_logging_switch)
+        setEnabled:quick_options_log_file];
+    () = msg![env; (quick_options_stuff.trace_gl_errors_switch)
+        setOn:quick_options_trace_gl_errors];
+    () = msg![env; (quick_options_stuff.trace_gl_errors_switch)
+        setEnabled:quick_options_log_file];
+    () = msg![env; (quick_options_stuff.fix_texture_min_filter_switch)
+        setOn:quick_options_fix_texture_min_filter];
+    () = msg![env; (quick_options_stuff.force_composition_switch)
+        setOn:quick_options_force_composition];
     update_orientation_buttons(
         env,
         &quick_options_stuff.orientation_buttons,
         quick_options_orientation,
     );
+    update_render_rotation_buttons(
+        env,
+        &quick_options_stuff.render_rotation_buttons,
+        quick_options_render_rotation,
+    );
+    update_fps_limit_buttons(
+        env,
+        &quick_options_stuff.fps_limit_buttons,
+        quick_options_fps_limit,
+    );
+    () = msg![env; (quick_options_stuff.revert_x_axis_switch) setOn:quick_options_revert_x_axis];
+    () = msg![env; (quick_options_stuff.revert_y_axis_switch) setOn:quick_options_revert_y_axis];
     update_device_model_menu(
         env,
         &quick_options_stuff.device_model_items,
@@ -672,75 +1481,263 @@ fn app_picker_inner(
 
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
     let mut current_page = 0;
-    // If the user taps the "+" tile, this records the .ipa files that existed
-    // at that moment; once a new one shows up, the app list is re-enumerated.
     let mut awaited_ipa: Option<IpaWatch> = None;
+    // App whose launch is paused while the user picks an architecture slice.
+    let mut arch_dialog_pending: Option<PathBuf> = None;
 
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
     let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
-        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
-        let icon_tapped = std::mem::take(&mut host_obj.icon_tapped);
+        let (icon_scroll_page, icon_tapped) = {
+            let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+            (
+                std::mem::take(&mut host_obj.icon_scroll_page),
+                std::mem::take(&mut host_obj.icon_tapped),
+            )
+        };
+        if let Some(page) = icon_scroll_page {
+            current_page = page.min(
+                icon_grid_stuff
+                    .as_ref()
+                    .map_or(0, |grid| grid.pages.len().saturating_sub(1)),
+            );
+            if let Some(grid) = icon_grid_stuff.as_ref() {
+                let page: NSInteger = current_page as NSInteger;
+                () = msg![env; (grid.page_control) setCurrentPage:page];
+            }
+        }
         if icon_tapped != nil {
             match icon_grid_stuff.as_ref().unwrap().icon_map.get(&icon_tapped) {
                 Some(&TappedIcon::App(app_idx)) => {
-                    // Provide visual feedback that the app has been picked
-                    // (it may take a while for the splash screen to appear etc)
                     () = msg![env; icon_tapped setAlpha:(0.5 as CGFloat)];
-                    // Redraw screen, even if this makes the next frame early
-                    // (the app picker will never be redrawn after this).
                     crate::frameworks::core_animation::recomposite_if_necessary(
                         env, /* force: */ true,
                     );
-                    // Ensure touchHLE is responsive from the OS perspective,
-                    // otherwise screen redraw might not show up? (Unclear if
-                    // this explanation is correct.)
                     run_run_loop_single_iteration(env, main_run_loop);
 
                     let app_path = &apps.as_ref().unwrap()[app_idx].path;
+                    if apps.as_ref().unwrap()[app_idx].fat_both {
+                        // Universal app: ask the user which slice to run
+                        // before launching, instead of silently preferring
+                        // ARM32.
+                        echo!(
+                            "Picked: {} (universal app: asking which architecture to launch)",
+                            app_path.display()
+                        );
+                        () = msg![env; (arch_dialog.backdrop) setHidden:false];
+                        () = msg![env; (arch_dialog.main_view) setHidden:false];
+                        () = msg![env; (arch_dialog.main_view) bringSubviewToFront:(arch_dialog.backdrop)];
+                        arch_dialog_pending = Some(app_path.clone());
+                        continue;
+                    }
                     echo!("Picked: {}", app_path.display());
                     break app_path.clone();
                 }
-                Some(&TappedIcon::ChangePage(page_idx)) => {
-                    current_page = page_idx;
-                    update_icon_grid(
-                        env,
-                        icon_grid_stuff.as_mut().unwrap(),
-                        apps.as_mut().unwrap(),
-                        page_idx,
-                    );
-                }
                 Some(&TappedIcon::AddIpa) => {
-                    // Handled by the main loop body below (next iteration).
                     env.objc
                         .borrow_mut::<AppPickerDelegateHostObject>(delegate)
                         .add_ipa = true;
                 }
-                None => (), // Tapped on a black space
+                None => (),
             }
             continue;
         }
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
         if std::mem::take(&mut host_obj.add_ipa) {
-            // Snapshot the .ipa files that exist right now, so that when the
-            // system file picker finishes, we can detect the new file and
-            // refresh the app grid.
             awaited_ipa = Some(IpaWatch {
                 last_seen: list_top_level_ipa_files(&apps_dir),
                 dirty: false,
                 last_change: None,
             });
-            // MainActivity (Android) opens the system file picker and copies
-            // the picked file into the apps directory. On other platforms,
-            // the apps directory is opened in the file manager instead.
             if let Err(e) = crate::window::launch_ipa_picker(env) {
                 echo!("Couldn't open IPA picker: {}", e);
             }
+        } else if let Some(pick_64) = host_obj.arch_pick.take() {
+            if let Some(app_path) = arch_dialog_pending.take() {
+                () = msg![env; (arch_dialog.main_view) setHidden:true];
+                () = msg![env; (arch_dialog.backdrop) setHidden:true];
+                if pick_64 {
+                    option_args.push("--force-64-bit".to_string());
+                } else {
+                    option_args.push("--force-32-bit".to_string());
+                }
+                echo!("Picked: {} ({} slice)", app_path.display(), if pick_64 { "ARM64" } else { "ARM32" });
+                break app_path;
+            }
+        } else if std::mem::take(&mut host_obj.arch_cancel) {
+            // User dismissed the architecture chooser.
+            if let Some(app_path) = arch_dialog_pending.take() {
+                echo!("Cancelled launch of {}", app_path.display());
+            }
+            () = msg![env; (arch_dialog.main_view) setHidden:true];
+            () = msg![env; (arch_dialog.backdrop) setHidden:true];
+        } else if std::mem::take(&mut host_obj.copyright_show) {
+            copyright_info_page_idx = 0;
+            change_copyright_page(
+                env,
+                &mut copyright_info_stuff,
+                &copyright_info_text,
+                copyright_info_page_idx,
+            );
+            animate_picker_panel(env, copyright_info_stuff.main_view, true);
+        } else if std::mem::take(&mut host_obj.copyright_hide) {
+            animate_picker_panel(env, copyright_info_stuff.main_view, false);
+        } else if std::mem::take(&mut host_obj.copyright_prev) && copyright_info_page_idx != 0 {
+            copyright_info_page_idx -= 1;
+            change_copyright_page(
+                env,
+                &mut copyright_info_stuff,
+                &copyright_info_text,
+                copyright_info_page_idx,
+            );
+        } else if std::mem::take(&mut host_obj.copyright_next)
+            && Some(copyright_info_page_idx) != copyright_info_stuff.last_page_idx
+        {
+            copyright_info_page_idx += 1;
+            change_copyright_page(
+                env,
+                &mut copyright_info_stuff,
+                &copyright_info_text,
+                copyright_info_page_idx,
+            );
         } else if std::mem::take(&mut host_obj.quick_options_show) {
-            () = msg![env; (quick_options_stuff.main_view) setHidden:false];
+            animate_picker_panel(env, quick_options_stuff.settings_backdrop, true);
+            animate_picker_panel(env, quick_options_stuff.main_view, true);
         } else if std::mem::take(&mut host_obj.quick_options_hide) {
-            () = msg![env; (quick_options_stuff.main_view) setHidden:true];
+            animate_picker_panel(env, quick_options_stuff.main_view, false);
+            animate_picker_panel(env, quick_options_stuff.settings_backdrop, false);
+        } else if std::mem::take(&mut host_obj.apps_refresh_requested) {
+            let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
+            match enumerate_apps(&apps_dir) {
+                Ok(new_apps) if !new_apps.is_empty() => {
+                    apps = Ok(new_apps);
+                    if let Some(icon_grid) = icon_grid_stuff.as_mut() {
+                        remove_icon_grid(env, icon_grid);
+                        *icon_grid = make_icon_grid(
+                            env,
+                            delegate,
+                            main_view,
+                            app_frame,
+                            apps.as_ref().unwrap().len(),
+                            have_wallpaper,
+                        );
+                        update_icon_grid(env, icon_grid, apps.as_mut().unwrap(), 0);
+                    }
+                }
+                Ok(_) => echo!("No games found in the game folder yet."),
+                Err(e) => echo!("Couldn't refresh the game list: {}", e),
+            }
+        } else if std::mem::take(&mut host_obj.ios_version_toggle) {
+            set_settings_menu_background(env, quick_options_stuff.ios_version_menu);
+            let hidden: bool = msg![env; (quick_options_stuff.ios_version_menu) isHidden];
+            () = msg![env; (quick_options_stuff.ios_version_menu) setHidden:(!hidden)];
+            if hidden {
+                () = msg![env; (quick_options_stuff.main_view) bringSubviewToFront:(quick_options_stuff.ios_version_menu)];
+                () = msg![env; (quick_options_stuff.main_view) bringSubviewToFront:(quick_options_stuff.ios_version_btn)];
+            }
+        } else if let Some(version) = std::mem::take(&mut host_obj.ios_version) {
+            quick_options_ios_version = version;
+            update_ios_version_dropdown(
+                env,
+                quick_options_stuff.ios_version_btn,
+                quick_options_stuff.ios_version_menu,
+                &quick_options_stuff.ios_version_items,
+                quick_options_ios_version,
+            );
+        } else if std::mem::take(&mut host_obj.graphics_api_toggle) {
+            set_settings_menu_background(env, quick_options_stuff.graphics_api_menu);
+            let hidden: bool = msg![env; (quick_options_stuff.graphics_api_menu) isHidden];
+            () = msg![env; (quick_options_stuff.graphics_api_menu) setHidden:(!hidden)];
+            if hidden {
+                () = msg![env; (quick_options_stuff.main_view) bringSubviewToFront:(quick_options_stuff.graphics_api_menu)];
+                () = msg![env; (quick_options_stuff.main_view) bringSubviewToFront:(quick_options_stuff.graphics_api_btn)];
+            }
+        } else if std::mem::take(&mut host_obj.gles_override_toggle) {
+            toggle_settings_dropdown(
+                env,
+                quick_options_stuff.main_view,
+                quick_options_stuff.gles_override_menu,
+                quick_options_stuff.gles_override_btn,
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.gles_override_version) {
+            quick_options_gles_override = value;
+            update_settings_dropdown(
+                env,
+                quick_options_stuff.gles_override_btn,
+                &quick_options_stuff.gles_override_items,
+                GLES_OVERRIDE_ENTRIES,
+                value as usize,
+            );
+            () = msg![env; (quick_options_stuff.gles_override_menu) setHidden:true];
+        } else if std::mem::take(&mut host_obj.texture_filtering_toggle) {
+            toggle_settings_dropdown(
+                env,
+                quick_options_stuff.main_view,
+                quick_options_stuff.texture_filtering_menu,
+                quick_options_stuff.texture_filtering_btn,
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.texture_filtering) {
+            quick_options_texture_filtering = value;
+            update_settings_dropdown(
+                env,
+                quick_options_stuff.texture_filtering_btn,
+                &quick_options_stuff.texture_filtering_items,
+                TEXTURE_FILTERING_ENTRIES,
+                value as usize,
+            );
+            () = msg![env; (quick_options_stuff.texture_filtering_menu) setHidden:true];
+        } else if let Some(value) = std::mem::take(&mut host_obj.pvrtc_decoding) {
+            quick_options_pvrtc_decoding = value;
+            update_pvrtc_decoding_buttons(env, &quick_options_stuff.quality_buttons, value);
+        } else if std::mem::take(&mut host_obj.memory_management_toggle) {
+            toggle_settings_dropdown(
+                env,
+                quick_options_stuff.main_view,
+                quick_options_stuff.memory_management_menu,
+                quick_options_stuff.memory_management_btn,
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.memory_management) {
+            quick_options_memory_management = value;
+            update_settings_dropdown(
+                env,
+                quick_options_stuff.memory_management_btn,
+                &quick_options_stuff.memory_management_items,
+                MEMORY_MANAGEMENT_ENTRIES,
+                value as usize,
+            );
+            () = msg![env; (quick_options_stuff.memory_management_menu) setHidden:true];
+        } else if std::mem::take(&mut host_obj.audio_backend_toggle) {
+            toggle_settings_dropdown(
+                env,
+                quick_options_stuff.main_view,
+                quick_options_stuff.audio_backend_menu,
+                quick_options_stuff.audio_backend_btn,
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.audio_backend) {
+            quick_options_audio_backend = value;
+            update_settings_dropdown(
+                env,
+                quick_options_stuff.audio_backend_btn,
+                &quick_options_stuff.audio_backend_items,
+                AUDIO_BACKEND_ENTRIES,
+                value as usize,
+            );
+            () = msg![env; (quick_options_stuff.audio_backend_menu) setHidden:true];
+        } else if let Some(api) = std::mem::take(&mut host_obj.graphics_api) {
+            quick_options_graphics_api = api;
+            update_graphics_api_dropdown(
+                env,
+                quick_options_stuff.graphics_api_btn,
+                &quick_options_stuff.graphics_api_items,
+                api,
+            );
+            () = msg![env; (quick_options_stuff.graphics_api_menu) setHidden:true];
+        } else if let Some(backend) = std::mem::take(&mut host_obj.arm64_backend) {
+            quick_options_arm64_backend = backend;
+        } else if let Some(fallback) = std::mem::take(&mut host_obj.arm64_fallback) {
+            quick_options_arm64_fallback = fallback;
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
             quick_options_scale_hack = None;
             update_scale_hack_buttons(
@@ -749,33 +1746,123 @@ fn app_picker_inner(
                 quick_options_scale_hack,
             );
         } else if std::mem::take(&mut host_obj.scale_hack1) {
-            quick_options_scale_hack = Some(NonZeroU32::new(1).unwrap());
+            quick_options_scale_hack = Some(1.0);
+            update_scale_hack_buttons(
+                env,
+                &quick_options_stuff.scale_hack_buttons,
+                quick_options_scale_hack,
+            );
+        } else if std::mem::take(&mut host_obj.scale_hack_half) {
+            quick_options_scale_hack = Some(0.5);
+            update_scale_hack_buttons(
+                env,
+                &quick_options_stuff.scale_hack_buttons,
+                quick_options_scale_hack,
+            );
+        } else if std::mem::take(&mut host_obj.scale_hack_three_quarters) {
+            quick_options_scale_hack = Some(0.75);
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
         } else if std::mem::take(&mut host_obj.scale_hack2) {
-            quick_options_scale_hack = Some(NonZeroU32::new(2).unwrap());
+            quick_options_scale_hack = Some(2.0);
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
         } else if std::mem::take(&mut host_obj.scale_hack3) {
-            quick_options_scale_hack = Some(NonZeroU32::new(3).unwrap());
+            quick_options_scale_hack = Some(3.0);
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
         } else if std::mem::take(&mut host_obj.scale_hack4) {
-            quick_options_scale_hack = Some(NonZeroU32::new(4).unwrap());
+            quick_options_scale_hack = Some(4.0);
             update_scale_hack_buttons(
                 env,
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
+        } else if std::mem::take(&mut host_obj.custom_resolution) {
+            let hidden: bool = msg![env; (quick_options_stuff.custom_resolution_menu) isHidden];
+            () = msg![env; (quick_options_stuff.custom_resolution_menu) setHidden:(!hidden)];
+            if hidden {
+                () = msg![env; (quick_options_stuff.main_view)
+                    bringSubviewToFront:(quick_options_stuff.custom_resolution_menu)];
+            }
+        } else if std::mem::take(&mut host_obj.custom_resolution_custom) {
+            let default_resolution = quick_options_custom_resolution
+                .or_else(|| host_resolutions.last().copied())
+                .unwrap_or((320, 480));
+            quick_options_custom_resolution = Some(default_resolution);
+            let title = ns_string::from_rust_string(
+                env,
+                format!("{} x {}", default_resolution.0, default_resolution.1),
+            );
+            () = msg![env; (quick_options_stuff.custom_resolution_button)
+                setTitle:title forState:UIControlStateNormal];
+            release(env, title);
+            let width_text = ns_string::from_rust_string(env, default_resolution.0.to_string());
+            let height_text = ns_string::from_rust_string(env, default_resolution.1.to_string());
+            () = msg![env; (quick_options_stuff.custom_resolution_width_field) setText:width_text];
+            () =
+                msg![env; (quick_options_stuff.custom_resolution_height_field) setText:height_text];
+            release(env, width_text);
+            release(env, height_text);
+            () = msg![env; (quick_options_stuff.custom_resolution_error) setHidden:true];
+            () = msg![env; (quick_options_stuff.custom_resolution_menu) setHidden:true];
+            () = msg![env; (quick_options_stuff.custom_resolution_editor) setHidden:false];
+            () = msg![env; (quick_options_stuff.main_view)
+                bringSubviewToFront:(quick_options_stuff.custom_resolution_editor)];
+            () =
+                msg![env; (quick_options_stuff.custom_resolution_width_field) becomeFirstResponder];
+            () = msg![env; (quick_options_stuff.custom_resolution_menu) setHidden:true];
+        } else if std::mem::take(&mut host_obj.custom_resolution_apply) {
+            let mut parse_field = |field: id| -> Option<u32> {
+                let text: id = msg![env; field text];
+                let value = ns_string::to_rust_string(env, text)
+                    .trim()
+                    .parse::<u32>()
+                    .ok()?;
+                (64..=16384).contains(&value).then_some(value)
+            };
+            if let (Some(width), Some(height)) = (
+                parse_field(quick_options_stuff.custom_resolution_width_field),
+                parse_field(quick_options_stuff.custom_resolution_height_field),
+            ) {
+                quick_options_custom_resolution = Some((width, height));
+                let title = ns_string::from_rust_string(env, format!("{} x {}", width, height));
+                () = msg![env; (quick_options_stuff.custom_resolution_button)
+                    setTitle:title forState:UIControlStateNormal];
+                release(env, title);
+                () = msg![env; (quick_options_stuff.custom_resolution_editor) setHidden:true];
+            } else {
+                let error =
+                    ns_string::get_static_str(env, "Enter width and height from 64 to 16384.");
+                () = msg![env; (quick_options_stuff.custom_resolution_error) setText:error];
+                () = msg![env; (quick_options_stuff.custom_resolution_error) setHidden:false];
+                release(env, error);
+            }
+        } else if std::mem::take(&mut host_obj.custom_resolution_cancel) {
+            () = msg![env; (quick_options_stuff.custom_resolution_editor) setHidden:true];
+        } else if let Some(index) = std::mem::take(&mut host_obj.supported_resolution) {
+            if index >= 0 {
+                if let Some(resolution) = host_resolutions.get(index as usize).copied() {
+                    quick_options_custom_resolution = Some(resolution);
+                    let title = ns_string::from_rust_string(
+                        env,
+                        format!("{} x {}", resolution.0, resolution.1),
+                    );
+                    () = msg![env; (quick_options_stuff.custom_resolution_button)
+                        setTitle:title forState:UIControlStateNormal];
+                    release(env, title);
+                    () = msg![env; (quick_options_stuff.custom_resolution_menu) setHidden:true];
+                }
+            }
         } else if std::mem::take(&mut host_obj.orientation_default) {
             quick_options_orientation = None;
             update_orientation_buttons(
@@ -804,6 +1891,19 @@ fn app_picker_inner(
                 &quick_options_stuff.orientation_buttons,
                 quick_options_orientation,
             );
+        } else if let Some(value) = std::mem::take(&mut host_obj.render_rotation) {
+            quick_options_render_rotation = Some(value);
+            update_render_rotation_buttons(
+                env,
+                &quick_options_stuff.render_rotation_buttons,
+                quick_options_render_rotation,
+            );
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.revert_x_axis) {
+            quick_options_revert_x_axis = enabled;
+            () = msg![env; (quick_options_stuff.revert_x_axis_switch) setOn:enabled];
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.revert_y_axis) {
+            quick_options_revert_y_axis = enabled;
+            () = msg![env; (quick_options_stuff.revert_y_axis_switch) setOn:enabled];
         } else if let Some(tag) = std::mem::take(&mut host_obj.device_model_tag) {
             quick_options_device_tag = Some(tag);
             quick_options_device_model_open = false;
@@ -824,6 +1924,12 @@ fn app_picker_inner(
             quick_options_device_model_open = !quick_options_device_model_open;
             () = msg![env; (quick_options_stuff.device_model_menu)
                 setHidden:(!quick_options_device_model_open)];
+            if quick_options_device_model_open {
+                () = msg![env; (quick_options_stuff.main_view)
+                    bringSubviewToFront:(quick_options_stuff.device_model_menu)];
+                () = msg![env; (quick_options_stuff.main_view)
+                    bringSubviewToFront:(quick_options_stuff.device_model_btn)];
+            }
             let arrow = if quick_options_device_model_open {
                 "▲"
             } else {
@@ -866,78 +1972,222 @@ fn app_picker_inner(
             quick_options_analog_stick_tilt_controls = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
             quick_options_network = enabled;
+            quick_options_network_changed = true;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
             quick_options_cheat_engine = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.rtcs) {
+            quick_options_rtcs = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
-        } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
-            quick_options_trace_gl_errors = trace_gl_errors;
-        } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
-            quick_options_gles_native = gles_native;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.angle_driver) {
+            quick_options_angle_driver = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.log_file) {
+            quick_options_log_file = enabled;
+            () = msg![env; (quick_options_stuff.log_file_switch) setOn:enabled];
+            () = msg![env; (quick_options_stuff.verbose_logging_switch) setEnabled:enabled];
+            () = msg![env; (quick_options_stuff.trace_gl_errors_switch) setEnabled:enabled];
+            if !enabled {
+                quick_options_verbose_logging = false;
+                quick_options_trace_gl_errors = false;
+                () = msg![env; (quick_options_stuff.verbose_logging_switch) setOn:false];
+                () = msg![env; (quick_options_stuff.trace_gl_errors_switch) setOn:false];
+            }
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_errors) {
+            quick_options_trace_gl_errors = enabled && quick_options_log_file;
+            () = msg![env; (quick_options_stuff.trace_gl_errors_switch) setOn:quick_options_trace_gl_errors];
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.fast_memory) {
+            quick_options_fast_memory = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_32_bit) {
+            quick_options_force_32_bit = enabled;
+            if enabled {
+                quick_options_force_64_bit = false;
+            }
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_64_bit) {
+            quick_options_force_64_bit = enabled;
+            if enabled {
+                quick_options_force_32_bit = false;
+            }
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.frame_pacing) {
+            quick_options_frame_pacing = enabled;
+        } else if let Some(limit) = std::mem::take(&mut host_obj.fps_limit) {
+            quick_options_fps_limit = limit;
+            update_fps_limit_buttons(
+                env,
+                &quick_options_stuff.fps_limit_buttons,
+                quick_options_fps_limit,
+            );
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.vsync) {
+            quick_options_vsync = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.battery_saver) {
+            quick_options_battery_saver = enabled;
+            if enabled {
+                quick_options_high_performance = false;
+                quick_options_force_max_clocks = false;
+            }
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.ultra_battery_saver) {
+            quick_options_ultra_battery_saver = enabled;
+            if enabled {
+                quick_options_battery_saver = true;
+                quick_options_high_performance = false;
+                quick_options_force_max_clocks = false;
+                () = msg![env; (quick_options_stuff.battery_saver_switch) setOn:true];
+            }
+            () = msg![env; (quick_options_stuff.ultra_battery_saver_switch) setOn:enabled];
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.verbose_logging) {
+            quick_options_verbose_logging = enabled && quick_options_log_file;
+            () = msg![env; (quick_options_stuff.verbose_logging_switch) setOn:quick_options_verbose_logging];
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.shader_compatibility_fixes) {
+            quick_options_shader_compatibility_fixes = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.fix_texture_min_filter) {
+            quick_options_fix_texture_min_filter = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_composition) {
+            quick_options_force_composition = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.frame_generation) {
+            quick_options_frame_generation = enabled;
+            () = msg![env; (quick_options_stuff.frame_generation_switch) setOn:enabled];
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.skip_intros) {
+            quick_options_skip_intros = enabled;
+            () = msg![env; (quick_options_stuff.skip_intros_switch) setOn:enabled];
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.high_performance) {
+            quick_options_high_performance = enabled;
+            () = msg![env; (quick_options_stuff.high_performance_switch) setOn:enabled];
+            if !enabled {
+                quick_options_force_max_clocks = false;
+                () = msg![env; (quick_options_stuff.force_max_clocks_switch) setOn:false];
+            }
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_max_clocks) {
+            quick_options_force_max_clocks = enabled;
+            () = msg![env; (quick_options_stuff.force_max_clocks_switch) setOn:enabled];
+            if enabled {
+                quick_options_high_performance = true;
+                () = msg![env; (quick_options_stuff.high_performance_switch) setOn:true];
+            }
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
                 true => Some(()),
             };
-        }
-
-        // Detect .ipa files copied in by the "+" tile flow and refresh the
-        // grid once the new file has finished copying (its size stops
-        // changing and has stayed stable for a moment).
-        // Consume any page change from a swipe: sync UIPageControl and
-        // remember the page the user settled on. Runs after the
-        // quick-options chain so the host-object borrow has ended.
-        if let Some(page) = env
-            .objc
-            .borrow_mut::<AppPickerDelegateHostObject>(delegate)
-            .icon_scroll_page
-            .take()
-        {
-            let max_page = icon_grid_stuff
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.fullscreen_stretched) {
+            quick_options_fullscreen_stretched = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.llvmpipe_fallback) {
+            quick_options_llvmpipe_fallback = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.software_rendering) {
+            quick_options_software_rendering = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.metal_translator) {
+            quick_options_metal_translator = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.core_audio) {
+            quick_options_core_audio = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.low_audio_quality) {
+            quick_options_low_audio_quality = enabled;
+            () = msg![env; (quick_options_stuff.low_audio_quality_switch) setOn:enabled];
+        } else if let Some(index) = std::mem::take(&mut host_obj.custom_driver_selected) {
+            if index < 0 {
+                quick_options_custom_driver = None;
+                () = msg![env; (quick_options_stuff.custom_driver_btn) setEnabled:true];
+            } else if let Some(path) = quick_options_stuff.custom_driver_paths.get(index as usize) {
+                quick_options_custom_driver = Some(path.clone());
+                quick_options_custom_driver_enabled = true;
+                () = msg![env; (quick_options_stuff.custom_driver_btn) setEnabled:true];
+            }
+            let title = quick_options_custom_driver
                 .as_ref()
-                .map_or(0, |grid| grid.pages.len().saturating_sub(1));
-            current_page = page.min(max_page);
-            let page: NSInteger = current_page as NSInteger;
-            () = msg![env; (icon_grid_stuff.as_ref().unwrap().page_control) setCurrentPage:page];
+                .map(|path| format!("Selected: {}", custom_driver_label(path)))
+                .unwrap_or_else(|| "No custom driver".to_string());
+            let title = ns_string::from_rust_string(env, title);
+            () = msg![env; (quick_options_stuff.custom_driver_btn) setTitle:title forState:UIControlStateNormal];
+            () = msg![env; (quick_options_stuff.custom_driver_menu) setHidden:true];
+            release(env, title);
+        } else if std::mem::take(&mut host_obj.custom_driver_menu_toggle) {
+            toggle_settings_dropdown(
+                env,
+                quick_options_stuff.main_view,
+                quick_options_stuff.custom_driver_menu,
+                quick_options_stuff.custom_driver_btn,
+            );
+        } else if std::mem::take(&mut host_obj.custom_driver_folder) {
+            match paths::url_for_opening_custom_driver() {
+                Ok(url) => {
+                    if let Err(error) = crate::window::open_url(env, &url) {
+                        echo!("Couldn't open custom-driver files: {}", error);
+                    }
+                }
+                Err(error) => echo!("Couldn't open custom-driver files: {}", error),
+            }
+        } else if let Some(value) = std::mem::take(&mut host_obj.anisotropic_filtering) {
+            quick_options_anisotropic_filtering = value;
+            update_quality_button_group(
+                env,
+                &quick_options_stuff.quality_buttons,
+                1,
+                &[1, 2, 4, 8, 16],
+                value,
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.texture_upscaler) {
+            quick_options_texture_upscaler = value;
+            update_quality_button_group(
+                env,
+                &quick_options_stuff.quality_buttons,
+                2,
+                &[1, 2, 3, 4],
+                value,
+            );
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.no_texture_compression) {
+            quick_options_no_texture_compression = enabled;
+            () = msg![env; (quick_options_stuff.no_texture_compression_switch) setOn:enabled];
+        } else if let Some(value) = std::mem::take(&mut host_obj.anti_aliasing) {
+            quick_options_anti_aliasing = value;
+            update_quality_button_group(
+                env,
+                &quick_options_stuff.quality_buttons,
+                0,
+                &[1, 2, 4, 8],
+                value,
+            );
         }
 
         if let Some(watch) = &mut awaited_ipa {
-            let new_listing = list_top_level_ipa_files(&apps_dir);
-            if new_listing != watch.last_seen {
-                watch.last_seen = new_listing;
+            let listing = list_top_level_ipa_files(&apps_dir);
+            if listing != watch.last_seen {
+                watch.last_seen = listing;
                 watch.dirty = true;
                 watch.last_change = Some(Instant::now());
             } else if watch.dirty
                 && watch
                     .last_change
-                    .is_some_and(|t| t.elapsed() >= IPA_COPY_SETTLE_TIME)
+                    .is_some_and(|changed| changed.elapsed() >= IPA_COPY_SETTLE_TIME)
             {
-                watch.dirty = false;
-                if let Ok(new_apps) = enumerate_apps(&apps_dir) {
-                    let mut new_apps = new_apps;
-                    if let Some(grid) = icon_grid_stuff.as_ref() {
-                        remove_icon_grid(env, grid);
+                if let Ok(mut new_apps) = enumerate_apps(&apps_dir) {
+                    if let Some(icon_grid) = icon_grid_stuff.as_mut() {
+                        icon_grid.pages =
+                            compute_pages(icon_grid.icon_buttons_and_labels.len(), new_apps.len());
+                        current_page = current_page.min(icon_grid.pages.len().saturating_sub(1));
+                        update_icon_grid(env, icon_grid, &mut new_apps, current_page);
                     }
-                    let mut new_grid = make_icon_grid(
-                        env,
-                        delegate,
-                        main_view,
-                        app_frame,
-                        new_apps.len(),
-                        have_wallpaper,
-                    );
-                    current_page = current_page.min(new_grid.pages.len().saturating_sub(1));
-                    update_icon_grid(env, &mut new_grid, &mut new_apps, current_page);
-                    icon_grid_stuff = Some(new_grid);
                     apps = Ok(new_apps);
                 }
+                watch.dirty = false;
+                watch.last_change = None;
             }
         }
     };
 
     // Apply user-specified overrides
+    if let Some((major, minor, patch)) = quick_options_ios_version {
+        option_args.push(format!("--ios-version={major}.{minor}.{patch}"));
+    }
+    option_args.push(
+        if quick_options_core_audio {
+            "--core-audio"
+        } else {
+            "--disable-core-audio"
+        }
+        .to_string(),
+    );
     if let Some(scale_hack) = quick_options_scale_hack {
-        option_args.push(format!("--scale-hack={}", scale_hack.get()));
+        option_args.push(format!("--scale-hack={scale_hack}"));
+    }
+    if let Some((width, height)) = quick_options_custom_resolution {
+        option_args.push(format!("--custom-resolution={width}x{height}"));
     }
     if let Some(orientation) = quick_options_orientation {
         option_args.push(
@@ -950,34 +2200,306 @@ fn app_picker_inner(
             .to_string(),
         );
     }
+    if let Some(render_rotation) = quick_options_render_rotation {
+        option_args.push(format!("--render-rotation={}", render_rotation.label()));
+    }
+    if quick_options_revert_x_axis {
+        option_args.push("--revert-x-axis".to_string());
+    }
+    if quick_options_revert_y_axis {
+        option_args.push("--revert-y-axis".to_string());
+    }
     if let Some(()) = quick_options_fullscreen {
         option_args.push("--fullscreen".to_string());
     }
+    option_args.push(
+        if quick_options_fullscreen_stretched {
+            "--fullscreen-stretched"
+        } else {
+            "--disable-fullscreen-stretched"
+        }
+        .to_string(),
+    );
     if !quick_options_analog_stick_tilt_controls {
         option_args.push("--disable-analog-stick-tilt-controls".to_string());
     }
-    if quick_options_network {
-        option_args.push("--allow-network-access".to_string());
+    if quick_options_network_changed || quick_options_network {
+        option_args.push(
+            if quick_options_network {
+                "--allow-network-access"
+            } else {
+                "--disable-network-access"
+            }
+            .to_string(),
+        );
     }
-    option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
+    option_args.push(
+        if quick_options_cheat_engine {
+            "--trainer"
+        } else {
+            "--no-trainer"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_rtcs {
+            "--rtcs"
+        } else {
+            "--disable-rtcs"
+        }
+        .to_string(),
+    );
 
     if quick_options_show_fps {
-        // Reuse existing CLI flag to enable FPS logging/counter behaviour.
         option_args.push("--print-fps".to_string());
-        // Also enable the on-screen FPS overlay both via env var and runtime
-        // flag so users don't need to set env vars manually.
         std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
         crate::gles::present::set_onscreen_fps_enabled(true);
+    } else {
+        crate::gles::present::set_onscreen_fps_enabled(false);
     }
-
-    if quick_options_trace_gl_errors {
-        option_args.push("--trace-gl-errors".to_string());
+    option_args.push(
+        if quick_options_frame_pacing {
+            "--enable-frame-pacing"
+        } else {
+            "--disable-frame-pacing"
+        }
+        .to_string(),
+    );
+    option_args.push(match quick_options_fps_limit {
+        Some(limit) => format!("--fps-limit={limit}"),
+        None => "--fps-limit=off".to_string(),
+    });
+    option_args.push(
+        if quick_options_vsync {
+            "--vsync"
+        } else {
+            "--disable-vsync"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_battery_saver {
+            "--battery-saver"
+        } else {
+            "--disable-battery-saver"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_ultra_battery_saver {
+            "--ultra-battery-saver"
+        } else {
+            "--disable-ultra-battery-saver"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_frame_generation {
+            "--frame-generation"
+        } else {
+            "--disable-frame-generation"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_skip_intros {
+            "--skip-intros"
+        } else {
+            "--no-skip-intros"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_high_performance {
+            "--high-performance"
+        } else {
+            "--disable-high-performance"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_force_max_clocks {
+            "--force-max-clocks"
+        } else {
+            "--disable-force-max-clocks"
+        }
+        .to_string(),
+    );
+    if quick_options_custom_driver_enabled {
+        if let Some(path) = &quick_options_custom_driver {
+            option_args.push(format!("--custom-driver={}", path.display()));
+        } else {
+            option_args.push("--disable-custom-driver".to_string());
+        }
+    } else {
+        option_args.push("--disable-custom-driver".to_string());
     }
-    // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
-    // default is now OFF, so the switch has to be able to turn the native
-    // driver back on, and the picker's choice should win over any
-    // `--gles-native`/`--no-gles-native` in the options files.
-    option_args.push(quick_options_gles_native_argument(quick_options_gles_native).to_string());
+    option_args.push(format!(
+        "--anisotropic-filtering={quick_options_anisotropic_filtering}"
+    ));
+    option_args.push(format!(
+        "--texture-upscaler={quick_options_texture_upscaler}"
+    ));
+    option_args.push(format!(
+        "--texture-filtering={}",
+        quick_options_texture_filtering.label()
+    ));
+    option_args.push(format!(
+        "--memory-management={}",
+        quick_options_memory_management.label()
+    ));
+    if quick_options_gles_override != crate::options::GlesOverrideVersion::Default {
+        option_args.push(format!(
+            "--gles-override={}",
+            quick_options_gles_override.label()
+        ));
+    }
+    let audio_backend = if quick_options_core_audio {
+        crate::options::AudioBackend::CoreAudio
+    } else {
+        quick_options_audio_backend
+    };
+    option_args.push(format!("--audio-backend={}", audio_backend.driver_name()));
+    option_args.push(
+        if quick_options_low_audio_quality {
+            "--low-audio-quality"
+        } else {
+            "--disable-low-audio-quality"
+        }
+        .to_string(),
+    );
+    option_args.push(format!(
+        "--pvrtc-decoding={}",
+        quick_options_pvrtc_decoding.short_name()
+    ));
+    option_args.push(
+        if quick_options_no_texture_compression {
+            "--no-texture-compression"
+        } else {
+            "--allow-texture-compression"
+        }
+        .to_string(),
+    );
+    option_args.push(format!("--anti-aliasing={quick_options_anti_aliasing}"));
+    option_args.push(
+        if quick_options_software_rendering {
+            "--software-rendering"
+        } else {
+            "--disable-software-rendering"
+        }
+        .to_string(),
+    );
+    if quick_options_graphics_api != crate::options::GraphicsApi::Default {
+        let value = match quick_options_graphics_api {
+            crate::options::GraphicsApi::Translator => "translator",
+            crate::options::GraphicsApi::TranslatorGLES30 => "translator-gles3",
+            crate::options::GraphicsApi::GLES10 => "gles1.0",
+            crate::options::GraphicsApi::GLES11 => "gles1.1",
+            crate::options::GraphicsApi::GLES20 => "gles2.0",
+            crate::options::GraphicsApi::GLES30 => "gles3.0",
+            crate::options::GraphicsApi::Wgpu => "wgpu",
+            crate::options::GraphicsApi::Vulkan => "vulkan",
+            crate::options::GraphicsApi::Software => "software",
+            crate::options::GraphicsApi::Metal => "metal",
+            crate::options::GraphicsApi::Default => unreachable!(),
+        };
+        option_args.push(format!("--graphics-api={value}"));
+    }
+    option_args.push(format!(
+        "--arm64-backend={}",
+        quick_options_arm64_backend.label()
+    ));
+    if quick_options_arm64_backend == crate::options::Arm64Backend::Jit {
+        option_args.push(format!(
+            "--arm64-fallback={}",
+            quick_options_arm64_fallback.label()
+        ));
+    }
+    option_args.push(
+        if quick_options_llvmpipe_fallback {
+            "--llvmpipe-fallback"
+        } else {
+            "--disable-llvmpipe-fallback"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_metal_translator {
+            "--metal-translator"
+        } else {
+            "--disable-metal-translator"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_angle_driver {
+            "--angle-driver"
+        } else {
+            "--disable-angle-driver"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_log_file {
+            "--enable-log-file"
+        } else {
+            "--disable-log-file"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_trace_gl_errors {
+            "--trace-gl-errors"
+        } else {
+            "--disable-trace-gl-errors"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_verbose_logging {
+            "--verbose-logging"
+        } else {
+            "--disable-verbose-logging"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_shader_compatibility_fixes {
+            "--shader-compatibility-fixes"
+        } else {
+            "--disable-shader-compatibility-fixes"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_fix_texture_min_filter {
+            "--fix-texture-min-filter"
+        } else {
+            "--no-fix-texture-min-filter"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_force_composition {
+            "--force-composition"
+        } else {
+            "--disable-force-composition"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_fast_memory {
+            "--enable-direct-memory-access"
+        } else {
+            "--disable-direct-memory-access"
+        }
+        .to_string(),
+    );
+    if quick_options_force_32_bit {
+        option_args.push("--force-32-bit".to_string());
+    } else if quick_options_force_64_bit {
+        option_args.push("--force-64-bit".to_string());
+    }
 
     if let Some(tag) = quick_options_device_tag {
         let tag = tag as NSInteger;
@@ -994,79 +2516,46 @@ fn app_picker_inner(
     (app_path, option_args)
 }
 
-const HYPERHLE_FORK_NAME: &str = "HyperHLE-Fork";
-
-const APP_PICKER_VERSION_LABEL_HEIGHT: CGFloat = 15.0;
-const APP_PICKER_VERSION_LABEL_BOTTOM_INSET: CGFloat = 5.0;
-const APP_PICKER_FOOTER_GAP: CGFloat = 10.0;
-const APP_PICKER_BUTTON_ROW_HEIGHT: CGFloat = 30.0;
-const APP_PICKER_GRID_TOP: CGFloat = 44.0;
-const APP_PICKER_GRID_TO_BUTTON_GAP: CGFloat = 6.0;
-const APP_PICKER_ICON_ROWS: usize = 4;
-
 const ICON_SIZE: CGSize = CGSize {
-    width: 72.0,
-    height: 72.0,
+    width: 70.0,
+    height: 70.0,
 };
-const ICON_LABEL_TOP_GAP: CGFloat = 2.0;
-const ICON_ROW_GAP: CGFloat = 2.0;
+const ICON_IMAGE_INSET: CGFloat = 9.0;
 
-fn app_picker_version_label_top(app_height: CGFloat) -> CGFloat {
-    app_height - APP_PICKER_VERSION_LABEL_HEIGHT - APP_PICKER_VERSION_LABEL_BOTTOM_INSET
+fn picker_ui_scale(size: CGSize) -> CGFloat {
+    let short_side = size.width.min(size.height);
+    (short_side / 320.0).clamp(1.0, 4.5)
 }
 
-fn app_picker_quick_options_button_center(app_height: CGFloat) -> CGFloat {
-    app_picker_version_label_top(app_height)
-        - APP_PICKER_FOOTER_GAP
-        - APP_PICKER_BUTTON_ROW_HEIGHT / 2.0
-}
-
-fn app_picker_quick_options_button_top(app_height: CGFloat) -> CGFloat {
-    app_picker_quick_options_button_center(app_height) - APP_PICKER_BUTTON_ROW_HEIGHT / 2.0
-}
-
-fn app_picker_icon_grid_num_rows(app_height: CGFloat, label_height: CGFloat) -> usize {
-    let grid_bottom =
-        app_picker_quick_options_button_top(app_height) - APP_PICKER_GRID_TO_BUTTON_GAP;
-    let cell_content_height = ICON_SIZE.height + ICON_LABEL_TOP_GAP + label_height;
-    let cell_step_y = cell_content_height + ICON_ROW_GAP;
-    let available_height = (grid_bottom - APP_PICKER_GRID_TOP - cell_content_height).max(0.0);
-    ((available_height / cell_step_y).floor() as usize + 1).clamp(1, APP_PICKER_ICON_ROWS)
-}
-
-#[cfg(test)]
-mod layout_tests {
-    use super::*;
-
-    #[test]
-    fn classic_phone_picker_has_four_icon_rows() {
-        // A visible status bar leaves `UIScreen.applicationFrame` at 320x460.
-        assert_eq!(
-            app_picker_icon_grid_num_rows(460.0, 12.0),
-            APP_PICKER_ICON_ROWS
-        );
+fn picker_font(env: &mut Environment, size: CGFloat) -> id {
+    for family in ["HelveticaNeue-Medium", "HelveticaNeue"] {
+        let name = ns_string::get_static_str(env, family);
+        let font: id = msg_class![env; UIFont fontWithName:name size:size];
+        release(env, name);
+        if font != nil {
+            return font;
+        }
     }
+    msg_class![env; UIFont systemFontOfSize:size]
 }
 
 enum TappedIcon {
     App(usize),
-    ChangePage(usize),
     AddIpa,
 }
+
+const ICON_SCROLL_TAG: NSInteger = 0x5248;
 
 struct IconGridStuff {
     icon_buttons_and_labels: Vec<(id, id)>,
     placeholder_icon: Option<id>,
-    prev_icon: Option<id>,
-    next_icon: Option<id>,
     plus_icon: Option<id>,
     pages: Vec<std::ops::Range<usize>>,
-    icon_map: HashMap<id, TappedIcon>,
-    /// All pages live in one paging `UIScrollView`, built up front, so the
-    /// user can swipe horizontally between them instead of tapping arrows.
+    slots_per_page: usize,
     icon_scroll_view: id,
     page_control: id,
     page_width: CGFloat,
+    icon_map: HashMap<id, TappedIcon>,
 }
 
 fn make_icon_grid(
@@ -1077,44 +2566,48 @@ fn make_icon_grid(
     total_app_count: usize,
     have_wallpaper: bool,
 ) -> IconGridStuff {
-    let num_cols = if app_frame.size.width >= 380.0 {
-        4
-    } else if app_frame.size.width >= 270.0 {
-        3
-    } else {
-        2
+    let ui_scale = picker_ui_scale(app_frame.size);
+    let short_side = app_frame.size.width.min(app_frame.size.height);
+    let icon_size_value = (54.0 * ui_scale).min(short_side * 0.21).max(46.0);
+    let icon_size = CGSize {
+        width: icon_size_value,
+        height: icon_size_value,
     };
+    let num_cols = 4;
     let num_cols_f = num_cols as CGFloat;
-    let label_size = CGSize {
-        width: 74.0,
-        height: 12.0,
+    let num_rows = if app_frame.size.height >= 640.0 * ui_scale {
+        5
+    } else {
+        4
     };
-    let icon_gap_x: CGFloat = 19.0;
-    let icon_gap_y = ICON_LABEL_TOP_GAP + label_size.height + ICON_ROW_GAP;
-    let grid_top = APP_PICKER_GRID_TOP;
-    let num_rows = app_picker_icon_grid_num_rows(app_frame.size.height, label_size.height);
-    let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
-    let icon_grid_origin = CGPoint {
-        x: (app_frame.size.width - icon_grid_width) / 2.0,
-        y: grid_top,
-    };
-
     let slots_per_page = num_cols * num_rows;
     let pages = compute_pages(slots_per_page, total_app_count);
+    let label_size = CGSize {
+        width: icon_size.width + 14.0 * ui_scale,
+        height: 22.0 * ui_scale,
+    };
+    let icon_gap_x: CGFloat = (short_side * 0.028).clamp(8.0, 22.0);
+    let icon_gap_y: CGFloat = (short_side * 0.008).clamp(3.0, 8.0) + label_size.height;
+    let icon_grid_width = (icon_size.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
+    let icon_grid_origin = CGPoint {
+        x: (app_frame.size.width - icon_grid_width) / 2.0,
+        y: 16.0 * ui_scale,
+    };
+    let grid_height = (app_frame.size.height - 220.0 * ui_scale).max(300.0 * ui_scale);
     let page_width = app_frame.size.width;
-    let grid_height = (num_rows as CGFloat) * (ICON_SIZE.height + icon_gap_y);
-
-    let icon_scroll_view: id = msg_class![env; UIScrollView alloc];
-    let icon_scroll_view: id = msg![env; icon_scroll_view initWithFrame:(CGRect {
-        origin: CGPoint { x: 0.0, y: grid_top },
+    let scroll_frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
             width: page_width,
             height: grid_height,
         },
-    })];
+    };
+    let icon_scroll_view: id = msg_class![env; UIScrollView alloc];
+    let icon_scroll_view: id = msg![env; icon_scroll_view initWithFrame:scroll_frame];
     () = msg![env; icon_scroll_view setTag:ICON_SCROLL_TAG];
     () = msg![env; icon_scroll_view setDelegate:delegate];
     () = msg![env; icon_scroll_view setPagingEnabled:true];
+    () = msg![env; icon_scroll_view setDirectionalLockEnabled:false];
     () = msg![env; icon_scroll_view setDelaysContentTouches:false];
     () = msg![env; icon_scroll_view setCanCancelContentTouches:true];
     () = msg![env; icon_scroll_view setScrollEnabled:true];
@@ -1133,11 +2626,11 @@ fn make_icon_grid(
     let page_control: id = msg![env; page_control initWithFrame:(CGRect {
         origin: CGPoint {
             x: 0.0,
-            y: (grid_top + grid_height + 2.0).min(app_frame.size.height - 24.0),
+            y: (grid_height - 28.0 * ui_scale).max(0.0),
         },
         size: CGSize {
             width: page_width,
-            height: 20.0,
+            height: 28.0 * ui_scale,
         },
     })];
     let page_count: NSInteger = pages.len() as NSInteger;
@@ -1145,67 +2638,72 @@ fn make_icon_grid(
     () = msg![env; page_control setCurrentPage:0];
     () = msg![env; page_control setHidesForSinglePage:true];
     () = msg![env; page_control setUserInteractionEnabled:false];
+    let inactive: id = msg_class![env; UIColor lightGrayColor];
+    let active: id = msg_class![env; UIColor darkGrayColor];
+    () = msg![env; page_control setPageIndicatorTintColor:inactive];
+    () = msg![env; page_control setCurrentPageIndicatorTintColor:active];
     () = msg![env; main_view addSubview:page_control];
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
-
     let mut icon_buttons_and_labels = Vec::new();
-
     for page in 0..pages.len() {
-        for i in 0..slots_per_page {
-            let col = i % num_cols;
-            let row = i / num_cols;
-
-            // Rounding is needed here to avoid a blurry or offset image. Icons
-            // are placed in page-local coordinates; each page's origin is
-            // `page_width * page` inside the scroll view's content area.
+        for slot in 0..slots_per_page {
+            let col = slot % num_cols;
+            let row = slot / num_cols;
             let icon_frame = CGRect {
                 origin: CGPoint {
-                    x: (page_width * page as CGFloat
-                        + icon_grid_origin.x
-                        + (col as CGFloat) * (ICON_SIZE.width + icon_gap_x))
+                    x: page_width * page as CGFloat
+                        + (icon_grid_origin.x + (col as CGFloat) * (icon_size.width + icon_gap_x))
+                            .round(),
+                    y: (icon_grid_origin.y + (row as CGFloat) * (icon_size.height + icon_gap_y))
                         .round(),
-                    y: ((row as CGFloat) * (ICON_SIZE.height + icon_gap_y)).round(),
                 },
-                size: ICON_SIZE,
+                size: icon_size,
             };
             let icon_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-            let icon_button: id = msg![env;
-                icon_button initWithFrame:icon_frame
-            ];
-            () = msg![env; icon_button addTarget:delegate action:icon_tapped_sel forControlEvents:UIControlEventTouchUpInside];
-            () = msg![env; icon_button setImage:nil forState:UIControlStateNormal];
-            () = msg![env; icon_button setEnabled:false];
-            () = msg![env; (icon_scroll_view) addSubview:icon_button];
+            () = msg![env; icon_button setFrame:icon_frame];
+            let image_view: id = msg![env; icon_button imageView];
+            let bounds: CGRect = msg![env; icon_button bounds];
+            let inset = ICON_IMAGE_INSET * ui_scale;
+            () = msg![env; image_view setFrame:(CGRect {
+                origin: CGPoint { x: inset, y: inset },
+                size: CGSize {
+                    width: (bounds.size.width - inset * 2.0).max(1.0),
+                    height: (bounds.size.height - inset * 2.0).max(1.0),
+                },
+            })];
+            let layer: id = msg![env; image_view layer];
+            let gravity = ns_string::get_static_str(env, "resizeAspect");
+            () = msg![env; layer setContentsGravity:gravity];
+            () = msg![env; icon_button addTarget:delegate
+                                          action:icon_tapped_sel
+                                forControlEvents:UIControlEventTouchUpInside];
+            () = msg![env; icon_scroll_view addSubview:icon_button];
 
-            // Rounding is needed here to avoid blurry text.
             let label_frame = CGRect {
                 origin: CGPoint {
-                    x: (icon_frame.origin.x - (label_size.width - ICON_SIZE.width) / 2.0).round(),
-                    y: (icon_frame.origin.y + ICON_SIZE.height + ICON_LABEL_TOP_GAP).round(),
+                    x: (icon_frame.origin.x - (label_size.width - icon_size.width) / 2.0).round(),
+                    y: (icon_frame.origin.y + icon_size.height + 4.0 * ui_scale).round(),
                 },
                 size: label_size,
             };
             let label: id = msg_class![env; UILabel alloc];
             let label: id = msg![env; label initWithFrame:label_frame];
             () = msg![env; label setTextAlignment:UITextAlignmentCenter];
-            let font_size: CGFloat = label_size.height - 2.0;
-            let font: id = if have_wallpaper {
-                msg_class![env; UIFont systemFontOfSize:font_size]
-            } else {
-                msg_class![env; UIFont boldSystemFontOfSize:font_size]
-            };
+            let font = picker_font(env, (12.0 * ui_scale).max(10.0));
             () = msg![env; label setFont:font];
+            () = msg![env; label setNumberOfLines:2];
+            () = msg![env; label setAdjustsFontSizeToFitWidth:true];
+            () = msg![env; label setMinimumFontSize:8.0];
             let text_color: id = if have_wallpaper {
                 msg_class![env; UIColor whiteColor]
             } else {
                 msg_class![env; UIColor lightGrayColor]
             };
             () = msg![env; label setTextColor:text_color];
-            let bg_color: id = msg_class![env; UIColor clearColor];
-            () = msg![env; label setBackgroundColor:bg_color];
-            () = msg![env; (icon_scroll_view) addSubview:label];
-
+            let clear: id = msg_class![env; UIColor clearColor];
+            () = msg![env; label setBackgroundColor:clear];
+            () = msg![env; icon_scroll_view addSubview:label];
             icon_buttons_and_labels.push((icon_button, label));
         }
     }
@@ -1213,38 +2711,30 @@ fn make_icon_grid(
     IconGridStuff {
         icon_buttons_and_labels,
         placeholder_icon: None,
-        prev_icon: None,
-        next_icon: None,
         plus_icon: None,
         pages,
-        icon_map: HashMap::new(),
+        slots_per_page,
         icon_scroll_view,
         page_control,
         page_width,
+        icon_map: HashMap::new(),
     }
 }
 
-/// Work out which apps go on each page of the icon grid.
-///
-/// Page 0 reserves its first slot for the "add IPA" (+) tile; the remaining
-/// slots are used for the prev/next arrows (when relevant) and the apps.
 fn compute_pages(total_slots: usize, total_app_count: usize) -> Vec<std::ops::Range<usize>> {
-    let mut pages = Vec::new();
+    let capacity = total_slots.max(1);
     if total_app_count == 0 {
-        pages.push(0..0);
-        return pages;
+        return vec![0..0];
     }
+    let mut pages = Vec::new();
     let mut start = 0;
     while start < total_app_count {
-        let page_idx = pages.len();
-        let has_prev = start != 0;
-        let has_plus = page_idx == 0;
-        let mut app_slots = total_slots - usize::from(has_prev) - usize::from(has_plus);
-        let remaining = total_app_count - start;
-        if remaining > app_slots {
-            app_slots -= 1;
-        }
-        let end = (start + app_slots).min(total_app_count);
+        let page_capacity = if pages.is_empty() {
+            capacity.saturating_sub(1).max(1)
+        } else {
+            capacity
+        };
+        let end = (start + page_capacity).min(total_app_count);
         pages.push(start..end);
         start = end;
     }
@@ -1258,28 +2748,22 @@ fn make_icon_from_glyph(
     baseline_offset: CGFloat,
     bg_color: (CGFloat, CGFloat, CGFloat, CGFloat),
 ) -> id {
-    let ui_scale = env.options.ui_scale.get() as CGFloat;
     let color_space = CGColorSpaceCreateDeviceRGB(env);
     let context = CGBitmapContextCreate(
         env,
         Ptr::null(),
-        (ICON_SIZE.width as u32).saturating_mul(env.options.ui_scale.get()),
-        (ICON_SIZE.height as u32).saturating_mul(env.options.ui_scale.get()),
+        ICON_SIZE.width as u32,
+        ICON_SIZE.height as u32,
         8,
-        4 * (ICON_SIZE.width as u32).saturating_mul(env.options.ui_scale.get()),
+        4 * (ICON_SIZE.width as u32),
         color_space,
         kCGImageAlphaPremultipliedLast,
     );
     UIGraphicsPushContext(env, context);
 
-    let scaled_width = ICON_SIZE.width * ui_scale;
-    let scaled_height = ICON_SIZE.height * ui_scale;
-
-    // Compensate for row order inversion. The offset is in bitmap pixels,
-    // so it must be scaled along with everything else.
-    CGContextSaveGState(env, context);
-    CGContextTranslateCTM(env, context, 0.0, scaled_height);
-    CGContextScaleCTM(env, context, ui_scale, -ui_scale);
+    // Compensate for row order inversion
+    CGContextTranslateCTM(env, context, 0.0, ICON_SIZE.height);
+    CGContextScaleCTM(env, context, 1.0, -1.0);
 
     let (r, g, b, a) = bg_color;
     CGContextSetRGBFillColor(env, context, r, g, b, a);
@@ -1291,21 +2775,14 @@ fn make_icon_from_glyph(
             size: ICON_SIZE,
         },
     );
-    CGContextRestoreGState(env, context);
 
-    // Draw the glyph at 1:1 device pixels with a larger font, so it is
-    // rasterized at the higher resolution instead of being upscaled by
-    // the CTM (which would make it blurry).
-    CGContextTranslateCTM(env, context, 0.0, scaled_height);
-    CGContextScaleCTM(env, context, 1.0, -1.0);
-
-    let font: id = msg_class![env; UIFont systemFontOfSize:(font_size * ui_scale)];
+    let font: id = picker_font(env, font_size);
     let glyph_string: id = ns_string::from_rust_string(env, [glyph].into_iter().collect());
     let glyph_size: CGSize = msg![env; glyph_string sizeWithFont:font];
     CGContextSetRGBFillColor(env, context, 1.0, 1.0, 1.0, 1.0); // white
     let glyph_origin = CGPoint {
-        x: scaled_width / 2.0 - glyph_size.width / 2.0,
-        y: scaled_height / 2.0 - glyph_size.height / 2.0 + baseline_offset * ui_scale,
+        x: ICON_SIZE.width / 2.0 - glyph_size.width / 2.0,
+        y: ICON_SIZE.height / 2.0 - glyph_size.height / 2.0 + baseline_offset,
     };
     let _: CGSize = msg![env; glyph_string drawAtPoint:glyph_origin withFont:font];
     release(env, glyph_string);
@@ -1313,12 +2790,9 @@ fn make_icon_from_glyph(
     UIGraphicsPopContext(env);
 
     let cg_image = CGBitmapContextCreateImage(env, context);
-    // This radius should match the one in src/bundle.rs, adjusted for the
-    // bitmap resolution.
+    // This radius should match the one in src/bundle.rs.
     cg_image::borrow_image_mut(&mut env.objc, cg_image).round_corners(
-        12.0 * ui_scale,
-        /* four_corners: */ true,
-        /* add_sheen: */ true,
+        12.0, /* four_corners: */ true, /* add_sheen: */ true,
     );
     CGContextRelease(env, context);
 
@@ -1328,10 +2802,6 @@ fn make_icon_from_glyph(
     ui_image
 }
 
-/// Fill in every page of the icon scroll view with the current app list.
-///
-/// `page_idx` is the page that should be scrolled into view (e.g. the page
-/// the user was on before the grid was rebuilt).
 fn update_icon_grid(
     env: &mut Environment,
     icon_grid_stuff: &mut IconGridStuff,
@@ -1343,81 +2813,58 @@ fn update_icon_grid(
     let mut icon_iter = icon_grid_stuff.icon_buttons_and_labels.iter();
 
     for page in 0..icon_grid_stuff.pages.len() {
-        let app_idx_range = icon_grid_stuff.pages[page].clone();
-        let have_prev_icon = page != 0;
-        let have_plus_icon = page == 0;
-        let have_next_icon = app_idx_range.end != apps.len();
-
-        if have_prev_icon {
+        let app_range = icon_grid_stuff.pages[page].clone();
+        for slot in 0..icon_grid_stuff.slots_per_page {
             let &(icon_button, label) = icon_iter.next().unwrap();
-            let image = *icon_grid_stuff.prev_icon.get_or_insert_with(|| {
-                make_icon_from_glyph(env, '\u{2190}', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
-            });
-            () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-            () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-            icon_grid_stuff
-                .icon_map
-                .insert(icon_button, TappedIcon::ChangePage(page - 1));
-        }
+            () = msg![env; icon_button setImage:nil forState:UIControlStateNormal];
+            let empty = ns_string::get_static_str(env, "");
+            () = msg![env; label setText:empty];
 
-        if have_plus_icon {
-            let &(icon_button, label) = icon_iter.next().unwrap();
-            let image = *icon_grid_stuff.plus_icon.get_or_insert_with(|| {
-                make_icon_from_glyph(env, '+', 50.0, -6.0, (0.25, 0.25, 0.25, 1.0))
-            });
-            () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-            () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-            icon_grid_stuff
-                .icon_map
-                .insert(icon_button, TappedIcon::AddIpa);
-        }
-
-        for app_idx in app_idx_range.clone() {
-            let app = &mut apps[app_idx];
-
-            let &(icon_button, label) = icon_iter.next().unwrap();
-
-            if let Some(icon) = app.icon.take() {
-                let cg_image = cg_image::from_image(env, icon);
-                let image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
-                app.icon_ui_image = Some(image);
+            if page == 0 && slot == 0 {
+                let image = *icon_grid_stuff.plus_icon.get_or_insert_with(|| {
+                    make_icon_from_glyph(env, '+', 50.0, -6.0, (0.25, 0.25, 0.25, 1.0))
+                });
+                () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
+                let title = ns_string::get_static_str(env, "Add game");
+                () = msg![env; label setText:title];
+                icon_grid_stuff
+                    .icon_map
+                    .insert(icon_button, TappedIcon::AddIpa);
+                continue;
             }
 
+            let app_slot = if page == 0 {
+                slot.saturating_sub(1)
+            } else {
+                slot
+            };
+            let Some(app_idx) = app_range
+                .start
+                .checked_add(app_slot)
+                .filter(|index| *index < app_range.end)
+            else {
+                continue;
+            };
+            let app = &mut apps[app_idx];
+            if let Some(icon) = app.icon.take() {
+                let image = cg_image::from_image(env, icon);
+                let image: id = msg_class![env; UIImage imageWithCGImage:image];
+                app.icon_ui_image = Some(image);
+            }
             let image = app.icon_ui_image.unwrap_or_else(|| {
                 *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
                     make_icon_from_glyph(env, '?', 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
                 })
             });
             () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-
             let text = *app
                 .display_name_ns_string
                 .get_or_insert_with(|| ns_string::from_rust_string(env, app.display_name.clone()));
             () = msg![env; label setText:text];
-
             icon_grid_stuff
                 .icon_map
                 .insert(icon_button, TappedIcon::App(app_idx));
         }
-
-        if have_next_icon {
-            let &(icon_button, label) = icon_iter.next().unwrap();
-            let image = *icon_grid_stuff.next_icon.get_or_insert_with(|| {
-                make_icon_from_glyph(env, '\u{2192}', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
-            });
-            () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-            () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-            icon_grid_stuff
-                .icon_map
-                .insert(icon_button, TappedIcon::ChangePage(page + 1));
-        }
-    }
-
-    // Slots past the end of the app list (only possible on the last page)
-    // stay blank.
-    for &(icon_button, label) in icon_iter {
-        () = msg![env; icon_button setImage:nil forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
     }
 
     () = msg![env; (icon_grid_stuff.icon_scroll_view) setContentOffset:(CGPoint {
@@ -1433,6 +2880,121 @@ fn remove_icon_grid(env: &mut Environment, icon_grid_stuff: &IconGridStuff) {
     () = msg![env; (icon_grid_stuff.page_control) removeFromSuperview];
 }
 
+fn make_app_launcher_grid(
+    env: &mut Environment,
+    delegate: id,
+    super_view: id,
+    super_view_size: CGSize,
+    first_row_center: CGFloat,
+    second_row_center: CGFloat,
+) {
+    let ui_scale = picker_ui_scale(super_view_size);
+    let short_side = super_view_size.width.min(super_view_size.height);
+    let icon_size = (52.0 * ui_scale).min(short_side * 0.21).max(44.0);
+    let card_width = (super_view_size.width * 0.40).max(icon_size + 12.0 * ui_scale);
+    let items = [
+        ("Files", "openFileManager", "/res/picker_files_icon.jpg"),
+        (
+            "Settings",
+            "quickOptionsShow",
+            "/res/picker_settings_icon.jpg",
+        ),
+        ("Info", "copyrightInfoShow", "/res/picker_touchhle_icon.png"),
+        (
+            "TouchHLE.org",
+            "visitWebsite",
+            "/res/picker_touchhle_icon.png",
+        ),
+    ];
+    for (index, (title, selector_name, icon_path)) in items.iter().enumerate() {
+        let row = index / 2;
+        let column = index % 2;
+        let center = if row == 0 {
+            first_row_center
+        } else {
+            second_row_center
+        };
+        let card_center_x = if column == 0 {
+            super_view_size.width * 0.28
+        } else {
+            super_view_size.width * 0.72
+        };
+        let icon_frame = CGRect {
+            origin: CGPoint {
+                x: (card_center_x - icon_size / 2.0).round(),
+                y: (center - icon_size / 2.0 - 7.0 * ui_scale).round(),
+            },
+            size: CGSize {
+                width: icon_size,
+                height: icon_size,
+            },
+        };
+        let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        () = msg![env; button setFrame:icon_frame];
+        let resource: &[u8] = match *icon_path {
+            "/res/picker_files_icon.jpg" => &include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/res/picker_files_icon.jpg"
+            ))[..],
+            "/res/picker_settings_icon.jpg" => &include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/res/picker_settings_icon.jpg"
+            ))[..],
+            "/res/picker_touchhle_icon.png" => &include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/res/picker_touchhle_icon.png"
+            ))[..],
+            _ => unreachable!(),
+        };
+        let mut image = Image::from_bytes(resource).expect("picker icon resource must be valid");
+        image.round_corners(
+            12.0, /* four_corners: */ true, /* add_sheen: */ true,
+        );
+        let image = cg_image::from_image(env, image);
+        let image: id = msg_class![env; UIImage imageWithCGImage:image];
+        () = msg![env; button setImage:image forState:UIControlStateNormal];
+        let clear: id = msg_class![env; UIColor clearColor];
+        () = msg![env; button setBackgroundColor:clear];
+        let image_view: id = msg![env; button imageView];
+        () = msg![env; image_view setContentMode:2];
+        () = msg![env; image_view setFrame:(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: icon_frame.size,
+        })];
+        let selector = env.objc.lookup_selector(selector_name).unwrap();
+        () = msg![env; button addTarget:delegate
+                                 action:selector
+                       forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; super_view addSubview:button];
+
+        let label_frame = CGRect {
+            origin: CGPoint {
+                x: (card_center_x - card_width / 2.0).round(),
+                y: (icon_frame.origin.y + icon_size + 4.0 * ui_scale).round(),
+            },
+            size: CGSize {
+                width: card_width,
+                height: (17.0 * ui_scale).max(13.0),
+            },
+        };
+        let label: id = msg_class![env; UILabel alloc];
+        let label: id = msg![env; label initWithFrame:label_frame];
+        let text = ns_string::get_static_str(env, title);
+        () = msg![env; label setText:text];
+        () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+        let font = picker_font(env, (11.0 * ui_scale).max(9.0));
+        () = msg![env; label setFont:font];
+        () = msg![env; label setAdjustsFontSizeToFitWidth:true];
+        () = msg![env; label setMinimumFontSize:8.0];
+        () = msg![env; label setNumberOfLines:1];
+        let text_color: id = msg_class![env; UIColor whiteColor];
+        () = msg![env; label setTextColor:text_color];
+        let clear: id = msg_class![env; UIColor clearColor];
+        () = msg![env; label setBackgroundColor:clear];
+        () = msg![env; super_view addSubview:label];
+    }
+}
+
 fn make_button_row(
     env: &mut Environment,
     delegate: id,
@@ -1442,11 +3004,12 @@ fn make_button_row(
     buttons: &[(&'static str, &'static str)],
     font_size: Option<CGFloat>,
 ) -> Vec<id> {
-    let margin = 10.0;
-
+    let ui_scale = picker_ui_scale(super_view_size);
+    let margin = 6.0 * ui_scale;
     let button_size = CGSize {
-        width: (super_view_size.width - margin) / (buttons.len() as CGFloat) - margin,
-        height: APP_PICKER_BUTTON_ROW_HEIGHT,
+        width: (super_view_size.width - margin * (buttons.len() as CGFloat + 1.0))
+            / buttons.len() as CGFloat,
+        height: 30.0 * ui_scale,
     };
     let mut button_frame = CGRect {
         origin: CGPoint {
@@ -1458,18 +3021,25 @@ fn make_button_row(
 
     let mut ui_buttons = Vec::new();
     for (title_text, selector) in buttons {
-        let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeRoundedRect];
+        let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
         let text = ns_string::get_static_str(env, title_text);
         () = msg![env; button setTitle:text forState:UIControlStateNormal];
         () = msg![env; button setFrame:button_frame];
-        // FIXME: manually calling layoutSubviews shouldn't be needed?
-        () = msg![env; button layoutSubviews];
 
-        if let Some(font_size) = font_size {
-            let label: id = msg![env; button titleLabel];
-            let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
-            () = msg![env; label setFont:font];
-        }
+        let label: id = msg![env; button titleLabel];
+        let scaled_font_size = font_size.unwrap_or(12.0) * ui_scale;
+        let font: id = picker_font(env, scaled_font_size);
+        () = msg![env; label setFont:font];
+        () = msg![env; label setAdjustsFontSizeToFitWidth:true];
+        () = msg![env; label setMinimumFontSize:8.0];
+        () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+        let white: id = msg_class![env; UIColor whiteColor];
+        () = msg![env; button setTitleColor:white forState:UIControlStateNormal];
+        let button_background: id = msg_class![env; UIColor darkGrayColor];
+        let _: () = msg![env; button setBackgroundColor:button_background];
+        let layer: id = msg![env; button layer];
+        () = msg![env; layer setCornerRadius:(7.0 * ui_scale)];
+        () = msg![env; button layoutSubviews];
 
         let selector = env.objc.lookup_selector(selector).unwrap();
         () = msg![env; button addTarget:delegate
@@ -1483,10 +3053,370 @@ fn make_button_row(
     ui_buttons
 }
 
+struct CopyrightInfoStuff {
+    main_view: id,
+    text_frame: CGRect,
+    text_label: id,
+    font: id,
+    pages: Vec<(std::ops::Range<usize>, CGFloat)>,
+    last_page_idx: Option<usize>,
+    prev_page_button: id,
+    next_page_button: id,
+}
+
+struct ArchDialogStuff {
+    backdrop: id,
+    main_view: id,
+}
+
+/// Modal dialog shown when a tapped app contains both ARM32 and ARM64
+/// slices, letting the user pick which slice to launch.
+fn setup_arch_dialog(
+    env: &mut Environment,
+    delegate: id,
+    super_view: id,
+    app_frame: CGRect,
+) -> ArchDialogStuff {
+    let ui_scale = picker_ui_scale(app_frame.size);
+
+    let backdrop_frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: app_frame.size,
+    };
+    let backdrop: id = msg_class![env; UIView alloc];
+    let backdrop: id = msg![env; backdrop initWithFrame:backdrop_frame];
+    let backdrop_color: id = msg_class![env; UIColor blackColor];
+    () = msg![env; backdrop setBackgroundColor:backdrop_color];
+    () = msg![env; backdrop setAlpha:(0.6 as CGFloat)];
+    () = msg![env; backdrop setHidden:true];
+    () = msg![env; super_view addSubview:backdrop];
+
+    let panel_width = (app_frame.size.width * 0.8).clamp(240.0, 560.0);
+    let panel_height = 190.0 * ui_scale;
+    let panel_frame = CGRect {
+        origin: CGPoint {
+            x: (app_frame.size.width - panel_width) / 2.0,
+            y: (app_frame.size.height - panel_height) / 2.0,
+        },
+        size: CGSize {
+            width: panel_width,
+            height: panel_height,
+        },
+    };
+    let main_view: id = msg_class![env; UIView alloc];
+    let main_view: id = msg![env; main_view initWithFrame:panel_frame];
+    let bg_color: id = msg_class![env; UIColor darkGrayColor];
+    () = msg![env; main_view setBackgroundColor:bg_color];
+    let main_layer: id = msg![env; main_view layer];
+    () = msg![env; main_layer setCornerRadius:(10.0 as CGFloat)];
+    () = msg![env; main_view setHidden:true];
+    () = msg![env; super_view addSubview:main_view];
+
+    let title_frame = CGRect {
+        origin: CGPoint {
+            x: 10.0,
+            y: 12.0 * ui_scale,
+        },
+        size: CGSize {
+            width: panel_width - 20.0,
+            height: 56.0 * ui_scale,
+        },
+    };
+    let title: id = msg_class![env; UILabel alloc];
+    let title: id = msg![env; title initWithFrame:title_frame];
+    let title_text = ns_string::get_static_str(
+        env,
+        "This app has both 32-bit and 64-bit support.\nWhich version do you want to launch?",
+    );
+    () = msg![env; title setText:title_text];
+    () = msg![env; title setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; title setNumberOfLines:0];
+    let title_color: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; title setTextColor:title_color];
+    let title_bg: id = msg_class![env; UIColor clearColor];
+    () = msg![env; title setBackgroundColor:title_bg];
+    let title_font = picker_font(env, 13.0 * ui_scale);
+    () = msg![env; title setFont:title_font];
+    () = msg![env; main_view addSubview:title];
+
+    let button_width = panel_width - 40.0;
+    let button_height = 34.0 * ui_scale;
+    let button_x = 20.0;
+    let mut button_y = 76.0 * ui_scale;
+    for (label, selector_name, emphasized) in [
+        ("Launch 32-bit (recommended)", "archPick32", true),
+        ("Launch 64-bit (experimental)", "archPick64", false),
+        ("Cancel", "archPickCancel", false),
+    ] {
+        let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        let text = ns_string::get_static_str(env, label);
+        () = msg![env; button setTitle:text forState:UIControlStateNormal];
+        let label_view: id = msg![env; button titleLabel];
+        let font = picker_font(env, 12.0 * ui_scale);
+        () = msg![env; label_view setFont:font];
+        let text_color: id = msg_class![env; UIColor whiteColor];
+        () = msg![env; button setTitleColor:text_color forState:UIControlStateNormal];
+        let color: id = if emphasized {
+            msg_class![env; UIColor magentaColor]
+        } else {
+            msg_class![env; UIColor darkGrayColor]
+        };
+        () = msg![env; button setBackgroundColor:color];
+        () = msg![env; button setFrame:(CGRect {
+            origin: CGPoint { x: button_x, y: button_y },
+            size: CGSize { width: button_width, height: button_height },
+        })];
+        () = msg![env; button layoutSubviews];
+        let selector = env.objc.lookup_selector(selector_name).unwrap();
+        () = msg![env; button addTarget:delegate
+                                 action:selector
+                       forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; main_view addSubview:button];
+        button_y += button_height + 8.0 * ui_scale;
+    }
+
+    ArchDialogStuff { backdrop, main_view }
+}
+
+fn setup_copyright_info(
+    env: &mut Environment,
+    delegate: id,
+    super_view: id,
+    app_frame: CGRect,
+) -> CopyrightInfoStuff {
+    let main_frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: app_frame.size,
+    };
+
+    let divider = main_frame.size.height - 40.0;
+
+    // Container for all the other stuff
+
+    let main_view: id = msg_class![env; UIView alloc];
+    let main_view: id = msg![env; main_view initWithFrame:main_frame];
+    // TODO: Isn't white the default?
+    let bg_color: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; main_view setBackgroundColor:bg_color];
+    // This main_view is hidden until the copyright info button is tapped.
+    () = msg![env; main_view setHidden:true];
+    () = msg![env; super_view addSubview:main_view];
+
+    // UILabel that will display part of the copyright text
+
+    let padding = 10.0;
+    let text_frame = CGRect {
+        origin: CGPoint {
+            x: padding,
+            y: padding,
+        },
+        size: CGSize {
+            width: app_frame.size.width - padding * 2.0,
+            height: divider - padding * 2.0,
+        },
+    };
+
+    let text_label: id = msg_class![env; UILabel alloc];
+    let text_label: id = msg![env; text_label initWithFrame:text_frame];
+    () = msg![env; text_label setNumberOfLines:0]; // unlimited
+    let text_color: id = msg_class![env; UIColor blackColor];
+    () = msg![env; text_label setTextColor:text_color];
+    let bg_color: id = msg_class![env; UIColor clearColor];
+    () = msg![env; text_label setBackgroundColor:bg_color];
+    let font_size: CGFloat = 16.0;
+    let font: id = picker_font(env, font_size);
+    () = msg![env; text_label setFont:font];
+    () = msg![env; main_view addSubview:text_label];
+
+    // Navigation
+
+    let buttons_row_center = (main_frame.size.height + divider) / 2.0;
+    let buttons = make_button_row(
+        env,
+        delegate,
+        main_view,
+        main_frame.size,
+        buttons_row_center,
+        &[
+            ("↑", "copyrightInfoPrevPage"),
+            ("↓", "copyrightInfoNextPage"),
+            ("×", "copyrightInfoHide"),
+        ],
+        Some(30.0),
+    );
+
+    CopyrightInfoStuff {
+        main_view,
+        text_frame,
+        text_label,
+        font,
+        pages: Vec::new(),
+        last_page_idx: None,
+        prev_page_button: buttons[0],
+        next_page_button: buttons[1],
+    }
+}
+
+fn change_copyright_page(
+    env: &mut Environment,
+    copyright_info_stuff: &mut CopyrightInfoStuff,
+    copyright_info_text: &str,
+    page_idx: usize,
+) {
+    // TODO: Eventually this should be ripped out and replaced with a scrolling
+    // UITextView, once that's implemented.
+
+    let &mut CopyrightInfoStuff {
+        text_frame,
+        text_label,
+        font,
+        ref mut pages,
+        ref mut last_page_idx,
+        prev_page_button,
+        next_page_button,
+        ..
+    } = copyright_info_stuff;
+
+    // Lazily lay out pages of text as needed.
+
+    if page_idx == pages.len() {
+        let mut page_start = pages.last().map_or(0, |page| page.0.end);
+        while copyright_info_text[page_start..].starts_with([' ', '\n', '\r']) {
+            page_start += 1;
+        }
+        let mut page_height = 0.0;
+        let page_end = loop {
+            let mut line_start = page_start;
+            while line_start < copyright_info_text.len() {
+                let is_first_line = line_start == page_start;
+
+                let line_end = if let Some(i) = copyright_info_text[line_start..].find('\n') {
+                    line_start + i + 1
+                } else {
+                    copyright_info_text.len()
+                };
+
+                let line = &copyright_info_text[line_start..line_end];
+
+                // Force pagination before headings (in Dynarmic's license text)
+                if !is_first_line && line.starts_with("###") {
+                    break;
+                }
+
+                let line_temp = ns_string::from_rust_string(env, line.to_string());
+                let line_size: CGSize = msg![env; line_temp sizeWithFont:font
+                                                       constrainedToSize:(text_frame.size)];
+                // Avoid accumulation of old line strings.
+                release(env, line_temp);
+
+                if page_height + line_size.height > text_frame.size.height {
+                    break;
+                }
+
+                page_height += line_size.height;
+                line_start = line_end;
+
+                // Force pagination after dividers
+                if !is_first_line && line.starts_with("---") {
+                    break;
+                }
+            }
+            let page_end = line_start;
+            assert!(page_start != page_end);
+
+            // Avoid entirely blank pages
+            if copyright_info_text[page_start..page_end].trim() == "" {
+                page_start = page_end;
+            } else {
+                break page_end;
+            }
+        };
+        assert!(page_start != page_end);
+        pages.push((page_start..page_end, page_height));
+        if page_end == copyright_info_text.len() {
+            *last_page_idx = Some(page_idx);
+        }
+    }
+
+    // Actually display the page
+
+    let (page, page_height) = pages[page_idx].clone();
+    let page = &copyright_info_text[page];
+
+    let page: id = ns_string::from_rust_string(env, page.to_string());
+    () = msg![env; text_label setText:page];
+    // Avoid accumulation of old page strings.
+    release(env, page);
+
+    // UILabel always vertically centers text. Work around that by resizing it.
+    let label_frame = CGRect {
+        origin: text_frame.origin,
+        size: CGSize {
+            width: text_frame.size.width,
+            // The page height is slightly off, a little padding is needed.
+            height: page_height + 10.0,
+        },
+    };
+    () = msg![env; text_label setFrame:label_frame];
+
+    () = msg![env; prev_page_button setHidden:(page_idx == 0)];
+    () = msg![env; next_page_button setHidden:(Some(page_idx) == *last_page_idx)];
+}
+
 struct QuickOptionsStuff {
     main_view: id,
-    scale_hack_buttons: [id; 5],
+    settings_backdrop: id,
+    settings_category_buttons: [id; 4],
+    settings_category_views: [Vec<id>; 4],
+    ios_version_btn: id,
+    ios_version_menu: id,
+    ios_version_items: Vec<id>,
+    graphics_api_btn: id,
+    graphics_api_menu: id,
+    graphics_api_items: Vec<id>,
+    texture_filtering_btn: id,
+    texture_filtering_menu: id,
+    texture_filtering_items: Vec<id>,
+    memory_management_btn: id,
+    memory_management_menu: id,
+    memory_management_items: Vec<id>,
+    gles_override_btn: id,
+    gles_override_menu: id,
+    gles_override_items: Vec<id>,
+    audio_backend_btn: id,
+    audio_backend_menu: id,
+    audio_backend_items: Vec<id>,
+    custom_driver_btn: id,
+    custom_driver_switch: id,
+    custom_driver_menu: id,
+    custom_driver_paths: Vec<PathBuf>,
+    quality_buttons: Vec<Vec<id>>,
+    scale_hack_buttons: [id; 7],
+    custom_resolution_button: id,
+    custom_resolution_menu: id,
+    custom_resolution_editor: id,
+    custom_resolution_width_field: id,
+    custom_resolution_height_field: id,
+    custom_resolution_error: id,
     orientation_buttons: [id; 4],
+    render_rotation_buttons: [id; 5],
+    frame_generation_switch: id,
+    skip_intros_switch: id,
+    high_performance_switch: id,
+    force_max_clocks_switch: id,
+    fps_limit_buttons: [id; 4],
+    low_audio_quality_switch: id,
+    no_texture_compression_switch: id,
+    vsync_switch: id,
+    battery_saver_switch: id,
+    ultra_battery_saver_switch: id,
+    log_file_switch: id,
+    verbose_logging_switch: id,
+    trace_gl_errors_switch: id,
+    fix_texture_min_filter_switch: id,
+    force_composition_switch: id,
+    revert_x_axis_switch: id,
+    revert_y_axis_switch: id,
     /// The button that toggles the "Device model" dropdown open/closed. Its
     /// title shows the currently-selected model plus an up/down arrow.
     device_model_btn: id,
@@ -1535,7 +3465,7 @@ fn device_model_label_for_tag(tag: Option<i32>) -> String {
     use crate::window::DeviceFamily;
     match tag.map(|t| t as NSInteger) {
         None | Some(DEVICE_TAG_DEFAULT) => "Default".to_string(),
-        Some(DEVICE_TAG_AUTO) => "Auto".to_string(),
+        Some(DEVICE_TAG_AUTO) => "Native".to_string(),
         Some(idx) => DeviceFamily::ALL_SELECTABLE
             .get(idx as usize)
             .map(|f| f.display_name().to_string())
@@ -1548,34 +3478,105 @@ fn setup_quick_options(
     delegate: id,
     super_view: id,
     app_frame: CGRect,
-    cheat_engine_enabled: bool,
-    gles_native_enabled: bool,
+    host_resolutions: &[(u32, u32)],
 ) -> QuickOptionsStuff {
     // UIView*
-    let main_frame = CGRect {
+    let visible_frame = CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: app_frame.size,
     };
+    let content_height = app_frame.size.height.max(6200.0);
+    let main_frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width: app_frame.size.width,
+            height: content_height,
+        },
+    };
 
-    // Container for all the other stuff
+    let settings_category_buttons = [nil; 4];
+    let settings_category_views: [Vec<id>; 4] = std::array::from_fn(|_| Vec::new());
 
-    let main_view: id = msg_class![env; UIView alloc];
-    let main_view: id = msg![env; main_view initWithFrame:main_frame];
-    // TODO: Isn't white the default?
-    let bg_color: id = msg_class![env; UIColor whiteColor];
-    () = msg![env; main_view setBackgroundColor:bg_color];
-    // This main_view is hidden until the quick options button is tapped.
+    // Container for all the other stuff. The settings list is taller than the
+    // screen and is hosted in a real scroll view so every option keeps a
+    // readable row instead of being compressed into overlapping controls.
+
+    let settings_background: id =
+        msg_class![env; UIColor colorWithRed:0.72 green:0.72 blue:0.72 alpha:1.0];
+    let settings_backdrop: id = msg_class![env; UIView alloc];
+    let settings_backdrop: id = msg![env; settings_backdrop initWithFrame:visible_frame];
+    () = msg![env; settings_backdrop setBackgroundColor:settings_background];
+    () = msg![env; settings_backdrop setOpaque:true];
+    () = msg![env; settings_backdrop setHidden:true];
+    () = msg![env; super_view addSubview:settings_backdrop];
+
+    let main_view: id = msg_class![env; UIScrollView alloc];
+    let main_view: id = msg![env; main_view initWithFrame:visible_frame];
+    let content_size = main_frame.size;
+    () = msg![env; main_view setContentSize:content_size];
+    () = msg![env; main_view setScrollEnabled:true];
+    () = msg![env; main_view setShowsVerticalScrollIndicator:true];
+    () = msg![env; main_view setAlwaysBounceVertical:true];
+    () = msg![env; main_view setBackgroundColor:settings_background];
+    () = msg![env; main_view setOpaque:true];
+    // This main_view is hidden until the settings button is tapped.
     () = msg![env; main_view setHidden:true];
     () = msg![env; super_view addSubview:main_view];
 
-    let divider = 50.0;
+    let ui_scale = picker_ui_scale(app_frame.size);
+    let divider = 42.0 * ui_scale;
+
+    let header_frame = CGRect {
+        origin: CGPoint {
+            x: 22.0 * ui_scale,
+            y: 12.0 * ui_scale,
+        },
+        size: CGSize {
+            width: main_frame.size.width - 44.0 * ui_scale,
+            height: 30.0 * ui_scale,
+        },
+    };
+    let header: id = msg_class![env; UILabel alloc];
+    let header: id = msg![env; header initWithFrame:header_frame];
+    let header_text = ns_string::get_static_str(env, "Settings");
+    () = msg![env; header setText:header_text];
+    () = msg![env; header setTextAlignment:UITextAlignmentLeft];
+    let header_font = picker_font(env, 24.0 * ui_scale);
+    () = msg![env; header setFont:header_font];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; header setTextColor:black];
+    let clear: id = msg_class![env; UIColor clearColor];
+    () = msg![env; header setBackgroundColor:clear];
+    () = msg![env; main_view addSubview:header];
+
+    let subtitle_frame = CGRect {
+        origin: CGPoint {
+            x: 22.0 * ui_scale,
+            y: 42.0 * ui_scale,
+        },
+        size: CGSize {
+            width: main_frame.size.width - 44.0 * ui_scale,
+            height: 20.0 * ui_scale,
+        },
+    };
+    let subtitle: id = msg_class![env; UILabel alloc];
+    let subtitle: id = msg![env; subtitle initWithFrame:subtitle_frame];
+    let subtitle_text = ns_string::get_static_str(env, "Scroll for more options");
+    () = msg![env; subtitle setText:subtitle_text];
+    () = msg![env; subtitle setTextAlignment:UITextAlignmentLeft];
+    let subtitle_font = picker_font(env, 13.0 * ui_scale);
+    () = msg![env; subtitle setFont:subtitle_font];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; subtitle setTextColor:black];
+    () = msg![env; main_view addSubview:subtitle];
 
     // Close button (×) in the upper right corner. It uses an explicit border
     // and a slightly larger frame than the title so the glyph is clearly
     // visible against the white menu background.
     {
-        let button_size: CGFloat = 36.0;
-        let button_margin: CGFloat = 8.0;
+        let ui_scale = picker_ui_scale(main_frame.size);
+        let button_size: CGFloat = 30.0 * ui_scale;
+        let button_margin: CGFloat = 6.0 * ui_scale;
         let button_frame = CGRect {
             origin: CGPoint {
                 x: main_frame.size.width - button_size - button_margin,
@@ -1595,7 +3596,8 @@ fn setup_quick_options(
         () = msg![env; button layoutSubviews];
 
         let label: id = msg![env; button titleLabel];
-        let font: id = msg_class![env; UIFont systemFontOfSize:(28.0 as CGFloat)];
+        let scaled_font_size = 23.0 * ui_scale;
+        let font: id = picker_font(env, scaled_font_size);
         () = msg![env; label setFont:font];
 
         // `buttonWithType:UIButtonTypeRoundedRect` does not actually apply the
@@ -1618,21 +3620,137 @@ fn setup_quick_options(
     }
 
     enum RowKind {
+        Section(&'static str),
+        Subsection(&'static str),
         Label(&'static str),
+        LabelWithWarning(&'static str),
         Buttons(&'static [(&'static str, &'static str)]),
         /// Dropdown listing every selectable device model.
         DeviceDropdown,
+        /// Compact dropdown for the emulated iOS version.
+        IosVersionDropdown,
+        GraphicsApiDropdown,
+        GlesOverrideDropdown,
+        TextureFilteringDropdown,
+        MemoryManagementDropdown,
+        AudioBackendDropdown,
+        CustomDriverDropdown,
         Switch(&'static str, bool),
     }
     let rows = [
-        RowKind::Label("Scale hack"),
+        RowKind::Section("PERFORMANCE & GRAPHICS"),
+        RowKind::Subsection("Performance"),
+        RowKind::Label("High performance mode"),
+        RowKind::Switch("highPerformance:", crate::options::DEFAULT_HIGH_PERFORMANCE),
+        RowKind::LabelWithWarning("Force maximum GPU clocks"),
+        RowKind::Switch("forceMaxClocks:", crate::options::DEFAULT_FORCE_MAX_CLOCKS),
+        RowKind::Label("Battery saver"),
+        RowKind::Switch("batterySaver:", false),
+        RowKind::Label("Ultra battery saver"),
+        RowKind::Switch("ultraBatterySaver:", false),
+        RowKind::Label("Fast memory"),
+        RowKind::Switch("fastMemory:", crate::options::DEFAULT_FAST_MEMORY),
+        RowKind::Label("Memory management"),
+        RowKind::MemoryManagementDropdown,
+        RowKind::Label("Frame pacing"),
+        RowKind::Switch("framePacing:", true),
+        RowKind::Label("FPS limit"),
         RowKind::Buttons(&[
-            ("Default", "scaleHackDefault"),
-            ("Off", "scaleHack1"),
-            ("2×", "scaleHack2"),
-            ("3×", "scaleHack3"),
-            ("4×", "scaleHack4"),
+            ("Dynamic", "fpsLimitDynamic"),
+            ("30", "fpsLimit30"),
+            ("60", "fpsLimit60"),
+            ("120", "fpsLimit120"),
         ]),
+        RowKind::Label("Frame generation"),
+        RowKind::Switch("frameGeneration:", false),
+        RowKind::Label("Skip intro movies (off by default)"),
+        RowKind::Switch("skipIntros:", false),
+        RowKind::Subsection("Graphics quality"),
+        RowKind::Label("Graphics API"),
+        RowKind::GraphicsApiDropdown,
+        RowKind::Label("Vsync"),
+        RowKind::Switch("vsync:", false),
+        RowKind::Label("Anisotropic filtering"),
+        RowKind::Buttons(&[
+            ("1×", "anisotropicFiltering1"),
+            ("2×", "anisotropicFiltering2"),
+            ("4×", "anisotropicFiltering4"),
+            ("8×", "anisotropicFiltering8"),
+            ("16×", "anisotropicFiltering16"),
+        ]),
+        RowKind::Label("Anti-aliasing"),
+        RowKind::Buttons(&[
+            ("1×", "antiAliasing1"),
+            ("2×", "antiAliasing2"),
+            ("4×", "antiAliasing4"),
+            ("8×", "antiAliasing8"),
+        ]),
+        RowKind::Label("Texture upscaler"),
+        RowKind::Buttons(&[
+            ("1×", "textureUpscaler1"),
+            ("2×", "textureUpscaler2"),
+            ("3×", "textureUpscaler3"),
+            ("4×", "textureUpscaler4"),
+        ]),
+        RowKind::Label("Texture filtering"),
+        RowKind::TextureFilteringDropdown,
+        RowKind::Label("PVRTC decoding"),
+        RowKind::Buttons(&[
+            ("Software", "pvrtcDecodingSoftware"),
+            ("Automatic", "pvrtcDecodingAuto"),
+            ("Host driver", "pvrtcDecodingDriver"),
+        ]),
+        RowKind::Label("No texture compression"),
+        RowKind::Switch("noTextureCompression:", false),
+        RowKind::Subsection("Graphics compatibility"),
+        RowKind::Label("GLES override version"),
+        RowKind::GlesOverrideDropdown,
+        RowKind::Label("Shader compatibility fixes"),
+        RowKind::Switch("shaderCompatibilityFixes:", true),
+        RowKind::Label("Fix texture mipmap filter"),
+        RowKind::Switch("fixTextureMinFilter:", cfg!(target_os = "android")),
+        RowKind::Label("Force Core Animation composition"),
+        RowKind::Switch("forceComposition:", false),
+        RowKind::Label("Metal translator"),
+        RowKind::Switch("metalTranslator:", cfg!(target_arch = "aarch64")),
+        RowKind::Subsection("GPU / driver"),
+        RowKind::Label("Custom driver files"),
+        RowKind::Buttons(&[("Select ZIP file", "openCustomDriverFolder")]),
+        RowKind::Label("Installed custom drivers"),
+        RowKind::CustomDriverDropdown,
+        RowKind::Label("LLVMPipe fallback"),
+        RowKind::Switch("llvmpipeFallback:", false),
+        RowKind::Label("ANGLE driver"),
+        RowKind::Switch("angleDriver:", false),
+        RowKind::Section("SYSTEM & COMPATIBILITY"),
+        RowKind::Subsection("iOS / device"),
+        RowKind::Label("iOS version"),
+        RowKind::IosVersionDropdown,
+        RowKind::Label("Device model"),
+        RowKind::DeviceDropdown,
+        RowKind::Label("Force 32-bit"),
+        RowKind::Switch("force32Bit:", false),
+        RowKind::Label("Force 64-bit"),
+        RowKind::Switch("force64Bit:", false),
+        RowKind::Subsection("CPU / ARM"),
+        RowKind::Label("ARM64 JIT"),
+        RowKind::Switch("arm64Backend:", false),
+        RowKind::Label("Interpreter fallback"),
+        RowKind::Switch("arm64Fallback:", false),
+        RowKind::Subsection("Audio"),
+        RowKind::Label("Audio backend"),
+        RowKind::AudioBackendDropdown,
+        RowKind::Label("Core audio"),
+        RowKind::Switch("coreAudio:", false),
+        RowKind::Label("Lower audio quality"),
+        RowKind::Switch("lowAudioQuality:", false),
+        RowKind::Subsection("Networking"),
+        RowKind::Label("Network access"),
+        RowKind::Switch("network:", false),
+        RowKind::Section("DISPLAY, CONTROLS & DEBUG"),
+        RowKind::Subsection("Display"),
+        RowKind::Label("Custom resolution"),
+        RowKind::Buttons(&[("Custom", "customResolution")]),
         RowKind::Label("Orientation"),
         RowKind::Buttons(&[
             ("Default", "orientationDefault"),
@@ -1640,25 +3758,55 @@ fn setup_quick_options(
             ("→", "orientationLandscapeRight"),
             ("↓", "orientationPortraitUpsideDown"),
         ]),
-        RowKind::Label("Device model"),
-        RowKind::DeviceDropdown,
-        RowKind::Label("Cheat Engine"),
-        RowKind::Switch("cheatEngine:", cheat_engine_enabled),
-        RowKind::Label("Network access"),
-        RowKind::Switch("network:", false),
-        RowKind::Label("Show FPS"),
-        RowKind::Switch("showFPS:", false),
-        RowKind::Label("Trace GL errors"),
-        RowKind::Switch("traceGLErrors:", false),
-        RowKind::Label("GLES Native"),
-        RowKind::Switch("glesNative:", gles_native_enabled),
+        RowKind::Label("Render rotation"),
+        RowKind::Buttons(&[
+            ("Default", "renderRotationDefault"),
+            ("-90°", "renderRotationMinus90"),
+            ("-180°", "renderRotationMinus180"),
+            ("90°", "renderRotationPlus90"),
+            ("180°", "renderRotationPlus180"),
+        ]),
+        RowKind::Label("Revert X axis"),
+        RowKind::Switch("revertXAxis:", false),
+        RowKind::Label("Revert Y axis"),
+        RowKind::Switch("revertYAxis:", false),
+        RowKind::Label("Stretch to fullscreen"),
+        RowKind::Switch("fullscreenStretched:", false),
+        RowKind::Label("Scale hack"),
+        RowKind::Buttons(&[
+            ("Default", "scaleHackDefault"),
+            ("Off", "scaleHack1"),
+            ("0.50×", "scaleHackHalf"),
+            ("0.75×", "scaleHackThreeQuarters"),
+            ("2×", "scaleHack2"),
+            ("3×", "scaleHack3"),
+            ("4×", "scaleHack4"),
+        ]),
+        RowKind::Label("Show HUD"),
+        RowKind::Switch("showFPS:", true),
+        RowKind::Subsection("Controls"),
         RowKind::Label("Use analog sticks for tilt controls"),
         RowKind::Switch("analogStickTiltControls:", true),
-        // ---- (divider for stuff skipped below)
-        RowKind::Label("Fullscreen (override)"),
+        RowKind::Subsection("Games"),
+        RowKind::Label("Cheat Engine"),
+        RowKind::Switch("cheatEngine:", !env.options.trainer_disabled),
+        RowKind::Label("Game folder"),
+        RowKind::Buttons(&[
+            ("Open folder", "openFileManager"),
+            ("Refresh", "refreshApps"),
+        ]),
+        RowKind::Subsection("Diagnostics"),
+        RowKind::Label("Real-Time Corruption System"),
+        RowKind::Switch("rtcs:", false),
+        RowKind::Label("Enable log file"),
+        RowKind::Switch("logFile:", true),
+        RowKind::Label("Verbose logging"),
+        RowKind::Switch("verboseLogging:", false),
+        RowKind::Label("Trace OpenGL errors"),
+        RowKind::Switch("traceGLErrors:", true),
+        RowKind::Label("Fullscreen override"),
         RowKind::Switch("fullscreen:", false),
     ];
-    let rows_len_full = rows.len();
     let rows = if crate::window::Window::rotatable_fullscreen() {
         // Fullscreen option doesn't make sense on always-fullscreen platforms
         &rows[..rows.len() - 2]
@@ -1666,26 +3814,126 @@ fn setup_quick_options(
         &rows[..]
     };
 
-    let mut button_rows = Vec::new();
+    let mut scale_hack_buttons: Option<[id; 7]> = None;
+    let mut custom_resolution_button: id = nil;
+    let mut custom_resolution_row_center: CGFloat = 0.0;
+    let custom_resolution_menu: id;
+    let custom_resolution_editor: id;
+    let custom_resolution_width_field: id;
+    let custom_resolution_height_field: id;
+    let custom_resolution_error: id;
+    let mut orientation_buttons: Option<[id; 4]> = None;
+    let mut render_rotation_buttons: Option<[id; 5]> = None;
+    let mut fps_limit_buttons: Option<[id; 4]> = None;
+    let mut frame_generation_switch: id = nil;
+    let mut skip_intros_switch: id = nil;
+    let mut high_performance_switch: id = nil;
+    let mut force_max_clocks_switch: id = nil;
+    let mut log_file_switch: id = nil;
+    let mut trace_gl_errors_switch: id = nil;
+    let mut custom_driver_btn: id = nil;
+    let mut custom_driver_switch: id = nil;
+    let mut custom_driver_menu: id = nil;
+    let mut custom_driver_paths: Vec<PathBuf> = Vec::new();
+    let mut low_audio_quality_switch: id = nil;
+    let mut no_texture_compression_switch: id = nil;
+    let mut vsync_switch: id = nil;
+    let mut battery_saver_switch: id = nil;
+    let mut ultra_battery_saver_switch: id = nil;
+    let mut verbose_logging_switch: id = nil;
+    let mut fix_texture_min_filter_switch: id = nil;
+    let mut force_composition_switch: id = nil;
+    let mut revert_x_axis_switch: id = nil;
+    let mut revert_y_axis_switch: id = nil;
+    let mut ios_version_btn: id = nil;
+    let mut ios_version_menu: id = nil;
+    let mut ios_version_items: Vec<id> = Vec::new();
+    let mut graphics_api_btn: id = nil;
+    let mut graphics_api_menu: id = nil;
+    let mut graphics_api_items: Vec<id> = Vec::new();
+    let mut gles_override_btn: id = nil;
+    let mut gles_override_menu: id = nil;
+    let mut gles_override_items: Vec<id> = Vec::new();
+    let mut texture_filtering_btn: id = nil;
+    let mut texture_filtering_menu: id = nil;
+    let mut texture_filtering_items: Vec<id> = Vec::new();
+    let mut memory_management_btn: id = nil;
+    let mut memory_management_menu: id = nil;
+    let mut memory_management_items: Vec<id> = Vec::new();
+    let mut audio_backend_btn: id = nil;
+    let mut audio_backend_menu: id = nil;
+    let mut audio_backend_items: Vec<id> = Vec::new();
+    let mut quality_buttons: Vec<Vec<id>> = Vec::new();
     let mut device_model_btn: id = nil;
     let mut device_model_menu: id = nil;
     let mut device_model_items: Vec<id> = Vec::new();
     let mut device_model_thumb: id = nil;
-    for (i, row) in rows.iter().enumerate() {
-        let row_center = divider
-            + ((1 + i) as CGFloat)
-                * ((main_frame.size.height - divider) / ((rows.len() + 1) as CGFloat));
+    let mut layout_row = 0usize;
+    let mut layout_slot = 0usize;
+    for row in rows.iter() {
+        if let RowKind::Section(text) | RowKind::Subsection(text) = *row {
+            if layout_slot != 0 {
+                layout_row += 1;
+                layout_slot = 0;
+            }
+            let row_center = divider + ((1 + layout_row) as CGFloat) * 78.0 * ui_scale;
+            let is_section = matches!(*row, RowKind::Section(_));
+            let frame = CGRect {
+                origin: CGPoint {
+                    x: (if is_section { 14.0 } else { 22.0 }) * ui_scale,
+                    y: row_center - (if is_section { 24.0 } else { 18.0 }) * ui_scale,
+                },
+                size: CGSize {
+                    width: main_frame.size.width
+                        - (if is_section { 28.0 } else { 44.0 }) * ui_scale,
+                    height: (if is_section { 40.0 } else { 28.0 }) * ui_scale,
+                },
+            };
+            let label: id = msg_class![env; UILabel alloc];
+            let label: id = msg![env; label initWithFrame:frame];
+            let text = ns_string::get_static_str(env, text);
+            () = msg![env; label setText:text];
+            () = msg![env; label setTextAlignment:UITextAlignmentLeft];
+            let label_font = picker_font(env, (if is_section { 15.0 } else { 12.0 }) * ui_scale);
+            () = msg![env; label setFont:label_font];
+            let section_text_color: id = if is_section {
+                msg_class![env; UIColor whiteColor]
+            } else {
+                msg_class![env; UIColor darkGrayColor]
+            };
+            () = msg![env; label setTextColor:section_text_color];
+            let section_background: id = if is_section {
+                msg_class![env; UIColor colorWithRed:0.24 green:0.30 blue:0.38 alpha:1.0]
+            } else {
+                msg_class![env; UIColor clearColor]
+            };
+            () = msg![env; label setBackgroundColor:section_background];
+            () = msg![env; label setTextAlignment:UITextAlignmentLeft];
+            () = msg![env; label setAdjustsFontSizeToFitWidth:true];
+            () = msg![env; label setMinimumFontSize:8.0];
+            if is_section {
+                let layer: id = msg![env; label layer];
+                () = msg![env; layer setCornerRadius:(8.0 * ui_scale)];
+            }
+            () = msg![env; main_view addSubview:label];
+            layout_row += 1;
+            continue;
+        }
+
+        let row_center = divider + ((1 + layout_row) as CGFloat) * 78.0 * ui_scale;
+
+        let label_has_warning = matches!(row, &RowKind::LabelWithWarning(_));
 
         match *row {
-            RowKind::Label(text) => {
+            RowKind::Label(text) | RowKind::LabelWithWarning(text) => {
                 let frame = CGRect {
                     origin: CGPoint {
-                        x: 0.0,
-                        y: row_center - 30.0 / 2.0,
+                        x: 22.0 * ui_scale,
+                        y: row_center - (56.0 * ui_scale) / 2.0,
                     },
                     size: CGSize {
-                        width: main_frame.size.width,
-                        height: 30.0,
+                        width: main_frame.size.width * 0.39,
+                        height: 56.0 * ui_scale,
                     },
                 };
 
@@ -1693,19 +3941,109 @@ fn setup_quick_options(
                 let label: id = msg![env; label initWithFrame:frame];
                 let text = ns_string::get_static_str(env, text);
                 () = msg![env; label setText:text];
-                () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+                () = msg![env; label setTextAlignment:UITextAlignmentLeft];
+                let label_font = picker_font(env, 15.0 * ui_scale);
+                () = msg![env; label setFont:label_font];
+                () = msg![env; label setNumberOfLines:0];
+                let black: id = msg_class![env; UIColor blackColor];
+                () = msg![env; label setTextColor:black];
+                let clear: id = msg_class![env; UIColor clearColor];
+                () = msg![env; label setBackgroundColor:clear];
+                () = msg![env; label setAdjustsFontSizeToFitWidth:true];
+                () = msg![env; label setMinimumFontSize:8.0];
                 () = msg![env; main_view addSubview:label];
+                if label_has_warning {
+                    let warning_frame = CGRect {
+                        origin: CGPoint {
+                            x: main_frame.size.width * 0.53,
+                            y: row_center - (42.0 * ui_scale) / 2.0,
+                        },
+                        size: CGSize {
+                            width: 28.0 * ui_scale,
+                            height: 42.0 * ui_scale,
+                        },
+                    };
+                    let warning: id = msg_class![env; UILabel alloc];
+                    let warning: id = msg![env; warning initWithFrame:warning_frame];
+                    let warning_text = ns_string::get_static_str(env, "⚠");
+                    () = msg![env; warning setText:warning_text];
+                    () = msg![env; warning setTextAlignment:UITextAlignmentCenter];
+                    let warning_font = picker_font(env, 17.0 * ui_scale);
+                    () = msg![env; warning setFont:warning_font];
+                    let warning_color: id =
+                        msg_class![env; UIColor colorWithRed:0.95 green:0.62 blue:0.0 alpha:1.0];
+                    () = msg![env; warning setTextColor:warning_color];
+                    let clear: id = msg_class![env; UIColor clearColor];
+                    () = msg![env; warning setBackgroundColor:clear];
+                    () = msg![env; main_view addSubview:warning];
+                }
             }
             RowKind::Buttons(buttons) => {
-                button_rows.push(make_button_row(
+                let controls = make_button_row(
                     env,
                     delegate,
                     main_view,
                     main_frame.size,
                     row_center,
                     buttons,
-                    /* font_size: */ None,
-                ));
+                    /* font_size: */ Some(10.0),
+                );
+                let margin = 6.0 * ui_scale;
+                let controls_width = main_frame.size.width * 0.56;
+                let controls_x = main_frame.size.width * 0.42;
+                let button_width = (controls_width - margin * (controls.len() as CGFloat + 1.0))
+                    / controls.len() as CGFloat;
+                for (index, &button) in controls.iter().enumerate() {
+                    let button_frame = CGRect {
+                        origin: CGPoint {
+                            x: controls_x + margin + index as CGFloat * (button_width + margin),
+                            y: row_center - 15.0 * ui_scale,
+                        },
+                        size: CGSize {
+                            width: button_width,
+                            height: 30.0 * ui_scale,
+                        },
+                    };
+                    () = msg![env; button setFrame:button_frame];
+                    () = msg![env; button layoutSubviews];
+                }
+                match buttons.first().map(|button| button.1) {
+                    Some("scaleHackDefault") => {
+                        scale_hack_buttons = controls.try_into().ok();
+                    }
+                    Some("customResolution") => {
+                        custom_resolution_button = controls.first().copied().unwrap_or(nil);
+                        custom_resolution_row_center = row_center;
+                    }
+                    Some("orientationDefault") => {
+                        orientation_buttons = controls.try_into().ok();
+                    }
+                    Some("renderRotationDefault") => {
+                        render_rotation_buttons = controls.try_into().ok();
+                    }
+                    Some("fpsLimitDynamic") => {
+                        fps_limit_buttons = controls.try_into().ok();
+                    }
+                    Some("anisotropicFiltering1")
+                    | Some("textureUpscaler1")
+                    | Some("antiAliasing1")
+                    | Some("pvrtcDecodingSoftware") => {
+                        quality_buttons.push(controls.clone());
+                    }
+                    _ => {}
+                }
+            }
+            RowKind::IosVersionDropdown => {
+                let dropdown = make_ios_version_dropdown(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                );
+                ios_version_btn = dropdown.0;
+                ios_version_menu = dropdown.1;
+                ios_version_items = dropdown.2;
             }
             RowKind::DeviceDropdown => {
                 let dropdown = make_device_model_dropdown(
@@ -1720,36 +4058,479 @@ fn setup_quick_options(
                 device_model_items = dropdown.2;
                 device_model_thumb = dropdown.3;
             }
-            RowKind::Switch(selector, default_state) => {
+            RowKind::GraphicsApiDropdown => {
+                let dropdown = make_graphics_api_dropdown(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                );
+                graphics_api_btn = dropdown.0;
+                graphics_api_menu = dropdown.1;
+                graphics_api_items = dropdown.2;
+            }
+            RowKind::TextureFilteringDropdown => {
+                let dropdown = make_settings_dropdown(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                    TEXTURE_FILTERING_ENTRIES,
+                    "default",
+                    "textureFilteringToggle",
+                    "textureFiltering:",
+                );
+                texture_filtering_btn = dropdown.0;
+                texture_filtering_menu = dropdown.1;
+                texture_filtering_items = dropdown.2;
+            }
+            RowKind::MemoryManagementDropdown => {
+                let dropdown = make_settings_dropdown(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                    MEMORY_MANAGEMENT_ENTRIES,
+                    "balanced",
+                    "memoryManagementToggle",
+                    "memoryManagement:",
+                );
+                memory_management_btn = dropdown.0;
+                memory_management_menu = dropdown.1;
+                memory_management_items = dropdown.2;
+            }
+            RowKind::GlesOverrideDropdown => {
+                let dropdown = make_settings_dropdown(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                    GLES_OVERRIDE_ENTRIES,
+                    "default",
+                    "glesOverrideToggle",
+                    "glesOverride:",
+                );
+                gles_override_btn = dropdown.0;
+                gles_override_menu = dropdown.1;
+                gles_override_items = dropdown.2;
+            }
+            RowKind::AudioBackendDropdown => {
+                let dropdown = make_settings_dropdown(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                    AUDIO_BACKEND_ENTRIES,
+                    "default",
+                    "audioBackendToggle",
+                    "audioBackend:",
+                );
+                audio_backend_btn = dropdown.0;
+                audio_backend_menu = dropdown.1;
+                audio_backend_items = dropdown.2;
+            }
+            RowKind::CustomDriverDropdown => {
+                let dropdown = make_custom_driver_dropdown(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                );
+                custom_driver_btn = dropdown.0;
+                custom_driver_menu = dropdown.1;
+                custom_driver_paths = dropdown.3;
+            }
+            RowKind::Switch(selector_name, default_state) => {
                 let switch_frame = CGRect {
                     origin: CGPoint {
-                        x: main_frame.size.width / 2.0 - 94.0 / 2.0,
-                        y: row_center - 27.0 / 2.0,
+                        x: main_frame.size.width * 0.70,
+                        y: row_center - (30.0 * ui_scale) / 2.0,
                     },
-                    size: Default::default(),
+                    size: CGSize {
+                        width: 94.0 * ui_scale,
+                        height: 30.0 * ui_scale,
+                    },
                 };
 
                 let switch: id = msg_class![env; UISwitch alloc];
                 let switch: id = msg![env; switch initWithFrame:switch_frame];
                 () = msg![env; switch setOn:default_state];
-                let selector = env.objc.lookup_selector(selector).unwrap();
+                let selector = env.objc.lookup_selector(selector_name).unwrap();
                 () = msg![env; switch addTarget:delegate
                                          action:selector
                                forControlEvents:UIControlEventValueChanged];
                 () = msg![env; main_view addSubview:switch];
+                if selector_name == "frameGeneration:" {
+                    frame_generation_switch = switch;
+                }
+                if selector_name == "skipIntros:" {
+                    skip_intros_switch = switch;
+                }
+                if selector_name == "highPerformance:" {
+                    high_performance_switch = switch;
+                }
+                if selector_name == "forceMaxClocks:" {
+                    force_max_clocks_switch = switch;
+                }
+                if selector_name == "customDriver:" {
+                    custom_driver_switch = switch;
+                }
+                if selector_name == "logFile:" {
+                    log_file_switch = switch;
+                }
+                if selector_name == "traceGLErrors:" {
+                    trace_gl_errors_switch = switch;
+                }
+                if selector_name == "lowAudioQuality:" {
+                    low_audio_quality_switch = switch;
+                }
+                if selector_name == "vsync:" {
+                    vsync_switch = switch;
+                }
+                if selector_name == "batterySaver:" {
+                    battery_saver_switch = switch;
+                }
+                if selector_name == "ultraBatterySaver:" {
+                    ultra_battery_saver_switch = switch;
+                }
+                if selector_name == "verboseLogging:" {
+                    verbose_logging_switch = switch;
+                }
+                if selector_name == "fixTextureMinFilter:" {
+                    fix_texture_min_filter_switch = switch;
+                }
+                if selector_name == "forceComposition:" {
+                    force_composition_switch = switch;
+                }
+                if selector_name == "noTextureCompression:" {
+                    no_texture_compression_switch = switch;
+                }
+                if selector_name == "revertXAxis:" {
+                    revert_x_axis_switch = switch;
+                }
+                if selector_name == "revertYAxis:" {
+                    revert_y_axis_switch = switch;
+                }
             }
+            RowKind::Section(_) | RowKind::Subsection(_) => unreachable!(),
+        }
+        layout_slot += 1;
+        if layout_slot == 2 {
+            layout_slot = 0;
+            layout_row += 1;
         }
     }
 
+    let ui_scale = picker_ui_scale(main_frame.size);
+    let width = (main_frame.size.width * 0.56).clamp(170.0, 720.0);
+    let resolution_item_height = 36.0 * ui_scale;
+    let resolution_entries: Vec<(usize, (u32, u32))> =
+        host_resolutions.iter().copied().enumerate().collect();
+    let resolution_count = resolution_entries.len() + 1;
+    let resolution_menu_height = (resolution_count as CGFloat * resolution_item_height)
+        .min(main_frame.size.height * 0.55)
+        .max(resolution_item_height * 2.0);
+    let resolution_menu_frame = CGRect {
+        origin: CGPoint {
+            x: main_frame.size.width * 0.42,
+            y: (custom_resolution_row_center - resolution_menu_height).max(0.0),
+        },
+        size: CGSize {
+            width,
+            height: resolution_menu_height,
+        },
+    };
+    let resolution_menu: id = msg_class![env; UIScrollView alloc];
+    let resolution_menu: id = msg![env; resolution_menu initWithFrame:resolution_menu_frame];
+    let resolution_menu_color: id =
+        msg_class![env; UIColor colorWithRed:0.72 green:0.72 blue:0.74 alpha:1.0];
+    () = msg![env; resolution_menu setBackgroundColor:resolution_menu_color];
+    () = msg![env; resolution_menu setClipsToBounds:true];
+    () = msg![env; resolution_menu setScrollEnabled:true];
+    () = msg![env; resolution_menu setShowsVerticalScrollIndicator:true];
+    () = msg![env; resolution_menu setAlwaysBounceVertical:true];
+    () = msg![env; resolution_menu setContentSize:(CGSize {
+        width,
+        height:resolution_count as CGFloat * resolution_item_height,
+    })];
+    () = msg![env; resolution_menu setHidden:true];
+    () = msg![env; main_view addSubview:resolution_menu];
+    let resolution_text: id = msg_class![env; UIColor blackColor];
+    let resolution_selector = env.objc.lookup_selector("supportedResolution:").unwrap();
+    for (index, (_entry_index, (width_value, height_value))) in
+        resolution_entries.iter().copied().enumerate()
+    {
+        let item: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        let text = ns_string::from_rust_string(env, format!("{}×{}", width_value, height_value));
+        () = msg![env; item setTitle:text forState:UIControlStateNormal];
+        release(env, text);
+        let item_label: id = msg![env; item titleLabel];
+        let item_font = picker_font(env, 16.0 * ui_scale);
+        () = msg![env; item_label setFont:item_font];
+        () = msg![env; item_label setTextAlignment:UITextAlignmentCenter];
+        () = msg![env; item setTitleColor:resolution_text forState:UIControlStateNormal];
+        () = msg![env; item setBackgroundColor:resolution_menu_color];
+        let layer: id = msg![env; item layer];
+        () = msg![env; layer setCornerRadius:(5.0 * ui_scale)];
+        () = msg![env; item setFrame:(CGRect {
+            origin: CGPoint { x: 0.0, y: index as CGFloat * resolution_item_height },
+            size: CGSize { width, height: resolution_item_height },
+        })];
+        () = msg![env; item layoutSubviews];
+        let item_tag: NSInteger = index as NSInteger;
+        () = msg![env; item setTag:item_tag];
+        () = msg![env; item addTarget:delegate
+                               action:resolution_selector
+                     forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; resolution_menu addSubview:item];
+    }
+    let custom_item: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    let custom_text = ns_string::get_static_str(env, "Custom");
+    () = msg![env; custom_item setTitle:custom_text forState:UIControlStateNormal];
+    let custom_label: id = msg![env; custom_item titleLabel];
+    let custom_font = picker_font(env, 16.0 * ui_scale);
+    () = msg![env; custom_label setFont:custom_font];
+    () = msg![env; custom_label setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; custom_item setTitleColor:resolution_text forState:UIControlStateNormal];
+    () = msg![env; custom_item setBackgroundColor:resolution_menu_color];
+    let custom_layer: id = msg![env; custom_item layer];
+    () = msg![env; custom_layer setCornerRadius:(5.0 * ui_scale)];
+    () = msg![env; custom_item setFrame:(CGRect {
+        origin: CGPoint {
+            x: 0.0,
+            y: resolution_entries.len() as CGFloat * resolution_item_height,
+        },
+        size: CGSize { width, height: resolution_item_height },
+    })];
+    () = msg![env; custom_item layoutSubviews];
+    () = msg![env; custom_item addTarget:delegate
+                                  action:(env.objc.lookup_selector("customResolutionCustom").unwrap())
+                        forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; resolution_menu addSubview:custom_item];
+    custom_resolution_menu = resolution_menu;
+    let field_height = 30.0 * ui_scale;
+    let editor_height = 148.0 * ui_scale;
+    let editor_frame = CGRect {
+        origin: CGPoint {
+            x: main_frame.size.width * 0.42,
+            y: (custom_resolution_row_center - editor_height - 10.0 * ui_scale).max(8.0 * ui_scale),
+        },
+        size: CGSize {
+            width,
+            height: editor_height,
+        },
+    };
+    let editor: id = msg_class![env; UIView alloc];
+    let editor: id = msg![env; editor initWithFrame:editor_frame];
+    () = msg![env; editor setContentScaleFactor:4.0];
+    let panel: id = msg_class![env; UIColor colorWithRed:0.82 green:0.82 blue:0.84 alpha:1.0];
+    let dark_text: id = msg_class![env; UIColor blackColor];
+    let white: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; editor setBackgroundColor:panel];
+    () = msg![env; editor setHidden:true];
+    () = msg![env; main_view addSubview:editor];
+
+    let editor_title: id = msg_class![env; UILabel alloc];
+    let editor_title: id = msg![env; editor_title initWithFrame:(CGRect {
+        origin: CGPoint { x: 8.0 * ui_scale, y: 3.0 * ui_scale },
+        size: CGSize { width: width - 16.0 * ui_scale, height: 22.0 * ui_scale },
+    })];
+    let editor_title_text = ns_string::get_static_str(env, "Custom resolution");
+    () = msg![env; editor_title setText:editor_title_text];
+    () = msg![env; editor_title setTextColor:dark_text];
+    let editor_title_font = picker_font(env, 14.0 * ui_scale);
+    () = msg![env; editor_title setFont:editor_title_font];
+    let clear: id = msg_class![env; UIColor clearColor];
+    () = msg![env; editor_title setBackgroundColor:clear];
+    () = msg![env; editor addSubview:editor_title];
+
+    let make_field = |env: &mut Environment, x: CGFloat, label: &str| -> id {
+        let field: id = msg_class![env; UITextField alloc];
+        let frame = CGRect {
+            origin: CGPoint {
+                x,
+                y: 30.0 * ui_scale,
+            },
+            size: CGSize {
+                width: width * 0.40,
+                height: field_height,
+            },
+        };
+        let field: id = msg![env; field initWithFrame:frame];
+        let text = ns_string::from_rust_string(env, label.to_owned());
+        () = msg![env; field setPlaceholder:text];
+        release(env, text);
+        () = msg![env; field setKeyboardType:4];
+        () = msg![env; field setClearsOnBeginEditing:true];
+        () = msg![env; field setTextColor:dark_text];
+        let field_font = picker_font(env, 14.0 * ui_scale);
+        () = msg![env; field setFont:field_font];
+        () = msg![env; editor addSubview:field];
+        field
+    };
+    let width_field = make_field(env, 8.0 * ui_scale, "Width");
+    let height_field = make_field(env, width * 0.52, "Height");
+    let apply: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    let apply_frame = CGRect {
+        origin: CGPoint {
+            x: 8.0 * ui_scale,
+            y: 66.0 * ui_scale,
+        },
+        size: CGSize {
+            width: width * 0.42,
+            height: field_height,
+        },
+    };
+    () = msg![env; apply setFrame:apply_frame];
+    let apply_text = ns_string::get_static_str(env, "Apply");
+    () = msg![env; apply setTitle:apply_text forState:UIControlStateNormal];
+    () = msg![env; apply setTitleColor:white forState:UIControlStateNormal];
+    let apply_background: id = msg_class![env; UIColor darkGrayColor];
+    () = msg![env; apply setBackgroundColor:apply_background];
+    () = msg![env; apply layoutSubviews];
+    () = msg![env; apply addTarget:delegate action:(env.objc.lookup_selector("customResolutionApply").unwrap()) forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; editor addSubview:apply];
+    let cancel: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    let cancel_frame = CGRect {
+        origin: CGPoint {
+            x: width * 0.52,
+            y: 66.0 * ui_scale,
+        },
+        size: CGSize {
+            width: width * 0.40,
+            height: field_height,
+        },
+    };
+    () = msg![env; cancel setFrame:cancel_frame];
+    let cancel_text = ns_string::get_static_str(env, "Cancel");
+    () = msg![env; cancel setTitle:cancel_text forState:UIControlStateNormal];
+    () = msg![env; cancel setTitleColor:white forState:UIControlStateNormal];
+    () = msg![env; cancel setBackgroundColor:panel];
+    () = msg![env; cancel layoutSubviews];
+    () = msg![env; cancel addTarget:delegate action:(env.objc.lookup_selector("customResolutionCancel").unwrap()) forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; editor addSubview:cancel];
+    let error: id = msg_class![env; UILabel alloc];
+    let error: id = msg![env; error initWithFrame:(CGRect { origin: CGPoint { x: 8.0 * ui_scale, y: 104.0 * ui_scale }, size: CGSize { width: width - 16.0 * ui_scale, height: 30.0 * ui_scale } })];
+    let error_text: id = msg_class![env; UIColor colorWithRed:0.75 green:0.08 blue:0.08 alpha:1.0];
+    () = msg![env; error setTextColor:error_text];
+    let error_font = picker_font(env, 11.0 * ui_scale);
+    () = msg![env; error setFont:error_font];
+    () = msg![env; error setAdjustsFontSizeToFitWidth:true];
+    () = msg![env; error setHidden:true];
+    () = msg![env; editor addSubview:error];
+
+    custom_resolution_editor = editor;
+    custom_resolution_width_field = width_field;
+    custom_resolution_height_field = height_field;
+    custom_resolution_error = error;
+
     QuickOptionsStuff {
         main_view,
-        scale_hack_buttons: button_rows[0][..].try_into().unwrap(),
-        orientation_buttons: button_rows[1][..].try_into().unwrap(),
+        settings_backdrop,
+        settings_category_buttons,
+        settings_category_views,
+        ios_version_btn,
+        ios_version_menu,
+        ios_version_items,
+        graphics_api_btn,
+        graphics_api_menu,
+        graphics_api_items,
+        texture_filtering_btn,
+        texture_filtering_menu,
+        texture_filtering_items,
+        memory_management_btn,
+        memory_management_menu,
+        memory_management_items,
+        gles_override_btn,
+        gles_override_menu,
+        gles_override_items,
+        audio_backend_btn,
+        audio_backend_menu,
+        audio_backend_items,
+        custom_driver_btn,
+        custom_driver_switch,
+        custom_driver_menu,
+        custom_driver_paths,
+        quality_buttons,
+        scale_hack_buttons: scale_hack_buttons.unwrap_or([nil; 7]),
+        custom_resolution_button,
+        custom_resolution_menu,
+        custom_resolution_editor,
+        custom_resolution_width_field,
+        custom_resolution_height_field,
+        custom_resolution_error,
+        orientation_buttons: orientation_buttons.unwrap_or([nil; 4]),
+        render_rotation_buttons: render_rotation_buttons.unwrap_or([nil; 5]),
+        frame_generation_switch,
+        skip_intros_switch,
+        high_performance_switch,
+        force_max_clocks_switch,
+        fps_limit_buttons: fps_limit_buttons.unwrap_or([nil; 4]),
+        low_audio_quality_switch,
+        no_texture_compression_switch,
+        vsync_switch,
+        battery_saver_switch,
+        ultra_battery_saver_switch,
+        log_file_switch,
+        verbose_logging_switch,
+        trace_gl_errors_switch,
+        fix_texture_min_filter_switch,
+        force_composition_switch,
+        revert_x_axis_switch,
+        revert_y_axis_switch,
         device_model_btn,
         device_model_menu,
         device_model_items,
         device_model_thumb,
     }
+}
+
+fn animate_picker_panel(env: &mut Environment, panel: id, visible: bool) {
+    if panel == nil {
+        return;
+    }
+
+    let layer: id = msg![env; panel layer];
+    let key_path = ns_string::get_static_str(env, "opacity");
+    let animation: id = msg_class![env; CABasicAnimation animationWithKeyPath:key_path];
+    let from_alpha: f32 = if visible { 0.0 } else { 1.0 };
+    let to_alpha: f32 = if visible { 1.0 } else { 0.0 };
+    let from_value: id = msg_class![env; NSNumber numberWithFloat:from_alpha];
+    let to_value: id = msg_class![env; NSNumber numberWithFloat:to_alpha];
+    () = msg![env; animation setFromValue:from_value];
+    () = msg![env; animation setToValue:to_value];
+    () = msg![env; animation setDuration:(0.18_f64)];
+    () = msg![env; animation setRemovedOnCompletion:true];
+
+    // Keep the model layer at the animation's start value until the explicit
+    // animation is installed. The old order set alpha to zero before adding
+    // the hide animation, which exposed the coloured picker backing view for
+    // one compositor pass and produced the pink flash on close.
+    () = msg![env; panel setHidden:false];
+    () = msg![env; panel setUserInteractionEnabled:visible];
+    () = msg![env; panel setAlpha:(from_alpha as CGFloat)];
+    () = msg![env; layer addAnimation:animation forKey:key_path];
+    () = msg![env; panel setAlpha:(to_alpha as CGFloat)];
+
+    let transform_key = ns_string::get_static_str(env, "transform.scale");
+    let transform: id = msg_class![env; CABasicAnimation animationWithKeyPath:transform_key];
+    let from_scale = if visible { 0.94_f32 } else { 1.0_f32 };
+    let to_scale = if visible { 1.0_f32 } else { 0.94_f32 };
+    let from_scale_value: id = msg_class![env; NSNumber numberWithFloat:from_scale];
+    let to_scale_value: id = msg_class![env; NSNumber numberWithFloat:to_scale];
+    () = msg![env; transform setFromValue:from_scale_value];
+    () = msg![env; transform setToValue:to_scale_value];
+    () = msg![env; transform setDuration:(0.2_f64)];
+    () = msg![env; transform setRemovedOnCompletion:true];
+    () = msg![env; layer addAnimation:transform forKey:transform_key];
+    release(env, transform_key);
+    release(env, key_path);
 }
 
 /// Re-lay-out and re-style the device-model dropdown list for the given scroll
@@ -1764,12 +4545,16 @@ fn update_device_model_menu(
     selected: Option<i32>,
     scroll: isize,
 ) {
-    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
-    let list_width: CGFloat = 256.0;
+    let thumb_frame: CGRect = msg![env; thumb frame];
+    let list_width = thumb_frame.origin.x;
+    let scrollbar_width = thumb_frame.size.width;
+    let thumb_height = thumb_frame.size.height;
+    let row_height = DEVICE_MENU_ITEM_HEIGHT * (thumb_frame.size.width / 22.0).max(1.0);
+    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * row_height;
     let max_scroll = (items.len() as isize).saturating_sub(DEVICE_MENU_VISIBLE_ITEMS as isize);
 
     for (j, &item) in items.iter().enumerate() {
-        let y_pos = ((j as isize - scroll) as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
+        let y_pos = ((j as isize - scroll) as CGFloat) * row_height;
         let is_visible = y_pos >= 0.0 && y_pos < visible_menu_height;
         () = msg![env; item setHidden:(!is_visible)];
         if is_visible {
@@ -1777,7 +4562,7 @@ fn update_device_model_menu(
                 origin: CGPoint { x: 0.0, y: y_pos },
                 size: CGSize {
                     width: list_width,
-                    height: DEVICE_MENU_ITEM_HEIGHT,
+                    height: row_height,
                 },
             };
             () = msg![env; item setFrame:item_frame];
@@ -1785,15 +4570,17 @@ fn update_device_model_menu(
         let tag: NSInteger = msg![env; item tag];
         let is_selected = selected.is_some_and(|v| v as NSInteger == tag);
         let color: id = if is_selected {
-            msg_class![env; UIColor magentaColor]
+            settings_menu_selected_green(env)
         } else {
-            msg_class![env; UIColor darkGrayColor]
+            settings_menu_gray(env)
         };
+        let white: id = msg_class![env; UIColor whiteColor];
+        let black: id = msg_class![env; UIColor blackColor];
+        () = msg![env; item setTitleColor:(if is_selected { white } else { black }) forState:UIControlStateNormal];
         () = msg![env; item setBackgroundColor:color];
     }
 
     // Position the scrollbar thumb proportionally to the scroll offset.
-    let thumb_height: CGFloat = 54.0;
     let travel = (visible_menu_height - thumb_height).max(0.0);
     let thumb_y = if max_scroll > 0 {
         (scroll as CGFloat / max_scroll as CGFloat) * travel
@@ -1806,22 +4593,460 @@ fn update_device_model_menu(
             y: thumb_y,
         },
         size: CGSize {
-            width: 24.0,
+            width: scrollbar_width,
             height: thumb_height,
         },
     };
     () = msg![env; thumb setFrame:thumb_frame];
 }
 
-/// Build the "Device model" dropdown: a toggle button whose title shows the
-/// currently-selected model and an up/down arrow, plus a (initially hidden)
-/// menu placed *above* the button so it never runs off the bottom of the
-/// screen. The menu contains a vertically-scrollable list of every choice from
-/// [device_model_entries], a scrollbar track + thumb, and transparent up/down
-/// scroll arrows. Each list item is wired to the delegate's `deviceModel:`
-/// selector and tagged with its choice; the arrows fire `deviceModelScrollUp` /
-/// `deviceModelScrollDown`. Returns `(toggle button, menu view, item buttons,
-/// scrollbar thumb)`.
+/// Graphics API choices shown in the settings dropdown.
+const GRAPHICS_API_ENTRIES: &[(&str, crate::options::GraphicsApi)] = &[
+    ("Default (game)", crate::options::GraphicsApi::Default),
+    (
+        "OpenGL ES 1.1 → OpenGL ES 2.0 translator",
+        crate::options::GraphicsApi::Translator,
+    ),
+    (
+        "OpenGL ES 1.1 → OpenGL ES 3.0 translator",
+        crate::options::GraphicsApi::TranslatorGLES30,
+    ),
+    ("WGPU presentation", crate::options::GraphicsApi::Wgpu),
+    ("Vulkan presentation", crate::options::GraphicsApi::Vulkan),
+    (
+        "Software rendering (CPU only)",
+        crate::options::GraphicsApi::Software,
+    ),
+];
+
+fn settings_menu_gray(env: &mut Environment) -> id {
+    msg_class![env; UIColor grayColor]
+}
+
+fn settings_menu_selected_green(env: &mut Environment) -> id {
+    msg_class![env; UIColor colorWithRed:0.20 green:0.55 blue:0.30 alpha:1.0]
+}
+
+fn update_graphics_api_dropdown(
+    env: &mut Environment,
+    button: id,
+    items: &[id],
+    value: crate::options::GraphicsApi,
+) {
+    let selected_color: id = settings_menu_selected_green(env);
+    let unselected_color: id = settings_menu_gray(env);
+    let white: id = msg_class![env; UIColor whiteColor];
+    for (index, &item) in items.iter().enumerate() {
+        let color: id = if GRAPHICS_API_ENTRIES[index].1 == value {
+            selected_color
+        } else {
+            unselected_color
+        };
+        () = msg![env; item setBackgroundColor:color];
+        () = msg![env; item setTitleColor:white forState:UIControlStateNormal];
+    }
+    let title = ns_string::get_static_str(env, value.label());
+    () = msg![env; button setTitle:title forState:UIControlStateNormal];
+    () = msg![env; button layoutSubviews];
+}
+
+fn set_settings_menu_background(env: &mut Environment, menu: id) {
+    let gray: id = settings_menu_gray(env);
+    () = msg![env; menu setBackgroundColor:gray];
+}
+
+fn toggle_settings_dropdown(env: &mut Environment, main_view: id, menu: id, button: id) {
+    set_settings_menu_background(env, menu);
+    let hidden: bool = msg![env; menu isHidden];
+    () = msg![env; menu setHidden:(!hidden)];
+    if hidden {
+        () = msg![env; main_view bringSubviewToFront:menu];
+        () = msg![env; main_view bringSubviewToFront:button];
+    }
+}
+
+fn update_settings_dropdown<T>(
+    env: &mut Environment,
+    button: id,
+    items: &[id],
+    entries: &[(&'static str, T)],
+    selected: usize,
+) {
+    let selected = selected.min(entries.len().saturating_sub(1));
+    let selected_color: id = settings_menu_selected_green(env);
+    let unselected_color: id = settings_menu_gray(env);
+    let white: id = msg_class![env; UIColor whiteColor];
+    for (index, &item) in items.iter().enumerate() {
+        let background = if index == selected {
+            selected_color
+        } else {
+            unselected_color
+        };
+        () = msg![env; item setBackgroundColor:background];
+        () = msg![env; item setTitleColor:white forState:UIControlStateNormal];
+    }
+    if let Some((label, _)) = entries.get(selected) {
+        let title = ns_string::get_static_str(env, label);
+        () = msg![env; button setTitle:title forState:UIControlStateNormal];
+        release(env, title);
+        () = msg![env; button layoutSubviews];
+    }
+}
+
+fn custom_driver_paths() -> Vec<PathBuf> {
+    let directory = paths::user_data_base_path().join("touchHLE_custom_drivers");
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                || path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("zip")
+                        || extension.eq_ignore_ascii_case("so")
+                        || extension.eq_ignore_ascii_case("dylib")
+                        || extension.eq_ignore_ascii_case("dll")
+                })
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn custom_driver_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("custom driver")
+        .to_string()
+}
+
+fn make_custom_driver_dropdown(
+    env: &mut Environment,
+    delegate: id,
+    main_view: id,
+    main_view_size: CGSize,
+    row_center: CGFloat,
+) -> (id, id, Vec<id>, Vec<PathBuf>) {
+    let ui_scale = picker_ui_scale(main_view_size);
+    let button_frame = CGRect {
+        origin: CGPoint {
+            x: 22.0 * ui_scale,
+            y: row_center - 17.0 * ui_scale,
+        },
+        size: CGSize {
+            width: (main_view_size.width - 44.0 * ui_scale).max(180.0 * ui_scale),
+            height: 34.0 * ui_scale,
+        },
+    };
+    let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; button setFrame:button_frame];
+    let title = ns_string::get_static_str(env, "No custom driver");
+    () = msg![env; button setTitle:title forState:UIControlStateNormal];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; button setTitleColor:black forState:UIControlStateNormal];
+    let gray = settings_menu_gray(env);
+    () = msg![env; button setBackgroundColor:gray];
+    let selector = env.objc.lookup_selector("customDriverToggle").unwrap();
+    () = msg![env; button addTarget:delegate action:selector forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; main_view addSubview:button];
+
+    let paths = custom_driver_paths();
+    let item_height = 32.0 * ui_scale;
+    let menu_frame = CGRect {
+        origin: CGPoint {
+            x: button_frame.origin.x,
+            y: button_frame.origin.y + button_frame.size.height + 4.0 * ui_scale,
+        },
+        size: CGSize {
+            width: button_frame.size.width,
+            height: item_height * paths.len().max(1) as CGFloat,
+        },
+    };
+    let menu: id = msg_class![env; UIView alloc];
+    let menu: id = msg![env; menu initWithFrame:menu_frame];
+    () = msg![env; menu setBackgroundColor:gray];
+    () = msg![env; menu setHidden:true];
+    () = msg![env; main_view addSubview:menu];
+
+    let mut items = Vec::new();
+    let item_paths = if paths.is_empty() {
+        vec![PathBuf::new()]
+    } else {
+        paths.clone()
+    };
+    let selector = env.objc.lookup_selector("customDriverSelected:").unwrap();
+    for (index, path) in item_paths.iter().enumerate() {
+        let item: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        let frame = CGRect {
+            origin: CGPoint {
+                x: 4.0 * ui_scale,
+                y: index as CGFloat * item_height,
+            },
+            size: CGSize {
+                width: menu_frame.size.width - 8.0 * ui_scale,
+                height: item_height - 2.0 * ui_scale,
+            },
+        };
+        () = msg![env; item setFrame:frame];
+        let label = if paths.is_empty() {
+            "No custom drivers installed".to_string()
+        } else {
+            custom_driver_label(path)
+        };
+        let label = ns_string::from_rust_string(env, label);
+        () = msg![env; item setTitle:label forState:UIControlStateNormal];
+        () = msg![env; item setTitleColor:black forState:UIControlStateNormal];
+        let item_background = settings_menu_gray(env);
+        () = msg![env; item setBackgroundColor:item_background];
+        () = msg![env; item setTag:(if paths.is_empty() { -1 } else { index as NSInteger })];
+        () = msg![env; item addTarget:delegate action:selector forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; menu addSubview:item];
+        items.push(item);
+        release(env, label);
+    }
+    (button, menu, items, paths)
+}
+
+fn make_graphics_api_dropdown(
+    env: &mut Environment,
+    delegate: id,
+    super_view: id,
+    super_view_size: CGSize,
+    row_center: CGFloat,
+) -> (id, id, Vec<id>) {
+    let ui_scale = picker_ui_scale(super_view_size);
+    let width = (super_view_size.width * 0.56).clamp(170.0, 720.0);
+    let height = 30.0 * ui_scale;
+    let frame = CGRect {
+        origin: CGPoint {
+            x: super_view_size.width * 0.42,
+            y: row_center - height / 2.0,
+        },
+        size: CGSize { width, height },
+    };
+    let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    let title = ns_string::get_static_str(env, "Default (game)");
+    () = msg![env; button setTitle:title forState:UIControlStateNormal];
+    release(env, title);
+    let button_label: id = msg![env; button titleLabel];
+    let button_font = picker_font(env, 13.0 * ui_scale);
+    () = msg![env; button_label setFont:button_font];
+    () = msg![env; button_label setAdjustsFontSizeToFitWidth:true];
+    () = msg![env; button_label setMinimumFontSize:8.0];
+    let white: id = msg_class![env; UIColor whiteColor];
+    let gray: id = settings_menu_gray(env);
+    () = msg![env; button setTitleColor:white forState:UIControlStateNormal];
+    () = msg![env; button setBackgroundColor:gray];
+    () = msg![env; button setFrame:frame];
+    () = msg![env; button layoutSubviews];
+    let toggle = env.objc.lookup_selector("graphicsApiToggle").unwrap();
+    () = msg![env; button addTarget:delegate action:toggle forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; super_view addSubview:button];
+    let menu: id = msg_class![env; UIView alloc];
+    let menu: id = msg![env; menu initWithFrame:(CGRect { origin: CGPoint { x: frame.origin.x, y: (frame.origin.y - height * GRAPHICS_API_ENTRIES.len() as CGFloat).max(0.0) }, size: CGSize { width, height: height * GRAPHICS_API_ENTRIES.len() as CGFloat } })];
+    () = msg![env; menu setBackgroundColor:gray];
+    () = msg![env; menu setClipsToBounds:true];
+    () = msg![env; menu setHidden:true];
+    () = msg![env; super_view addSubview:menu];
+    let selector = env.objc.lookup_selector("graphicsApi:").unwrap();
+    let mut items = Vec::new();
+    for (index, (label, _)) in GRAPHICS_API_ENTRIES.iter().enumerate() {
+        let item: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        let text = ns_string::get_static_str(env, label);
+        () = msg![env; item setTitle:text forState:UIControlStateNormal];
+        release(env, text);
+        let item_label: id = msg![env; item titleLabel];
+        let item_font = picker_font(env, 11.0 * ui_scale);
+        () = msg![env; item_label setFont:item_font];
+        () = msg![env; item_label setAdjustsFontSizeToFitWidth:true];
+        () = msg![env; item_label setMinimumFontSize:6.0];
+        () = msg![env; item setTitleColor:white forState:UIControlStateNormal];
+        () = msg![env; item setBackgroundColor:gray];
+        () = msg![env; item setFrame:(CGRect { origin: CGPoint { x: 0.0, y: index as CGFloat * height }, size: CGSize { width, height } })];
+        () = msg![env; item layoutSubviews];
+        () = msg![env; item setTag:(index as NSInteger)];
+        () = msg![env; item addTarget:delegate action:selector forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; menu addSubview:item];
+        items.push(item);
+    }
+    (button, menu, items)
+}
+
+fn make_settings_dropdown<T>(
+    env: &mut Environment,
+    delegate: id,
+    super_view: id,
+    super_view_size: CGSize,
+    row_center: CGFloat,
+    entries: &[(&'static str, T)],
+    title: &'static str,
+    toggle_selector_name: &str,
+    select_selector_name: &str,
+) -> (id, id, Vec<id>) {
+    let ui_scale = picker_ui_scale(super_view_size);
+    let width = (super_view_size.width * 0.56).clamp(170.0, 720.0);
+    let height = 30.0 * ui_scale;
+    let button_frame = CGRect {
+        origin: CGPoint {
+            x: super_view_size.width * 0.42,
+            y: row_center - height / 2.0,
+        },
+        size: CGSize { width, height },
+    };
+    let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    let title = ns_string::get_static_str(env, title);
+    () = msg![env; button setTitle:title forState:UIControlStateNormal];
+    release(env, title);
+    let button_label: id = msg![env; button titleLabel];
+    let button_font = picker_font(env, 13.0 * ui_scale);
+    () = msg![env; button_label setFont:button_font];
+    () = msg![env; button_label setAdjustsFontSizeToFitWidth:true];
+    () = msg![env; button_label setMinimumFontSize:8.0];
+    let white: id = msg_class![env; UIColor whiteColor];
+    let gray: id = settings_menu_gray(env);
+    () = msg![env; button setTitleColor:white forState:UIControlStateNormal];
+    () = msg![env; button setBackgroundColor:gray];
+    () = msg![env; button setFrame:button_frame];
+    () = msg![env; button layoutSubviews];
+    let toggle = env.objc.lookup_selector(toggle_selector_name).unwrap();
+    () = msg![env; button addTarget:delegate action:toggle forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; super_view addSubview:button];
+
+    let menu_height = height * entries.len() as CGFloat;
+    let menu: id = msg_class![env; UIView alloc];
+    let menu: id = msg![env; menu initWithFrame:(CGRect {
+        origin: CGPoint {
+            x: button_frame.origin.x,
+            y: (button_frame.origin.y - menu_height).max(0.0),
+        },
+        size: CGSize { width, height: menu_height },
+    })];
+    () = msg![env; menu setBackgroundColor:gray];
+    () = msg![env; menu setClipsToBounds:true];
+    () = msg![env; menu setHidden:true];
+    () = msg![env; super_view addSubview:menu];
+    let selector = env.objc.lookup_selector(select_selector_name).unwrap();
+    let mut items = Vec::new();
+    for (index, (label, _)) in entries.iter().enumerate() {
+        let item: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        let text = ns_string::get_static_str(env, label);
+        () = msg![env; item setTitle:text forState:UIControlStateNormal];
+        release(env, text);
+        let item_label: id = msg![env; item titleLabel];
+        let item_font = picker_font(env, 11.0 * ui_scale);
+        () = msg![env; item_label setFont:item_font];
+        () = msg![env; item_label setAdjustsFontSizeToFitWidth:true];
+        () = msg![env; item_label setMinimumFontSize:6.0];
+        () = msg![env; item setTitleColor:white forState:UIControlStateNormal];
+        () = msg![env; item setBackgroundColor:gray];
+        () = msg![env; item setFrame:(CGRect {
+            origin: CGPoint { x: 0.0, y: index as CGFloat * height },
+            size: CGSize { width, height },
+        })];
+        () = msg![env; item layoutSubviews];
+        let item_tag = index as NSInteger;
+        () = msg![env; item setTag:item_tag];
+        () = msg![env; item addTarget:delegate action:selector forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; menu addSubview:item];
+        items.push(item);
+    }
+    (button, menu, items)
+}
+
+fn make_ios_version_dropdown(
+    env: &mut Environment,
+    delegate: id,
+    super_view: id,
+    super_view_size: CGSize,
+    row_center: CGFloat,
+) -> (id, id, Vec<id>) {
+    let ui_scale = picker_ui_scale(super_view_size);
+    let button_width: CGFloat = (super_view_size.width * 0.56).clamp(170.0, 720.0);
+    let button_height: CGFloat = 30.0 * ui_scale;
+    let item_height: CGFloat = 30.0 * ui_scale;
+    let button_frame = CGRect {
+        origin: CGPoint {
+            x: super_view_size.width * 0.42,
+            y: row_center - button_height / 2.0,
+        },
+        size: CGSize {
+            width: button_width,
+            height: button_height,
+        },
+    };
+    let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    let title = ns_string::get_static_str(env, "iOS version");
+    () = msg![env; button setTitle:title forState:UIControlStateNormal];
+    release(env, title);
+    let button_label: id = msg![env; button titleLabel];
+    let button_font = picker_font(env, 13.0 * ui_scale);
+    () = msg![env; button_label setFont:button_font];
+    let white: id = msg_class![env; UIColor whiteColor];
+    let dark_gray: id = settings_menu_gray(env);
+    () = msg![env; button_label setAdjustsFontSizeToFitWidth:true];
+    () = msg![env; button_label setMinimumFontSize:8.0];
+    let magenta: id = settings_menu_selected_green(env);
+    () = msg![env; button setTitleColor:white forState:UIControlStateNormal];
+    () = msg![env; button setBackgroundColor:dark_gray];
+    () = msg![env; button setFrame:button_frame];
+    () = msg![env; button layoutSubviews];
+    let button_layer: id = msg![env; button layer];
+    () = msg![env; button_layer setCornerRadius:(6.0 as CGFloat)];
+    let toggle_selector = env.objc.lookup_selector("iosVersionToggle").unwrap();
+    () = msg![env; button addTarget:delegate action:toggle_selector forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; super_view addSubview:button];
+
+    let menu: id = msg_class![env; UIView alloc];
+    let menu: id = msg![env; menu initWithFrame:(CGRect {
+        origin: CGPoint {
+            x: button_frame.origin.x,
+            y: (button_frame.origin.y - item_height * IOS_VERSION_ENTRIES.len() as CGFloat).max(0.0),
+        },
+        size: CGSize {
+            width: button_width,
+            height: item_height * IOS_VERSION_ENTRIES.len() as CGFloat,
+        },
+    })];
+    () = msg![env; menu setBackgroundColor:dark_gray];
+    () = msg![env; menu setClipsToBounds:true];
+    let menu_layer: id = msg![env; menu layer];
+    () = msg![env; menu_layer setCornerRadius:(6.0 as CGFloat)];
+    () = msg![env; menu setHidden:true];
+    () = msg![env; super_view addSubview:menu];
+
+    let entries = IOS_VERSION_ENTRIES;
+    let mut items = Vec::new();
+    for (index, (label, tag)) in entries.iter().enumerate() {
+        let item: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        let text = ns_string::from_rust_string(env, (*label).to_owned());
+        () = msg![env; item setTitle:text forState:UIControlStateNormal];
+        release(env, text);
+        let item_label: id = msg![env; item titleLabel];
+        let item_font = picker_font(env, 11.0 * ui_scale);
+        () = msg![env; item_label setFont:item_font];
+        () = msg![env; item_label setAdjustsFontSizeToFitWidth:true];
+        () = msg![env; item_label setMinimumFontSize:6.0];
+        let item_text_color: id = msg_class![env; UIColor whiteColor];
+        () = msg![env; item setTitleColor:item_text_color forState:UIControlStateNormal];
+        let item_color: id = if *tag == 0 { magenta } else { dark_gray };
+        () = msg![env; item setBackgroundColor:item_color];
+        () = msg![env; item setFrame:(CGRect {
+            origin: CGPoint { x: 0.0, y: index as CGFloat * item_height },
+            size: CGSize { width: button_width, height: item_height },
+        })];
+        () = msg![env; item layoutSubviews];
+        let tag: NSInteger = *tag as NSInteger;
+        () = msg![env; item setTag:tag];
+        let selector = env.objc.lookup_selector("iosVersion:").unwrap();
+        () = msg![env; item addTarget:delegate action:selector forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; menu addSubview:item];
+        items.push(item);
+    }
+    (button, menu, items)
+}
+
 fn make_device_model_dropdown(
     env: &mut Environment,
     delegate: id,
@@ -1829,14 +5054,15 @@ fn make_device_model_dropdown(
     super_view_size: CGSize,
     row_center: CGFloat,
 ) -> (id, id, Vec<id>, id) {
-    let btn_width: CGFloat = 280.0;
-    let btn_height: CGFloat = 30.0;
-    let list_width: CGFloat = 256.0;
-    let scrollbar_width: CGFloat = 24.0;
+    let ui_scale = picker_ui_scale(super_view_size);
+    let btn_width: CGFloat = (super_view_size.width * 0.56).clamp(170.0, 720.0);
+    let btn_height: CGFloat = 30.0 * ui_scale;
+    let scrollbar_width: CGFloat = 22.0 * ui_scale;
+    let list_width: CGFloat = btn_width - scrollbar_width;
 
     let btn_frame = CGRect {
         origin: CGPoint {
-            x: super_view_size.width / 2.0 - btn_width / 2.0,
+            x: super_view_size.width * 0.42,
             y: row_center - btn_height / 2.0,
         },
         size: CGSize {
@@ -1845,7 +5071,7 @@ fn make_device_model_dropdown(
         },
     };
 
-    let dark_gray: id = msg_class![env; UIColor darkGrayColor];
+    let dark_gray: id = settings_menu_gray(env);
 
     // Bordered container for the toggle button (a darker frame behind a lighter
     // inner button), so it reads as a control on the white menu background.
@@ -1866,9 +5092,14 @@ fn make_device_model_dropdown(
     let text = ns_string::from_rust_string(env, initial_title);
     () = msg![env; button setTitle:text forState:UIControlStateNormal];
     release(env, text);
-    let black: id = msg_class![env; UIColor blackColor];
-    () = msg![env; button setTitleColor:black forState:UIControlStateNormal];
-    let light_gray: id = msg_class![env; UIColor lightGrayColor];
+    let button_label: id = msg![env; button titleLabel];
+    let button_font = picker_font(env, 13.0 * ui_scale);
+    () = msg![env; button_label setFont:button_font];
+    let white: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; button setTitleColor:white forState:UIControlStateNormal];
+    () = msg![env; button_label setAdjustsFontSizeToFitWidth:true];
+    () = msg![env; button_label setMinimumFontSize:8.0];
+    let light_gray: id = msg_class![env; UIColor darkGrayColor];
     () = msg![env; button setBackgroundColor:light_gray];
     () = msg![env; button setFrame:inner_frame];
     () = msg![env; button layoutSubviews];
@@ -1880,11 +5111,12 @@ fn make_device_model_dropdown(
 
     // The dropdown menu, placed directly above the toggle button. It is clipped
     // to its own bounds and hidden until the button is tapped.
-    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
+    let row_height = DEVICE_MENU_ITEM_HEIGHT * ui_scale;
+    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * row_height;
     let menu_frame = CGRect {
         origin: CGPoint {
             x: btn_frame.origin.x,
-            y: btn_frame.origin.y - visible_menu_height,
+            y: (btn_frame.origin.y - visible_menu_height).max(0.0),
         },
         size: CGSize {
             width: btn_width,
@@ -1906,21 +5138,28 @@ fn make_device_model_dropdown(
     let white: id = msg_class![env; UIColor whiteColor];
     let mut items: Vec<id> = Vec::new();
     for (j, (title, tag)) in entries.into_iter().enumerate() {
-        let y_pos = (j as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
+        let y_pos = (j as CGFloat) * row_height;
         let item_frame = CGRect {
             origin: CGPoint { x: 0.0, y: y_pos },
             size: CGSize {
                 width: list_width,
-                height: DEVICE_MENU_ITEM_HEIGHT,
+                height: row_height,
             },
         };
         let item_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
         let text = ns_string::from_rust_string(env, title);
         () = msg![env; item_btn setTitle:text forState:UIControlStateNormal];
         release(env, text);
+        let item_label: id = msg![env; item_btn titleLabel];
+        let item_font = picker_font(env, 12.0 * ui_scale);
+        () = msg![env; item_label setFont:item_font];
+        () = msg![env; item_label setAdjustsFontSizeToFitWidth:true];
+        () = msg![env; item_label setMinimumFontSize:8.0];
         () = msg![env; item_btn setTitleColor:white forState:UIControlStateNormal];
+        () = msg![env; item_btn setBackgroundColor:dark_gray];
         () = msg![env; item_btn setFrame:item_frame];
         () = msg![env; item_btn layoutSubviews];
+        let tag: NSInteger = tag as NSInteger;
         () = msg![env; item_btn setTag:tag];
         if y_pos >= visible_menu_height {
             () = msg![env; item_btn setHidden:true];
@@ -1957,7 +5196,7 @@ fn make_device_model_dropdown(
         },
         size: CGSize {
             width: scrollbar_width,
-            height: 54.0,
+            height: (54.0 * ui_scale).min(visible_menu_height),
         },
     };
     let thumb_view: id = msg![env; thumb_view initWithFrame:thumb_frame];
@@ -2004,88 +5243,4 @@ fn make_device_model_dropdown(
     () = msg![env; menu_view addSubview:down_btn];
 
     (button, menu_view, items, thumb_view)
-}
-
-fn quick_options_trainer_enabled(options: &Options) -> bool {
-    !options.trainer_disabled
-}
-
-fn quick_options_trainer_argument(enabled: bool) -> &'static str {
-    if enabled {
-        "--trainer"
-    } else {
-        "--no-trainer"
-    }
-}
-
-/// Initial state of the "GLES Native" switch: whatever the effective
-/// [`Options`] say. The app picker runs before the options files are read,
-/// so in practice this is OFF unless `--gles-native` was given on the
-/// command line.
-fn quick_options_gles_native_enabled(options: &Options) -> bool {
-    options.gles_native
-}
-
-/// Launch argument matching the "GLES Native" switch. Always emitted so that
-/// the switch's choice overrides the base default and the options files.
-fn quick_options_gles_native_argument(enabled: bool) -> &'static str {
-    if enabled {
-        "--gles-native"
-    } else {
-        "--no-gles-native"
-    }
-}
-
-#[cfg(test)]
-mod quick_options_trainer_tests {
-    use super::*;
-
-    #[test]
-    fn trainer_toggle_defaults_off_and_emits_explicit_launch_option() {
-        let mut options = Options::default();
-
-        let mut enabled = quick_options_trainer_enabled(&options);
-        assert!(!enabled);
-        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
-
-        options.parse_argument("--trainer").unwrap();
-        enabled = quick_options_trainer_enabled(&options);
-        assert!(enabled);
-        assert_eq!(quick_options_trainer_argument(enabled), "--trainer");
-
-        options.parse_argument("--no-trainer").unwrap();
-        enabled = quick_options_trainer_enabled(&options);
-        assert!(!enabled);
-        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
-    }
-}
-
-#[cfg(test)]
-mod quick_options_gles_native_tests {
-    use super::*;
-
-    #[test]
-    fn gles_native_toggle_defaults_off_and_emits_explicit_launch_option() {
-        let mut options = Options::default();
-
-        let mut enabled = quick_options_gles_native_enabled(&options);
-        assert!(!enabled);
-        assert_eq!(
-            quick_options_gles_native_argument(enabled),
-            "--no-gles-native"
-        );
-
-        options.parse_argument("--gles-native").unwrap();
-        enabled = quick_options_gles_native_enabled(&options);
-        assert!(enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
-
-        options.parse_argument("--no-gles-native").unwrap();
-        enabled = quick_options_gles_native_enabled(&options);
-        assert!(!enabled);
-        assert_eq!(
-            quick_options_gles_native_argument(enabled),
-            "--no-gles-native"
-        );
-    }
 }

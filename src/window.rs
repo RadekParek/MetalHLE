@@ -16,7 +16,8 @@ mod geometry;
 
 use crate::gles::present::present_frame;
 use crate::gles::{
-    create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext,
+    create_gles1_ctx_no_parent_stack, create_gles1_gles3_translator_ctx_no_parent_stack,
+    create_gles1_translator_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext,
     LoggingGLESContext, GLES,
 };
 use crate::image::Image;
@@ -754,6 +755,48 @@ pub struct Window {
     pub(super) on_main_stack: bool,
 }
 
+pub fn host_screen_resolutions() -> Vec<(u32, u32)> {
+    let Some(sdl_ctx) = sdl2::init().ok() else {
+        return Vec::new();
+    };
+    let Some(video_ctx) = sdl_ctx.video().ok() else {
+        return Vec::new();
+    };
+    let mode_count = video_ctx.num_display_modes(0).unwrap_or(0);
+    let mut resolutions = Vec::new();
+    let mut add_resolution = |resolution: (u32, u32)| {
+        let resolution = normalize_portrait_size(resolution);
+        if resolution.0 >= 64 && resolution.1 >= 64 && !resolutions.contains(&resolution) {
+            resolutions.push(resolution);
+        }
+    };
+    for mode_index in 0..mode_count {
+        let Ok(mode) = video_ctx.display_mode(0, mode_index) else {
+            continue;
+        };
+        if mode.w <= 0 || mode.h <= 0 {
+            continue;
+        }
+        add_resolution((mode.w as u32, mode.h as u32));
+    }
+    if let Some(size) = host_screen_size() {
+        add_resolution(size);
+        // 0.75x sits between the full device resolution and the half
+        // resolution in the picker (e.g. 1440x3088 -> 1080x2316).
+        let three_quarters = normalize_portrait_size((size.0 * 3 / 4, size.1 * 3 / 4));
+        add_resolution(three_quarters);
+        add_resolution((size.0 / 2, size.1 / 2));
+    }
+    if let Some((width, height)) = resolutions.first().copied() {
+        let half = normalize_portrait_size((width / 2, height / 2));
+        if half.0 >= 64 && half.1 >= 64 && !resolutions.contains(&half) {
+            resolutions.push(half);
+        }
+    }
+    resolutions.sort_unstable_by_key(|(width, height)| (*width as u64) * (*height as u64));
+    resolutions
+}
+
 impl Window {
     /// Returns [true] if touchHLE is running on a device where we should always
     /// display fullscreen, but SDL2 will let us control the orientation, i.e.
@@ -963,6 +1006,11 @@ impl Window {
             .map(|(image, orientation_specific)| (Some(image), orientation_specific))
             .unwrap_or((None, false));
 
+        let effective_graphics_api = options.graphics_api;
+        let software_presentation = matches!(
+            effective_graphics_api,
+            crate::options::GraphicsApi::Software
+        );
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
             video_ctx,
@@ -998,7 +1046,7 @@ impl Window {
             host_screen_size,
             internal_gl_ins: None,
             gl_driver_description: String::new(),
-            software_presentation: false,
+            software_presentation,
             splash_image,
             splash_image_is_orientation_specific,
             device_family,
@@ -1037,10 +1085,35 @@ impl Window {
         // (see src/frameworks/core_animation/composition.rs). OpenGL ES is used
         // because SDL2 won't let us use more than one graphics API in the same
         // window, and we also need OpenGL ES for the app's own rendering.
-        let mut gl_ins = if options.prefer_gles2_context {
-            create_gles2_ctx_no_parent_stack(&mut window)
-        } else {
-            create_gles1_ctx_no_parent_stack(&mut window, options)
+        let mut gl_ins = match effective_graphics_api {
+            crate::options::GraphicsApi::Translator => {
+                create_gles1_translator_ctx_no_parent_stack(&mut window)
+            }
+            crate::options::GraphicsApi::TranslatorGLES30 => {
+                create_gles1_gles3_translator_ctx_no_parent_stack(&mut window)
+            }
+            crate::options::GraphicsApi::GLES20
+            | crate::options::GraphicsApi::GLES30
+            | crate::options::GraphicsApi::Metal
+            | crate::options::GraphicsApi::Wgpu
+            | crate::options::GraphicsApi::Vulkan => {
+                if matches!(effective_graphics_api, crate::options::GraphicsApi::GLES30) {
+                    log!("GLES 3.0 window context is unavailable; using a GLES 2.0 context");
+                }
+                create_gles2_ctx_no_parent_stack(&mut window)
+            }
+            crate::options::GraphicsApi::Software
+            | crate::options::GraphicsApi::GLES10
+            | crate::options::GraphicsApi::GLES11 => {
+                create_gles1_ctx_no_parent_stack(&mut window, options)
+            }
+            crate::options::GraphicsApi::Default => {
+                if options.prefer_gles2_context {
+                    create_gles2_ctx_no_parent_stack(&mut window)
+                } else {
+                    create_gles1_ctx_no_parent_stack(&mut window, options)
+                }
+            }
         };
         if options.trace_gl_errors {
             gl_ins = Box::new(LoggingGLESContext {
