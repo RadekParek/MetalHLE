@@ -313,6 +313,37 @@ fn apply_path_component<'a>(components: &mut Vec<&'a str>, component: &'a str) {
 /// current directory.
 /// It must be an absolute path. It is optional if `path`
 /// is absolute.
+/// Derive a stable, per-app install UUID (UUIDv5-style: SHA-1 over a fixed
+/// namespace concatenated with the bundle ID, trimmed to 128 bits with the
+/// version-5 and RFC-4122 variant bits set). Real devices assign a random
+/// UUID per install; deriving it from the bundle ID keeps the guest-visible
+/// `/var/mobile/Applications/<uuid>` path stable across launches (saves that
+/// hard-code the path keep working) while giving every app its own directory,
+/// instead of every app sharing the all-zero UUID.
+pub fn install_uuid_for_bundle_id(bundle_id: &str) -> String {
+    use sha1::{Digest, Sha1};
+
+    // Namespace: fixed, self-describing, constant across launches.
+    const NAMESPACE: &[u8] = b"MetalHLE-Install-UUID-Namespace-v1";
+    let mut hasher = Sha1::new();
+    hasher.update(NAMESPACE);
+    hasher.update(bundle_id.as_bytes());
+    let hash = hasher.finalize();
+
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    // Version 5 (SHA-1 name-based) and RFC 4122 variant bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+        bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
+        bytes[13], bytes[14], bytes[15]
+    )
+}
+
 pub fn resolve_path<'a>(path: &'a GuestPath, relative_to: Option<&'a GuestPath>) -> Vec<&'a str> {
     log_dbg!("Resolving {:?} relative to {:?}", path, relative_to);
     let mut components = Vec::new();
@@ -1272,6 +1303,38 @@ impl Fs {
 
     /// Returns access information about the file/directory at the path
     /// (exists, read, write, execute)
+
+    /// Resolve an existing guest path using the filesystem's canonical spelling.
+    /// Exact lookup is preferred; a case-insensitive component walk is used only
+    /// when the exact path is absent, matching common iOS resource lookup behavior.
+    pub fn resolve_existing_path(&self, path: &GuestPath) -> Option<GuestPathBuf> {
+        if self.exists(path) {
+            return Some(path.to_owned());
+        }
+
+        let components = resolve_path(path, Some(&self.working_directory));
+        if components.is_empty() {
+            return Some(GuestPathBuf::from("/".to_owned()));
+        }
+
+        let mut current = String::new();
+        for component in components {
+            let parent = if current.is_empty() {
+                GuestPath::new("/")
+            } else {
+                GuestPath::new(&current)
+            };
+            let actual = self
+                .enumerate(parent)
+                .ok()?
+                .find(|entry| entry.eq_ignore_ascii_case(component))?
+                .to_owned();
+            current.push('/');
+            current.push_str(&actual);
+        }
+        Some(GuestPathBuf::from(current))
+    }
+
     pub fn access(&self, path: &GuestPath) -> (bool, bool, bool, bool) {
         match self.lookup_node(path) {
             None => (false, false, false, false),
@@ -2024,10 +2087,8 @@ mod tests {
                     "Mobile",
                     FsNode::dir().with_child(
                         "Applications",
-                        FsNode::dir().with_child(
-                            "UUID",
-                            FsNode::dir().with_child("Granny.app", bundle),
-                        ),
+                        FsNode::dir()
+                            .with_child("UUID", FsNode::dir().with_child("Granny.app", bundle)),
                     ),
                 ),
             ),

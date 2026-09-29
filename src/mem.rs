@@ -280,6 +280,7 @@ unsafe impl SafeRead for i64 {}
 unsafe impl SafeRead for u64 {}
 unsafe impl SafeRead for f32 {}
 unsafe impl SafeRead for f64 {}
+unsafe impl SafeRead for [u64; 2] {}
 unsafe impl<T, const MUT: bool> SafeRead for Ptr<T, MUT> {}
 
 /// Marker trait for types that can be written to guest memory.

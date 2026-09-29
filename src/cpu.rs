@@ -9,15 +9,59 @@
 //!
 //! iPhone OS apps used either ARMv6 or ARMv7-A, which are both 32-bit ISAs.
 //! For the moment, only ARMv6 has been tested.
-// KlugKlugTG was here!
+
 use crate::abi::GuestFunction;
 use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
+use crate::mem64::Mem64;
+mod a64;
+
+use self::a64::A64Interpreter;
+
+use std::ffi::CStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Import functions from C++
 use touchHLE_dynarmic_wrapper::*;
 
 type VAddr = u32;
 pub type CpuContext = touchHLE_DynarmicContext;
+
+const NO_A64_MEMORY_FAULT: u64 = u64::MAX;
+static LAST_A64_MEMORY_FAULT: AtomicU64 = AtomicU64::new(NO_A64_MEMORY_FAULT);
+
+pub(crate) fn reset_a64_memory_fault() {
+    LAST_A64_MEMORY_FAULT.store(NO_A64_MEMORY_FAULT, Ordering::Relaxed);
+}
+
+pub(crate) fn record_a64_memory_fault(address: u64) {
+    LAST_A64_MEMORY_FAULT.store(address, Ordering::Relaxed);
+}
+
+pub(crate) fn last_a64_memory_fault() -> Option<u64> {
+    match LAST_A64_MEMORY_FAULT.load(Ordering::Relaxed) {
+        NO_A64_MEMORY_FAULT => None,
+        address => Some(address),
+    }
+}
+
+#[no_mangle]
+extern "C" fn touchHLE_cpu_a64_record_memory_fault(address: u64) {
+    record_a64_memory_fault(address);
+}
+
+#[no_mangle]
+extern "C" fn touchHLE_cpu_a64_log(message: *const std::ffi::c_char) {
+    if message.is_null() {
+        return;
+    }
+    let message = unsafe { CStr::from_ptr(message) };
+    let Ok(message) = message.to_str() else {
+        return;
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        echo!("ARM64 dynarmic: {}", message);
+    }));
+}
 
 fn touchHLE_cpu_read_impl<T: SafeRead + Default>(
     mem: *mut touchHLE_Mem,
@@ -92,6 +136,86 @@ extern "C" fn touchHLE_cpu_write_u64(mem: *mut touchHLE_Mem, addr: VAddr, value:
     touchHLE_cpu_write_impl(mem, addr, value)
 }
 
+fn touchHLE_cpu_read_64_impl<T: SafeRead + Default + Copy>(
+    mem: *mut touchHLE_Mem,
+    addr: u64,
+    error: *mut bool,
+) -> T {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mem = unsafe { &mut *mem.cast::<Mem64>() };
+        mem.read(addr)
+    }));
+    match res {
+        Ok(Ok(value)) => {
+            unsafe { error.write(false) };
+            value
+        }
+        Ok(Err(_)) | Err(_) => {
+            unsafe { error.write(true) };
+            T::default()
+        }
+    }
+}
+
+fn touchHLE_cpu_write_64_impl<T: SafeWrite>(mem: *mut touchHLE_Mem, addr: u64, value: T) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mem = unsafe { &mut *mem.cast::<Mem64>() };
+        mem.write(addr, value)
+    })) {
+        Ok(Ok(())) => false,
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
+#[no_mangle]
+extern "C" fn touchHLE_cpu_read_u8_64(mem: *mut touchHLE_Mem, addr: u64, error: *mut bool) -> u8 {
+    touchHLE_cpu_read_64_impl(mem, addr, error)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_read_u16_64(mem: *mut touchHLE_Mem, addr: u64, error: *mut bool) -> u16 {
+    touchHLE_cpu_read_64_impl(mem, addr, error)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_read_u32_64(mem: *mut touchHLE_Mem, addr: u64, error: *mut bool) -> u32 {
+    touchHLE_cpu_read_64_impl(mem, addr, error)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_read_u64_64(mem: *mut touchHLE_Mem, addr: u64, error: *mut bool) -> u64 {
+    touchHLE_cpu_read_64_impl(mem, addr, error)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_read_u128_64(
+    mem: *mut touchHLE_Mem,
+    addr: u64,
+    error: *mut bool,
+) -> [u64; 2] {
+    touchHLE_cpu_read_64_impl(mem, addr, error)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_write_u8_64(mem: *mut touchHLE_Mem, addr: u64, value: u8) -> bool {
+    touchHLE_cpu_write_64_impl(mem, addr, value)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_write_u16_64(mem: *mut touchHLE_Mem, addr: u64, value: u16) -> bool {
+    touchHLE_cpu_write_64_impl(mem, addr, value)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_write_u32_64(mem: *mut touchHLE_Mem, addr: u64, value: u32) -> bool {
+    touchHLE_cpu_write_64_impl(mem, addr, value)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_write_u64_64(mem: *mut touchHLE_Mem, addr: u64, value: u64) -> bool {
+    touchHLE_cpu_write_64_impl(mem, addr, value)
+}
+#[no_mangle]
+extern "C" fn touchHLE_cpu_write_u128_64(
+    mem: *mut touchHLE_Mem,
+    addr: u64,
+    value: [u64; 2],
+) -> bool {
+    touchHLE_cpu_write_64_impl(mem, addr, value)
+}
+
 pub struct Cpu {
     dynarmic_wrapper: *mut touchHLE_DynarmicWrapper,
     /// Copy of the direct memory access pointer used to check it has not
@@ -131,6 +255,8 @@ pub enum CpuError {
 impl Cpu {
     /// The register number of the stack pointer.
     pub const SP: usize = 13;
+    /// The register number used as the ARM EABI static-base/TLS register.
+    pub const R9: usize = 9;
     /// The register number of the link register.
     #[allow(unused)]
     pub const LR: usize = 14;
@@ -148,6 +274,7 @@ impl Cpu {
     /// becomes bound to that [Mem] instance (subsequent calls must use the same
     /// one).
     pub fn new(direct_memory_access: Option<&mut Mem>) -> Cpu {
+        log_once!("ARM32 backend: Dynarmic A32 JIT with fast memory and safe optimization passes");
         // Null page count is in pages rather than bytes. Mem ensures it is
         // page aligned.
         let null_page_count: usize = direct_memory_access
@@ -278,6 +405,7 @@ impl Cpu {
     /// something else happened which requires attention from the host.
     #[must_use]
     pub fn run_or_step(&mut self, mem: &mut Mem, ticks: Option<&mut u64>) -> CpuState {
+        let _perf_scope = crate::perf::interpreter_scope();
         // See ::new() for why this is done.
         if !self.direct_memory_access_ptr.is_null() {
             assert!(self.direct_memory_access_ptr == unsafe { mem.direct_memory_access_ptr() });
@@ -298,5 +426,206 @@ impl Cpu {
             _ if res < -4 => panic!("Unexpected CPU execution result"),
             svc => CpuState::Svc(svc as u32),
         }
+    }
+}
+
+pub struct A64Cpu {
+    backend: A64Backend,
+}
+
+enum A64Backend {
+    Jit {
+        wrapper: *mut touchHLE_DynarmicWrapper,
+        interpreter: A64Interpreter,
+        fallback: crate::options::Arm64Fallback,
+        disabled: bool,
+    },
+    Interpreter(A64Interpreter),
+}
+
+impl std::fmt::Debug for A64Cpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A64Cpu").finish_non_exhaustive()
+    }
+}
+
+impl Drop for A64Cpu {
+    fn drop(&mut self) {
+        if let A64Backend::Jit { wrapper, .. } = self.backend {
+            unsafe { touchHLE_DynarmicA64Wrapper_delete(wrapper) }
+        }
+    }
+}
+
+impl A64Cpu {
+    pub fn with_backend_and_fallback(
+        backend: crate::options::Arm64Backend,
+        fallback: crate::options::Arm64Fallback,
+    ) -> Self {
+        let backend = match backend {
+            crate::options::Arm64Backend::Interpreter => {
+                echo!("ARM64 backend selected: interpreter (explicit diagnostic mode)");
+                A64Backend::Interpreter(A64Interpreter::new())
+            }
+            crate::options::Arm64Backend::Auto => {
+                echo!("ARM64 backend selected: Dynarmic JIT (automatic mode)");
+                A64Backend::Jit {
+                    wrapper: unsafe { touchHLE_DynarmicA64Wrapper_new() },
+                    interpreter: A64Interpreter::new(),
+                    fallback,
+                    disabled: false,
+                }
+            }
+            crate::options::Arm64Backend::Jit => {
+                echo!("ARM64 backend selected: Dynarmic JIT (single-instruction compatibility stepping with interpreter fallback)");
+                A64Backend::Jit {
+                    wrapper: unsafe { touchHLE_DynarmicA64Wrapper_new() },
+                    interpreter: A64Interpreter::new(),
+                    fallback,
+                    disabled: false,
+                }
+            }
+        };
+        Self { backend }
+    }
+
+    pub fn load_context(&mut self, context: &touchHLE_DynarmicA64Context) {
+        if let A64Backend::Jit {
+            wrapper, disabled, ..
+        } = self.backend
+        {
+            if !disabled {
+                unsafe { touchHLE_DynarmicA64Wrapper_load_context(wrapper, context) }
+            }
+        }
+    }
+
+    pub fn save_context(&mut self, context: &mut touchHLE_DynarmicA64Context) {
+        match &mut self.backend {
+            A64Backend::Jit {
+                wrapper, disabled, ..
+            } if !*disabled => unsafe {
+                touchHLE_DynarmicA64Wrapper_save_context(*wrapper, context)
+            },
+            A64Backend::Jit { .. } | A64Backend::Interpreter(_) => {}
+        }
+    }
+
+    pub fn run_or_step(
+        &mut self,
+        mem: &mut Mem64,
+        context: &mut touchHLE_DynarmicA64Context,
+        mut ticks: Option<&mut u64>,
+    ) -> i32 {
+        match &mut self.backend {
+            A64Backend::Jit {
+                wrapper,
+                interpreter,
+                fallback,
+                disabled,
+            } => {
+                if *disabled {
+                    return interpreter.run_or_step(mem, context, ticks);
+                }
+                let result = unsafe {
+                    touchHLE_DynarmicA64Wrapper_run_or_step(
+                        *wrapper,
+                        mem as *mut _ as *mut _,
+                        ticks.as_deref_mut(),
+                    )
+                };
+                if result < -1 {
+                    unsafe { touchHLE_DynarmicA64Wrapper_save_context(*wrapper, context) };
+                    match fallback {
+                        crate::options::Arm64Fallback::Interpreter => {
+                            *disabled = true;
+                            echo!("ARM64 Dynarmic fallback: disabling JIT after result {result} at faulting pc={:#x}; retrying with interpreter", context.pc);
+                            return interpreter.run_or_step(mem, context, ticks);
+                        }
+                        crate::options::Arm64Fallback::Jit => {
+                            echo!("ARM64 Dynarmic fallback selected as JIT after result {result} at pc={:#x}; preserving the JIT error", context.pc);
+                        }
+                    }
+                }
+                result
+            }
+            A64Backend::Interpreter(interpreter) => interpreter.run_or_step(mem, context, ticks),
+        }
+    }
+
+    pub fn clear_halt(&mut self, reason: u32) {
+        if let A64Backend::Jit {
+            wrapper, disabled, ..
+        } = self.backend
+        {
+            if !disabled {
+                unsafe { touchHLE_DynarmicA64Wrapper_clear_halt(wrapper, reason) }
+            }
+        }
+    }
+
+    pub fn set_trace(&mut self, enabled: bool) {
+        if let A64Backend::Jit { wrapper, .. } = self.backend {
+            unsafe { touchHLE_DynarmicA64Wrapper_set_trace(wrapper, enabled) }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::A64Cpu;
+    use crate::mem64::Mem64;
+    use touchHLE_dynarmic_wrapper::touchHLE_DynarmicA64Context;
+
+    #[test]
+    fn a64_synthetic_cpu_executes_instructions_and_stack_writes() {
+        const CODE: u64 = 0x1_0000_1000;
+        const STACK: u64 = 0x2_0000_0000;
+        let instructions = [
+            0xd503201f, 0xd2800540, 0x91001401, 0xd1000822, 0xa9bf07e0, 0xa8c113e3, 0xd65f03c0,
+        ];
+        let mut memory = Mem64::new();
+        memory.map_zeroed(CODE, 0x1000).unwrap();
+        memory.map_zeroed(STACK, 0x1000).unwrap();
+        for (index, instruction) in instructions.iter().enumerate() {
+            memory
+                .write_u32(CODE + index as u64 * 4, *instruction)
+                .unwrap();
+        }
+        let mut context = touchHLE_DynarmicA64Context::default();
+        context.pc = CODE;
+        context.sp = STACK + 0x800;
+        context.regs[30] = CODE + 0x100;
+        let original_sp = context.sp;
+        let mut cpu = A64Cpu::with_backend_and_fallback(
+            crate::options::Arm64Backend::Interpreter,
+            crate::options::Arm64Fallback::Interpreter,
+        );
+        cpu.load_context(&context);
+
+        for (index, instruction) in instructions.iter().take(6).enumerate() {
+            assert_eq!(
+                cpu.run_or_step(&mut memory, &mut context, None),
+                -1,
+                "instruction {} {instruction:#010x}",
+                index + 1
+            );
+            cpu.save_context(&mut context);
+            assert_eq!(context.pc, CODE + (index as u64 + 1) * 4);
+        }
+
+        cpu.save_context(&mut context);
+        assert_eq!(context.regs[0], 42);
+        assert_eq!(context.regs[1], 47);
+        assert_eq!(context.regs[2], 45);
+        assert_eq!(context.regs[3], 42);
+        assert_eq!(context.regs[4], 47);
+        assert_eq!(context.sp, original_sp);
+        assert_eq!(memory.read_u64(original_sp - 16).unwrap(), 42);
+        assert_eq!(memory.read_u64(original_sp - 8).unwrap(), 47);
+
+        assert_eq!(cpu.run_or_step(&mut memory, &mut context, None), -1);
+        cpu.save_context(&mut context);
+        assert_eq!(context.pc, CODE + 0x100);
     }
 }

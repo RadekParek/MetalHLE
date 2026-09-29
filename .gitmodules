@@ -15,3 +15,5 @@
 [submodule "vendor/libxml2"]
 	path = vendor/libxml2
 	url = https://github.com/GNOME/libxml2.git
+[submodule "vendor/dynarmic"]
+	url = https://github.com/KlugKlugTG/dynarmic.git

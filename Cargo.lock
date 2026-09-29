@@ -1474,6 +1474,7 @@ dependencies = [
  "corosensei",
  "digest",
  "encoding_rs",
+ "flate2",
  "gl_generator",
  "hound",
  "lazy_static",

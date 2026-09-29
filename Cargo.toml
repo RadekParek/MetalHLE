@@ -41,7 +41,8 @@ cmake = "0.1.49"
 gl_generator = "0.14.0"
 
 [dependencies]
-caf = "0.1.0" # ИСПРАВЛЕНИЕ: Добавлен недостающий крейт
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+caf = "0.1.0"
 hound = "3.5.0"
 mach_object = "0.1.17"
 plist = "1.8.0"

@@ -1,0 +1,1693 @@
+use crate::arm64_runtime::{
+    dispatch, materialize_import, schedule_display_link_callback, A64GraphicsBackend, LoadedImage,
+    RuntimeState,
+};
+use crate::bundle::Bundle;
+use crate::cpu::A64Cpu;
+use crate::fs::Fs;
+use crate::mach_o64::MachO64;
+use crate::mem64::Mem64;
+use crate::options::Options;
+use crate::window::DeviceFamily;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+use touchHLE_dynarmic_wrapper::touchHLE_DynarmicA64Context;
+
+#[path = "environment64/arm64_exceptions.rs"]
+mod arm64_exceptions;
+
+const STACK_BASE: u64 = 0x7fff_ffff_0000;
+const STACK_SIZE: u64 = 0x0010_0000;
+const SVC_THREAD_EXIT: u32 = 1;
+const SVC_RETURN_TO_HOST: u32 = 2;
+const SVC_HOST_BASE: u32 = 0x100;
+const SVC_STATIC_INITIALIZER_RETURN: u32 = SVC_HOST_BASE + 0x7ff9;
+const HOST_STUB_SIZE: u64 = 8;
+const MAX_HOST_DISPATCHES_PER_CALLBACK: u64 = 100_000;
+const A64_HALT_USER_DEFINED1: u32 = 0x0100_0000;
+const A64_HALT_USER_DEFINED2: u32 = 0x0200_0000;
+const A64_HALT_USER_DEFINED3: u32 = 0x0400_0000;
+const STALL_THRESHOLD: u64 = 512;
+const EXECUTION_SLICE_TICKS: u64 = 1_000;
+const ARM64_BOOTSTRAP_GRACE_SLICES: u32 = 10_000;
+
+fn sign_extend(value: u64, bits: u32) -> i64 {
+    let shift = 64 - bits;
+    ((value << shift) as i64) >> shift
+}
+
+fn branch_target(instruction: u32, pc: u64) -> Option<u64> {
+    let instruction = u64::from(instruction);
+    let immediate =
+        if instruction & 0xfc00_0000 == 0x1400_0000 || instruction & 0xfc00_0000 == 0x9400_0000 {
+            sign_extend(instruction & 0x03ff_ffff, 26) << 2
+        } else if instruction & 0xff00_0010 == 0x5400_0000 {
+            sign_extend((instruction >> 5) & 0x7f_ffff, 19) << 2
+        } else if instruction & 0x7e00_0000 == 0x3400_0000 {
+            sign_extend((instruction >> 5) & 0x7f_ffff, 19) << 2
+        } else if instruction & 0x7e00_0000 == 0x3600_0000 {
+            sign_extend((instruction >> 5) & 0x3fff, 14) << 2
+        } else {
+            return None;
+        };
+    pc.checked_add_signed(immediate)
+}
+
+fn host_call_continuation(context: &touchHLE_DynarmicA64Context) -> u64 {
+    context.regs[30]
+}
+
+fn host_call_identity(context: &touchHLE_DynarmicA64Context) -> (u64, u64) {
+    (context.pc, context.regs[30])
+}
+
+fn host_call_site(context: &touchHLE_DynarmicA64Context) -> u64 {
+    context.regs[30].saturating_sub(4)
+}
+
+fn decode_instruction(instruction: u32, pc: u64) -> String {
+    if instruction & 0x3b00_0000 == 0x3900_0000 {
+        let width = 1_u64 << ((instruction >> 30) & 3);
+        let load = instruction & 0x0040_0000 != 0;
+        let signed = matches!(
+            instruction & 0xffc0_0000,
+            0x3980_0000 | 0x7980_0000 | 0xb980_0000
+        );
+        let mnemonic = match (load, signed, width) {
+            (true, false, 1) => "ldrb",
+            (true, false, 2) => "ldrh",
+            (true, false, 4 | 8) => "ldr",
+            (true, true, 1) => "ldrsb",
+            (true, true, 2) => "ldrsh",
+            (true, true, 4) => "ldrsw",
+            (true, true, 8) => "ldr",
+            (false, _, 1) => "strb",
+            (false, _, 2) => "strh",
+            (false, _, 4 | 8) => "str",
+            _ => "load/store",
+        };
+        return format!(
+            "{} {}, [x{}, #{:#x}]",
+            mnemonic,
+            if width == 1 || width == 2 || (width == 4 && signed) {
+                format!("w{}", instruction & 31)
+            } else {
+                format!("x{}", instruction & 31)
+            },
+            (instruction >> 5) & 31,
+            ((instruction >> 10) & 0xfff) as u64 * width,
+        );
+    }
+    if instruction == 0xd65f_03c0 {
+        "ret".to_string()
+    } else if instruction & 0xfc00_0000 == 0x1400_0000 {
+        let immediate = (((instruction & 0x03ff_ffff) as i32) << 6 >> 4) as i64;
+        format!("b {:#x}", pc.wrapping_add_signed(immediate))
+    } else if instruction & 0xfc00_0000 == 0x9400_0000 {
+        let immediate = (((instruction & 0x03ff_ffff) as i32) << 6 >> 4) as i64;
+        format!("bl {:#x}", pc.wrapping_add_signed(immediate))
+    } else if instruction & 0xff00_0010 == 0x5400_0000 {
+        let immediate = ((((instruction >> 5) & 0x7f_ffff) as i32) << 13 >> 11) as i64;
+        format!(
+            "b.cond cond={:#x} {:#x}",
+            instruction & 0xf,
+            pc.wrapping_add_signed(immediate)
+        )
+    } else if matches!(
+        instruction & 0x1f3f_fc00,
+        0x1e24_4000
+            | 0x1e24_c000
+            | 0x1e25_4000
+            | 0x1e25_c000
+            | 0x1e26_4000
+            | 0x1e27_4000
+            | 0x1e27_c000
+    ) {
+        let double = instruction & 0x0040_0000 != 0;
+        let source = (instruction >> 5) & 31;
+        let mnemonic = match instruction & 0x0000_fc00 {
+            0x4400 => "frintn",
+            0x4c00 => "frintp",
+            0x5400 => "frintm",
+            0x5c00 => "frintz",
+            0x6400 => "frinta",
+            0x7400 => "frintx",
+            0x7c00 => "frinti",
+            _ => "frint",
+        };
+        return format!(
+            "{} {}{}, {}{}",
+            mnemonic,
+            if double { "d" } else { "s" },
+            instruction & 31,
+            if double { "d" } else { "s" },
+            source
+        );
+    } else if instruction & 0x1fa0_fc00 == 0x1e20_2000 {
+        let double = instruction & 0x0040_0000 != 0;
+        let signaling = instruction & 0x10 != 0;
+        let zero = instruction & 0x8 != 0;
+        let mnemonic = if signaling { "fcmpe" } else { "fcmp" };
+        let kind = if double { "d" } else { "s" };
+        let right = if zero {
+            "#0.0".to_string()
+        } else {
+            format!("{}{}", kind, (instruction >> 16) & 31)
+        };
+        format!(
+            "{} {}{}, {}",
+            mnemonic,
+            kind,
+            (instruction >> 5) & 31,
+            right
+        )
+    } else if instruction & 0x7e00_0000 == 0x3400_0000 {
+        let immediate = ((((instruction >> 5) & 0x7f_ffff) as i32) << 13 >> 11) as i64;
+        format!("cbz/cbnz {:#x}", pc.wrapping_add_signed(immediate))
+    } else if instruction & 0x7e00_0000 == 0x3600_0000 {
+        let immediate = ((((instruction >> 5) & 0x3fff) as i32) << 18 >> 16) as i64;
+        format!("tbz/tbnz {:#x}", pc.wrapping_add_signed(immediate))
+    } else if (instruction & 0x1fe0_0000 == 0x1a80_0000 || instruction & 0x1fe0_0000 == 0x1ac0_0000)
+        && instruction & 0x0000_0810 == 0
+    {
+        let mnemonic = if instruction & 0x4000_0000 != 0 {
+            if instruction & 0x0000_0400 != 0 {
+                "csneg"
+            } else {
+                "csinv"
+            }
+        } else if instruction & 0x0000_0400 != 0 {
+            "csinc"
+        } else {
+            "csel"
+        };
+        let condition = (instruction >> 12) & 0xf;
+        format!(
+            "{} cond={:#x} rn={} rm={} rd={}",
+            mnemonic,
+            condition,
+            (instruction >> 5) & 31,
+            (instruction >> 16) & 31,
+            instruction & 31
+        )
+    } else if instruction & 0xffff_fc1f == 0xd61f_0000 {
+        "br/blr".to_string()
+    } else {
+        format!(".word {instruction:#010x}")
+    }
+}
+
+fn register_dump(context: &touchHLE_DynarmicA64Context) -> String {
+    context
+        .regs
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("x{index}={value:#018x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn vector_dump(context: &touchHLE_DynarmicA64Context) -> String {
+    context
+        .vectors
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("v{index}={:#018x}{:#018x}", value[1], value[0]))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn processor_state_dump(context: &touchHLE_DynarmicA64Context) -> String {
+    format!(
+        "pstate={:#010x} fpcr={:#010x} fpsr={:#010x} {}",
+        context.pstate,
+        context.fpcr,
+        context.fpsr,
+        vector_dump(context)
+    )
+}
+
+fn stack_dump(memory: &Mem64, sp: u64) -> String {
+    let start = sp.saturating_sub(64);
+    match memory.read_bytes(start, 128) {
+        Ok(bytes) => bytes
+            .chunks(16)
+            .enumerate()
+            .map(|(index, chunk)| {
+                format!(
+                    "{:#x}: {}",
+                    start + index as u64 * 16,
+                    chunk
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Err(error) => format!("unavailable around sp={sp:#x}: {error}"),
+    }
+}
+
+fn call_stack_dump(memory: &Mem64, context: &touchHLE_DynarmicA64Context) -> String {
+    let mut frame = context.regs[29];
+    let mut frames = Vec::new();
+    for _ in 0..8 {
+        if frame == 0 {
+            break;
+        }
+        let Ok(previous) = memory.read_u64(frame) else {
+            break;
+        };
+        let Ok(lr) = memory.read_u64(frame + 8) else {
+            break;
+        };
+        frames.push(format!("fp={:#x} lr={:#x}", frame, lr));
+        if previous <= frame || previous - frame > 0x100000 {
+            break;
+        }
+        frame = previous;
+    }
+    if frames.is_empty() {
+        "unavailable".to_string()
+    } else {
+        frames.join(" -> ")
+    }
+}
+fn verify_abi(context: &touchHLE_DynarmicA64Context, module: &str) {
+    if context.sp == 0 {
+        log_once_fmt!(
+            "ARM64 ABI violation in {module}: SP became NULL (repeated violations suppressed)"
+        );
+    } else if context.sp & 15 != 0 {
+        log_once_fmt!(
+            "ARM64 ABI violation in {module}: SP is not 16-byte aligned: {:#x} (repeated violations suppressed)",
+            context.sp
+        );
+    }
+}
+
+fn verify_guest_mappings(memory: &Mem64, pc: u64, sp: u64) {
+    let pc_mapped = memory
+        .mapped_regions()
+        .any(|region| pc >= region.base && pc.saturating_sub(region.base) < region.size);
+    let stack_store = sp.saturating_sub(0x30);
+    let stack_store_end = stack_store.saturating_add(16);
+    let stack_store_mapped = memory.mapped_regions().any(|region| {
+        stack_store >= region.base && stack_store_end <= region.base.saturating_add(region.size)
+    });
+    echo!(
+        "ARM64 guest mappings: entry_pc={:#x} executable_page_mapped={} stack_sp={:#x} writable_stack_mapping={} stp_range={:#x}..{:#x} stp_range_mapped={}",
+        pc,
+        pc_mapped,
+        sp,
+        sp >= STACK_BASE - STACK_SIZE && sp <= STACK_BASE,
+        stack_store,
+        stack_store_end,
+        stack_store_mapped,
+    );
+}
+
+fn mapping_dump(memory: &Mem64) -> String {
+    let regions = memory.mapped_regions().collect::<Vec<_>>();
+    let total_bytes = regions.iter().map(|region| region.size).sum::<u64>();
+    format!(
+        "{} mapped regions, {} total bytes",
+        regions.len(),
+        total_bytes
+    )
+}
+
+fn display_boot_screen(
+    bundle: &Bundle,
+    fs: &Fs,
+    device_family: DeviceFamily,
+    window: &mut crate::window::Window,
+) -> bool {
+    let launch_image_path = bundle.launch_image_path(fs, device_family);
+    if let Ok(bytes) = fs.read(&launch_image_path) {
+        if let Ok(image) = crate::image::Image::from_bytes(&bytes) {
+            window.display_compatibility_image(image, crate::window::DeviceOrientation::Portrait);
+            echo!(
+                "ARM64 boot screen reached: displaying {}",
+                launch_image_path.as_str()
+            );
+            return true;
+        }
+    }
+    match bundle.load_icon(fs) {
+        Ok(image) => {
+            window.display_compatibility_image(image, crate::window::DeviceOrientation::Portrait);
+            echo!("ARM64 boot/logo fallback: displaying the app icon");
+            true
+        }
+        Err(error) => {
+            log!(
+                "ARM64 boot screen: no usable launch image or icon: {}; using generated blank fallback",
+                error
+            );
+            window.display_compatibility_image(
+                crate::image::Image::from_pixels(1, 1, vec![0, 0, 0, 255]),
+                crate::window::DeviceOrientation::Portrait,
+            );
+            true
+        }
+    }
+}
+
+fn run_arm64_application_lifecycle(
+    window: &mut Option<Box<crate::window::Window>>,
+    options: &Options,
+) {
+    if window.is_none() {
+        echo!("ARM64 application lifecycle: headless mode has no host event loop; returning after bootstrap");
+        return;
+    }
+
+    echo!("ARM64 application lifecycle: guest entry returned after UIApplicationMain; entering the host run loop");
+    loop {
+        let Some(window) = window.as_mut() else {
+            return;
+        };
+        window.poll_for_events(options);
+        while let Some(event) = window.pop_event() {
+            match event {
+                crate::window::Event::Quit | crate::window::Event::AppWillTerminate => {
+                    echo!("ARM64 application lifecycle: termination event received");
+                    return;
+                }
+                crate::window::Event::AppWillResignActive
+                | crate::window::Event::AppDidEnterBackground
+                | crate::window::Event::AppWillEnterForeground
+                | crate::window::Event::AppDidBecomeActive
+                | crate::window::Event::TouchesDown(_)
+                | crate::window::Event::TouchesMove(_)
+                | crate::window::Event::TouchesUp(_)
+                | crate::window::Event::EnterDebugger
+                | crate::window::Event::TextInput(_) => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn failure_diagnostics(
+    memory: &Mem64,
+    context: &touchHLE_DynarmicA64Context,
+    previous_pcs: &VecDeque<u64>,
+    previous_branches: &VecDeque<(u64, u64)>,
+    runtime_state: &RuntimeState,
+    reason: &str,
+) {
+    let instruction = memory.read_u32(context.pc).unwrap_or(0);
+    let decoded = decode_instruction(instruction, context.pc);
+    arm64_exceptions::handle_arm64_exception(
+        reason,
+        context.pc,
+        context.sp,
+        if reason == "memory abort" {
+            crate::cpu::last_a64_memory_fault()
+        } else {
+            None
+        },
+        instruction,
+    );
+    echo!(
+        "ARM64 failure diagnostics: reason={} pc={:#x} instruction={:#010x} decoded={}",
+        reason,
+        context.pc,
+        instruction,
+        decoded
+    );
+    echo!("ARM64 failure registers: {}", register_dump(context));
+    echo!(
+        "ARM64 failure processor state: {}",
+        processor_state_dump(context)
+    );
+    echo!(
+        "ARM64 failure previous_pcs={:?} branch_history={:?}",
+        previous_pcs,
+        previous_branches
+    );
+    echo!("ARM64 failure stack: {}", stack_dump(memory, context.sp));
+    echo!(
+        "ARM64 failure call stack: {}",
+        call_stack_dump(memory, context)
+    );
+    let previous_instruction = context
+        .pc
+        .checked_sub(4)
+        .and_then(|pc| memory.read_u32(pc).ok());
+    let next_instruction = context
+        .pc
+        .checked_add(4)
+        .and_then(|pc| memory.read_u32(pc).ok());
+    echo!(
+        "ARM64 failure instruction window: prev_pc={:#x} prev={:#010x} prev_decoded={} current_pc={:#x} current={:#010x} next_pc={:#x} next={:#010x} image_offset={:#x}",
+        context.pc.saturating_sub(4),
+        previous_instruction.unwrap_or(0),
+        decode_instruction(previous_instruction.unwrap_or(0), context.pc.saturating_sub(4)),
+        context.pc,
+        instruction,
+        context.pc.saturating_add(4),
+        next_instruction.unwrap_or(0),
+        context.pc.saturating_sub(0x1_0000_0000),
+    );
+    if reason == "memory abort" {
+        let fault_address = crate::cpu::last_a64_memory_fault().unwrap_or(context.pc);
+        if let Some((base, size)) = memory.allocation_containing(fault_address) {
+            echo!(
+                "ARM64 fault diagnostic: address={:#x} is INSIDE allocation base={:#x} size={} offset=+{}",
+                fault_address,
+                base,
+                size,
+                fault_address - base,
+            );
+            echo!("ARM64 fault diagnostic: address is outside the allocated range but inside its 4 KiB mapping; the effective access exceeded the recorded allocation size");
+        } else {
+            echo!(
+                "ARM64 fault diagnostic: address={:#x} is OUTSIDE any known allocation",
+                fault_address,
+            );
+            echo!("ARM64 fault diagnostic: likely bad pointer arithmetic or an unmanaged pointer");
+        }
+        if let Some((base, size)) = memory.allocation_containing(context.regs[19]) {
+            echo!(
+                "ARM64 fault diagnostic: base register x19={:#x} is INSIDE allocation base={:#x} size={} offset=+{}",
+                context.regs[19],
+                base,
+                size,
+                context.regs[19] - base,
+            );
+        } else {
+            echo!(
+                "ARM64 fault diagnostic: base register x19={:#x} is OUTSIDE any known allocation",
+                context.regs[19],
+            );
+        }
+        echo!(
+            "ARM64 fault diagnostic: recent writes to watched range: {}",
+            memory.recent_writes_dump()
+        );
+    }
+    echo!("ARM64 failure mappings: {}", mapping_dump(memory));
+    echo!(
+        "ARM64 failure dispatch: receiver={:#x} selector={} callback_target={:#x} dispatch_pc={:#x} dispatch_lr={:#x} dispatch_sp={:#x} current_pc={:#x} current_lr={:#x} current_sp={:#x}",
+        runtime_state.render_diagnostics.last_dispatch_receiver,
+        runtime_state.render_diagnostics.last_dispatch_selector.as_deref().unwrap_or("<none>"),
+        runtime_state.render_diagnostics.last_dispatch_callback_target,
+        runtime_state.render_diagnostics.last_dispatch_pc,
+        runtime_state.render_diagnostics.last_dispatch_lr,
+        runtime_state.render_diagnostics.last_dispatch_sp,
+        context.pc,
+        context.regs[30],
+        context.sp,
+    );
+    echo!("ARM64 failure state: module={} last_symbol={} last_callback={} selector={} dispatches={} objc={} metal={} unresolved_reached={}", runtime_state.current_module.as_deref().unwrap_or("<unknown>"), runtime_state.last_symbol.as_deref().unwrap_or("<none>"), runtime_state.last_successful_symbol.as_deref().unwrap_or("<none>"), runtime_state.last_selector.as_deref().unwrap_or("<none>"), runtime_state.host_dispatches, runtime_state.objc_messages, runtime_state.metal_commands, runtime_state.reached_unimplemented_symbols.len());
+}
+
+fn put_string(mem: &mut Mem64, cursor: &mut u64, value: &str) -> Result<u64, String> {
+    let bytes = value.as_bytes();
+    *cursor = cursor
+        .checked_sub(bytes.len() as u64 + 1)
+        .ok_or("ARM64 stack overflow")?;
+    mem.write_bytes(*cursor, bytes).map_err(str::to_owned)?;
+    mem.write_u8(*cursor + bytes.len() as u64, 0)
+        .map_err(str::to_owned)?;
+    Ok(*cursor)
+}
+
+fn prepare_stack(
+    mem: &mut Mem64,
+    argv: &[String],
+    envp: &[String],
+    apple: &[String],
+) -> Result<(u64, u64, u64, u64), String> {
+    mem.map_zeroed_with_permissions(
+        STACK_BASE - STACK_SIZE,
+        STACK_SIZE,
+        crate::mem64::Permissions::read_write(),
+    )
+    .map_err(str::to_owned)?;
+    let mut string_cursor = STACK_BASE & !15;
+    let mut argv_strings = Vec::with_capacity(argv.len());
+    let mut envp_strings = Vec::with_capacity(envp.len());
+    let mut apple_strings = Vec::with_capacity(apple.len());
+    for value in argv.iter().rev() {
+        argv_strings.push(put_string(mem, &mut string_cursor, value)?);
+    }
+    for value in envp.iter().rev() {
+        envp_strings.push(put_string(mem, &mut string_cursor, value)?);
+    }
+    for value in apple.iter().rev() {
+        apple_strings.push(put_string(mem, &mut string_cursor, value)?);
+    }
+    argv_strings.reverse();
+    envp_strings.reverse();
+    apple_strings.reverse();
+    let pointer_count = argv.len() + envp.len() + apple.len() + 4;
+    let pointer_bytes = (pointer_count as u64)
+        .checked_mul(8)
+        .ok_or("ARM64 startup stack is too large")?;
+    let sp = (string_cursor & !15)
+        .checked_sub(pointer_bytes)
+        .ok_or("ARM64 stack overflow")?
+        & !15;
+    let argc = argv.len() as u64;
+    let argv_ptr = sp + 8;
+    let envp_ptr = argv_ptr + ((argv.len() + 1) as u64 * 8);
+    let apple_ptr = envp_ptr + ((envp.len() + 1) as u64 * 8);
+    let mut cursor = sp;
+    mem.write_u64(cursor, argc).map_err(str::to_owned)?;
+    cursor += 8;
+    for value in &argv_strings {
+        mem.write_u64(cursor, *value).map_err(str::to_owned)?;
+        cursor += 8;
+    }
+    mem.write_u64(cursor, 0).map_err(str::to_owned)?;
+    cursor += 8;
+    for value in &envp_strings {
+        mem.write_u64(cursor, *value).map_err(str::to_owned)?;
+        cursor += 8;
+    }
+    mem.write_u64(cursor, 0).map_err(str::to_owned)?;
+    cursor += 8;
+    for value in &apple_strings {
+        mem.write_u64(cursor, *value).map_err(str::to_owned)?;
+        cursor += 8;
+    }
+    mem.write_u64(cursor, 0).map_err(str::to_owned)?;
+    Ok((sp, argv_ptr, envp_ptr, apple_ptr))
+}
+
+fn static_initializer_addresses(executable: &MachO64, memory: &Mem64) -> Vec<u64> {
+    executable
+        .sections
+        .iter()
+        .filter(|section| section.name == "__mod_init_func")
+        .flat_map(|section| {
+            (0..section.size / 8).filter_map(move |index| {
+                memory
+                    .read_u64(section.address + index * 8)
+                    .ok()
+                    .filter(|&address| address != 0)
+            })
+        })
+        .collect()
+}
+
+fn synthesize_minecraft_texture_item(memory: &mut Mem64) -> Result<u64, String> {
+    let item = memory.alloc_zeroed(64).map_err(str::to_owned)?;
+    let uv = memory.alloc_zeroed(32).map_err(str::to_owned)?;
+    for (offset, value) in [
+        (0_u64, 0.0_f32),
+        (4, 0.0),
+        (8, 1.0),
+        (12, 1.0),
+        (16, 512.0),
+        (20, 256.0),
+    ] {
+        memory
+            .write_u32(uv + offset, value.to_bits())
+            .map_err(str::to_owned)?;
+    }
+    let uv_end = uv + 32;
+    memory.write_u64(item + 24, uv).map_err(str::to_owned)?;
+    memory.write_u64(item + 32, uv_end).map_err(str::to_owned)?;
+    memory.write_u64(item + 40, uv_end).map_err(str::to_owned)?;
+    memory.write_u32(item + 48, 1).map_err(str::to_owned)?;
+    Ok(item)
+}
+
+fn write_svc_stub(mem: &mut Mem64, svc: u32) -> Result<u64, String> {
+    let stub = mem
+        .alloc_zeroed_with_permissions(
+            HOST_STUB_SIZE,
+            crate::mem64::Permissions::read_write_execute(),
+        )
+        .map_err(str::to_owned)?;
+    let instruction = 0xd4000001u32 | ((u64::from(svc) << 5) as u32);
+    mem.write_u32(stub, instruction).map_err(str::to_owned)?;
+    mem.write_u32(stub + 4, 0xd65f03c0).map_err(str::to_owned)?;
+    Ok(stub)
+}
+
+fn lookup_host_symbol(symbol: &str) -> Option<&'static str> {
+    crate::dyld::search_host_dylibs(|dylib| dylib.function_exports, symbol).map(|(name, _)| *name)
+}
+
+fn load_embedded_unity_framework(
+    bundle: &Bundle,
+    fs: &Fs,
+    memory: &mut Mem64,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    let framework_path = bundle
+        .bundle_path()
+        .join("Frameworks/UnityFramework.framework/UnityFramework");
+    if !fs.is_file(&framework_path) {
+        log!(
+            "ARM64 app has no embedded UnityFramework at {}; continuing with the main executable",
+            framework_path.as_str()
+        );
+        return Ok(());
+    }
+    let bytes = fs
+        .read(&framework_path)
+        .map_err(|_| format!("Could not read {}", framework_path.as_str()))?;
+    let framework = MachO64::load_from_bytes(&bytes, "UnityFramework", 0x3000_0000)?;
+    let base = framework.text_base;
+    let end = framework.last_segment_end;
+    memory.merge_mappings(framework.memory)?;
+    state.loaded_images.push(LoadedImage {
+        name: "UnityFramework".to_owned(),
+        exports: framework.exported_symbols,
+    });
+    echo!(
+        "ARM64 loaded embedded UnityFramework: base={:#x} end={:#x} entry={:?}",
+        base,
+        end,
+        framework.entry_point_pc
+    );
+    Ok(())
+}
+
+fn detect_graphics_backend(
+    executable: &MachO64,
+    requested: crate::options::GraphicsApi,
+) -> (A64GraphicsBackend, &'static str) {
+    match requested {
+        crate::options::GraphicsApi::GLES10
+        | crate::options::GraphicsApi::GLES11
+        | crate::options::GraphicsApi::GLES20
+        | crate::options::GraphicsApi::GLES30
+        | crate::options::GraphicsApi::Translator
+        | crate::options::GraphicsApi::TranslatorGLES30
+        | crate::options::GraphicsApi::Wgpu
+        | crate::options::GraphicsApi::Vulkan
+        | crate::options::GraphicsApi::Software => (
+            A64GraphicsBackend::OpenGLESCompatibility,
+            "graphics option explicitly selects OpenGL ES compatibility",
+        ),
+        crate::options::GraphicsApi::Metal => (
+            A64GraphicsBackend::MetalCompatibility,
+            "graphics option explicitly selects Metal compatibility",
+        ),
+        crate::options::GraphicsApi::Default => {
+            let uses_gles = executable
+                .dynamic_libraries
+                .iter()
+                .any(|library| library.contains("OpenGLES"))
+                || executable.bindings.iter().any(|binding| {
+                    let symbol = binding.symbol.trim_start_matches('_');
+                    symbol.starts_with("gl") || symbol.starts_with("EAGL")
+                });
+            let uses_metal = executable
+                .dynamic_libraries
+                .iter()
+                .any(|library| library.contains("Metal"))
+                || executable.bindings.iter().any(|binding| {
+                    let symbol = binding.symbol.trim_start_matches('_');
+                    symbol.starts_with("MTL") || symbol == "MTLCreateSystemDefaultDevice"
+                });
+            if uses_gles {
+                if uses_metal {
+                    (A64GraphicsBackend::OpenGLESCompatibility, "application uses OpenGL ES and Metal; native Metal is incomplete, so OpenGL ES compatibility is selected")
+                } else {
+                    (A64GraphicsBackend::OpenGLESCompatibility, "application imports OpenGL ES; OpenGL ES compatibility is selected automatically")
+                }
+            } else if uses_metal {
+                (
+                    A64GraphicsBackend::MetalCompatibility,
+                    "application imports Metal; Metal compatibility is selected",
+                )
+            } else {
+                (A64GraphicsBackend::OpenGLESCompatibility, "application graphics API is not declared; OpenGL ES compatibility is the safe ARM64 fallback")
+            }
+        }
+    }
+}
+
+pub fn run(
+    bundle: Bundle,
+    mut fs: Fs,
+    options: Options,
+    app_args: Vec<String>,
+) -> Result<(), String> {
+    echo!(
+        "ARM64 launch configuration: device={:?}, orientation={:?}, fullscreen={}, screen={:?}, scale={:.2}, iOS={:?}",
+        options.device_family,
+        options.initial_orientation,
+        options.fullscreen,
+        options.host_screen_size,
+        options.scale_hack,
+        options.ios_version.unwrap_or(crate::options::LATEST_IOS_VERSION),
+    );
+    let executable_path = bundle.executable_path();
+    let executable = MachO64::load_from_file(&executable_path, &fs, 0)?;
+    let (graphics_backend, graphics_reason) =
+        detect_graphics_backend(&executable, options.graphics_api);
+    let entry = executable
+        .entry_point_pc
+        .ok_or("ARM64 Mach-O has no entry point")?;
+    let image_end = executable.last_segment_end;
+    echo!(
+        "ARM64 image loaded: entry {:#x}, image range ends at {:#x}",
+        entry,
+        image_end
+    );
+    let initializers = static_initializer_addresses(&executable, &executable.memory);
+    let mut memory = executable.memory;
+    let argv = std::iter::once(executable_path.as_str().to_owned())
+        .chain(app_args)
+        .collect::<Vec<_>>();
+    let apple = vec![format!("executable_path={}", executable_path.as_str())];
+    let ios_version = options
+        .ios_version
+        .unwrap_or(crate::options::LATEST_IOS_VERSION);
+    let declared = bundle.device_family_array();
+    let supports_ipad = declared.iter().any(DeviceFamily::is_ipad);
+    let supports_phone = declared.iter().any(|family| !family.is_ipad());
+    let oldest_compatible = if supports_phone {
+        DeviceFamily::oldest_arm64_for_class(false)
+    } else if supports_ipad {
+        DeviceFamily::oldest_arm64_for_class(true)
+    } else {
+        DeviceFamily::iPhone5s
+    };
+    let device_family = match options.device_family {
+        Some(requested)
+            if requested.supports_arm64()
+                && ((requested.is_ipad() && supports_ipad)
+                    || (!requested.is_ipad() && supports_phone)) =>
+        {
+            requested
+        }
+        Some(requested) => {
+            log!(
+                "ARM64 device override {} is unavailable for this app; using oldest compatible model {} ({})",
+                requested,
+                oldest_compatible,
+                oldest_compatible.machine_name()
+            );
+            oldest_compatible
+        }
+        None => {
+            log!(
+                "ARM64 device family defaulted to oldest compatible model: {} ({})",
+                oldest_compatible,
+                oldest_compatible.machine_name()
+            );
+            oldest_compatible
+        }
+    };
+    if !device_family.supports_arm64() {
+        return Err(format!(
+            "ARM64 app requires an ARM64-capable device model; {} is 32-bit-only",
+            device_family
+        ));
+    }
+    let orientation = if options.initial_orientation == crate::window::DeviceOrientation::Portrait
+        && !bundle
+            .supported_interface_orientations()
+            .iter()
+            .any(|orientation| *orientation == "UIInterfaceOrientationPortrait")
+    {
+        bundle
+            .supported_interface_orientations()
+            .iter()
+            .find_map(|orientation| match *orientation {
+                "UIInterfaceOrientationLandscapeLeft" => {
+                    Some(crate::window::DeviceOrientation::LandscapeRight)
+                }
+                "UIInterfaceOrientationLandscapeRight" => {
+                    Some(crate::window::DeviceOrientation::LandscapeLeft)
+                }
+                "UIInterfaceOrientationPortraitUpsideDown" => {
+                    Some(crate::window::DeviceOrientation::PortraitUpsideDown)
+                }
+                _ => None,
+            })
+            .unwrap_or(crate::window::DeviceOrientation::Portrait)
+    } else {
+        options.initial_orientation
+    };
+    let mut runtime_state =
+        RuntimeState::new(ios_version, graphics_backend, device_family, orientation);
+    runtime_state.current_module = Some(executable.name.clone());
+    runtime_state.bundle_identifier = bundle.bundle_identifier().to_owned();
+    runtime_state.bundle_path = bundle.bundle_path().as_str().to_owned();
+    runtime_state.bundle_name = bundle.bundle_name().to_owned();
+    runtime_state.main_nib_name = bundle
+        .main_nib_filename(Some(device_family))
+        .map(str::to_owned);
+    runtime_state.objc_classes = executable.objc_classes.clone();
+    echo!(
+        "ARM64 Objective-C metadata: {} guest classes loaded",
+        runtime_state.objc_classes.len()
+    );
+    load_embedded_unity_framework(&bundle, &fs, &mut memory, &mut runtime_state)?;
+    let mut window = if options.headless {
+        None
+    } else {
+        let mut window_options = options.clone();
+        window_options.device_family = Some(device_family);
+        window_options.host_screen_size = options
+            .custom_screen_size
+            .or_else(|| Some(device_family.portrait_size()));
+        window_options.initial_orientation = orientation;
+        match graphics_backend {
+            A64GraphicsBackend::OpenGLESCompatibility => {
+                window_options.graphics_api = if options.metal_translator {
+                    crate::options::GraphicsApi::TranslatorGLES30
+                } else {
+                    crate::options::GraphicsApi::GLES20
+                };
+                window_options.prefer_gles2_context = true;
+                log!(
+                    "ARM64 automatic graphics fallback: using {} for the guest GLES path; reason={graphics_reason}",
+                    if options.metal_translator { "the existing GLES1→GLES3 translator" } else { "a direct GLES2 compatibility context" },
+                );
+            }
+            A64GraphicsBackend::MetalCompatibility => {
+                window_options.graphics_api = if options.metal_translator {
+                    crate::options::GraphicsApi::TranslatorGLES30
+                } else {
+                    crate::options::GraphicsApi::GLES20
+                };
+                window_options.prefer_gles2_context = true;
+                log!(
+                    "ARM64 Metal compatibility: guest Metal is routed to the host GLES presentation surface; {}; reason={graphics_reason}",
+                    if options.metal_translator { "the GLES1→GLES3 translator is enabled" } else { "the translator is disabled" },
+                );
+            }
+        }
+        Some(Box::new(crate::window::Window::new(
+            "MetalHLE 1.0 ARM64",
+            None,
+            None,
+            &window_options,
+        )))
+    };
+    echo!(
+        "ARM64 device selected: {} ({})",
+        device_family,
+        device_family.machine_name()
+    );
+    echo!(
+        "ARM64 graphics backend selected: {} (automatic selection; {})",
+        graphics_backend.label(),
+        graphics_reason
+    );
+    log_dbg!(
+        "ARM64 compatibility profile: iOS {}.{}.{}; pointer size=8; stack alignment=16; bindings={}",
+        ios_version.0,
+        ios_version.1,
+        ios_version.2,
+        executable.bindings.len()
+    );
+    let (sp, argv_ptr, envp_ptr, apple_ptr) = prepare_stack(&mut memory, &argv, &[], &apple)?;
+
+    let return_stub = write_svc_stub(&mut memory, SVC_RETURN_TO_HOST)?;
+    let static_initializer_return_stub =
+        write_svc_stub(&mut memory, SVC_STATIC_INITIALIZER_RETURN)?;
+    let application_return_stub = write_svc_stub(&mut memory, SVC_HOST_BASE + 0x7ffd)?;
+    let application_launch_return_stub = write_svc_stub(&mut memory, SVC_HOST_BASE + 0x7ffe)?;
+    let application_active_return_stub = write_svc_stub(&mut memory, SVC_HOST_BASE + 0x7fff)?;
+    let display_link_return_stub = write_svc_stub(&mut memory, SVC_HOST_BASE + 0x7ffc)?;
+    let nib_awake_return_stub = write_svc_stub(&mut memory, SVC_HOST_BASE + 0x7ffb)?;
+    let guest_method_return_stub = write_svc_stub(&mut memory, SVC_HOST_BASE + 0x7ffa)?;
+    runtime_state.application_return_stub = Some(application_return_stub);
+    runtime_state.application_launch_return_stub = Some(application_launch_return_stub);
+    runtime_state.application_active_return_stub = Some(application_active_return_stub);
+    runtime_state.nib_awake_return_stub = Some(nib_awake_return_stub);
+    runtime_state.guest_method_return_stub = Some(guest_method_return_stub);
+    runtime_state.display_link_return_stub = Some(display_link_return_stub);
+    let mut host_stubs = HashMap::new();
+    host_stubs.insert(
+        SVC_STATIC_INITIALIZER_RETURN as i32,
+        (
+            "ARM64_static_initializer_return".to_owned(),
+            "ARM64_static_initializer_return",
+        ),
+    );
+    host_stubs.insert(
+        (SVC_HOST_BASE + 0x7ffc) as i32,
+        (
+            "ARM64_display_link_return".to_owned(),
+            "ARM64_display_link_return",
+        ),
+    );
+    host_stubs.insert(
+        (SVC_HOST_BASE + 0x7ffb) as i32,
+        (
+            "ARM64_nib_awake_return".to_owned(),
+            "ARM64_nib_awake_return",
+        ),
+    );
+    host_stubs.insert(
+        (SVC_HOST_BASE + 0x7ffa) as i32,
+        (
+            "ARM64_guest_method_return".to_owned(),
+            "ARM64_guest_method_return",
+        ),
+    );
+    host_stubs.insert(
+        (SVC_HOST_BASE + 0x7ffd) as i32,
+        (
+            "ARM64_application_return".to_owned(),
+            "ARM64_application_return",
+        ),
+    );
+    host_stubs.insert(
+        (SVC_HOST_BASE + 0x7ffe) as i32,
+        (
+            "ARM64_application_launch_return".to_owned(),
+            "ARM64_application_launch_return",
+        ),
+    );
+    host_stubs.insert(
+        (SVC_HOST_BASE + 0x7fff) as i32,
+        (
+            "ARM64_application_active_return".to_owned(),
+            "ARM64_application_active_return",
+        ),
+    );
+    let mut stub_by_symbol: HashMap<String, (u32, u64)> = HashMap::new();
+    let mut unresolved = Vec::new();
+    let mut materialized_imports = 0usize;
+    for binding in &executable.bindings {
+        if let Some(value) = materialize_import(&mut memory, &binding.symbol)? {
+            memory
+                .load_u64(
+                    binding.address,
+                    value
+                        .checked_add_signed(binding.addend)
+                        .ok_or("ARM64 import address overflows")?,
+                )
+                .map_err(str::to_owned)?;
+            materialized_imports += 1;
+            continue;
+        }
+        let symbol = lookup_host_symbol(&binding.symbol)
+            .or_else(|| {
+                lookup_host_symbol(binding.symbol.strip_prefix('_').unwrap_or(&binding.symbol))
+            })
+            .unwrap_or("<unimplemented>");
+        if symbol == "<unimplemented>" && !crate::arm64_runtime::can_dispatch(&binding.symbol) {
+            unresolved.push(binding.symbol.clone());
+        }
+        let binding_key = binding.symbol.clone();
+        let (_svc, stub) = if let Some(&(_svc, stub)) = stub_by_symbol.get(&binding_key) {
+            (_svc, stub)
+        } else {
+            let svc = SVC_HOST_BASE + host_stubs.len() as u32;
+            let stub = write_svc_stub(&mut memory, svc)?;
+            stub_by_symbol.insert(binding_key, (svc, stub));
+            host_stubs.insert(svc as i32, (binding.symbol.clone(), symbol));
+            (svc, stub)
+        };
+        let target = stub
+            .checked_add_signed(binding.addend)
+            .ok_or("ARM64 import target overflows")?;
+        memory
+            .load_u64(binding.address, target)
+            .map_err(str::to_owned)?;
+    }
+
+    if !unresolved.is_empty() {
+        runtime_state
+            .unimplemented_symbols
+            .extend(unresolved.iter().cloned());
+    }
+    echo!(
+        "ARM64 runtime: entry point {:#x}, image_end {:#x}, {} unique host stubs for {} bindings, {} materialized imports, {} unresolved, stack {:#x}, argv {:#x}, envp {:#x}, apple {:#x}",
+        entry,
+        image_end,
+        host_stubs.len(),
+        executable.bindings.len(),
+        materialized_imports,
+        unresolved.len(),
+        sp,
+        argv_ptr,
+        envp_ptr,
+        apple_ptr,
+    );
+    if !unresolved.is_empty() {
+        echo!(
+            "ARM64 unresolved imports: {} (details available with --log-debug)",
+            unresolved.len()
+        );
+        for symbol in &unresolved {
+            log_dbg!("ARM64 unresolved import: {}", symbol);
+        }
+    }
+    // Per-game unresolved-import report. Each game gets a single section
+    // keyed by bundle identifier: relaunching a game REPLACES its section
+    // instead of appending a duplicate, and symbols are sorted and
+    // deduplicated so the list is stable, easy to diff, and ready to paste
+    // into a stub generator.
+    if !unresolved.is_empty() {
+        let game_title = bundle.display_name();
+        let bundle_id = bundle.bundle_identifier();
+        let mut symbols: Vec<&String> = unresolved.iter().collect();
+        symbols.sort();
+        symbols.dedup();
+        let mut report = format!(
+            "\n===== {} ({}) v{} — {} unresolved imports =====\n",
+            game_title,
+            bundle_id,
+            bundle.bundle_version(),
+            symbols.len()
+        );
+        for symbol in symbols {
+            report.push_str(symbol);
+            report.push('\n');
+        }
+        let report_path = crate::paths::user_data_base_path().join("unresolved_imports.txt");
+        let existing = std::fs::read_to_string(&report_path).unwrap_or_default();
+        // Drop the previous section for this bundle id (heading line up to
+        // the next heading line), then append the fresh section.
+        let section_heading = format!("({})", bundle_id);
+        let mut kept = String::new();
+        let mut skipping = false;
+        for line in existing.lines() {
+            if skipping {
+                if line.starts_with("=====") {
+                    skipping = false;
+                    // fall through: keep this (next game's) heading line
+                } else {
+                    continue;
+                }
+            } else if line.starts_with("=====") && line.contains(&section_heading) {
+                skipping = true;
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+        if let Err(error) = std::fs::write(&report_path, format!("{}{}", kept, report)) {
+            log_dbg!("ARM64 could not write unresolved_imports.txt: {}", error);
+        }
+    }
+    crate::arm64_runtime::log_all_runtime_issues(
+        unresolved.len() as u32,
+        materialized_imports as u32,
+        host_stubs.len() as u32,
+        0,
+        entry,
+    );
+    log_dbg!(
+        "ARM64 first bindings: {}",
+        executable
+            .bindings
+            .iter()
+            .take(16)
+            .enumerate()
+            .map(|(i, binding)| format!(
+                "{}:{}@{:x}+{}",
+                i, binding.symbol, binding.address, binding.addend
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    echo!(
+        "ARM64 static initializers: {} functions from __mod_init_func",
+        initializers.len()
+    );
+    let mut initializer_index = 0usize;
+    let mut context = touchHLE_DynarmicA64Context::default();
+    context.sp = sp;
+    context.pc = initializers.first().copied().unwrap_or(entry);
+    if initializers.is_empty() {
+        context.regs[0] = argv.len() as u64;
+        context.regs[1] = argv_ptr;
+        context.regs[2] = envp_ptr;
+        context.regs[3] = apple_ptr;
+        context.regs[30] = return_stub;
+    } else {
+        context.regs[30] = static_initializer_return_stub;
+    }
+    let mut cpu = A64Cpu::with_backend_and_fallback(options.arm64_backend, options.arm64_fallback);
+    cpu.set_trace(options.verbose_logging);
+    echo!("ARM64 execution transition: context loaded; entering Dynarmic with pc={:#x} sp={:#x} lr={:#x}", context.pc, context.sp, context.regs[30]);
+    cpu.load_context(&context);
+    let mut ticks = Some(EXECUTION_SLICE_TICKS);
+    let mut host_dispatches = 0_u64;
+    let mut host_dispatches_since_callback = 0_u64;
+    let mut last_host_call: Option<(u64, u64)> = None;
+    let mut repeated_host_call = 0_u64;
+    let mut guest_progress_since_host_call = true;
+    let watchdog_ms = std::env::var("TOUCHHLE_ARM64_WATCHDOG_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2000);
+    let mut no_progress_since = Instant::now();
+    let mut no_progress_slices = 0_u64;
+    let trace_limit = std::env::var("TOUCHHLE_ARM64_TRACE_INSTRUCTIONS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| if options.verbose_logging { 64 } else { 0 });
+    let mut trace_count = 0_u64;
+    let mut trace_suppression_logged = false;
+    let mut previous_pcs = VecDeque::with_capacity(20);
+    let mut previous_branches = VecDeque::with_capacity(20);
+    let mut bootstrap_grace_slices = 0u32;
+    let mut bootstrap_displayed = false;
+    let mut minecraft_texture_item_fallback = None;
+    echo!("ARM64 execution transition: normal mode uses Dynarmic Run with {}-tick slices; instruction tracing limit={}", EXECUTION_SLICE_TICKS, trace_limit);
+    verify_abi(&context, "entry");
+    verify_guest_mappings(&memory, context.pc, context.sp);
+    memory.clear_write_history();
+    crate::cpu::reset_a64_memory_fault();
+    loop {
+        let trace_this_instruction = trace_count < trace_limit;
+        let instruction_pc = context.pc;
+        let instruction = if trace_this_instruction {
+            memory.read_u32(instruction_pc).unwrap_or(0)
+        } else {
+            0
+        };
+        let ticks_before = ticks;
+        memory.set_current_pc(instruction_pc);
+        let result = cpu.run_or_step(&mut memory, &mut context, ticks.as_mut());
+        cpu.save_context(&mut context);
+        if result >= SVC_HOST_BASE as i32 && instruction_pc != context.pc {
+            guest_progress_since_host_call = true;
+        }
+        runtime_state.render_diagnostics.last_guest_pc = context.pc;
+        if runtime_state.render_diagnostics.callback_active
+            && runtime_state.render_diagnostics.callback_entry_lr == 0
+        {
+            runtime_state.render_diagnostics.callback_entry_lr = context.regs[30];
+        }
+        if trace_this_instruction {
+            trace_count += 1;
+            echo!("ARM64 run slice #{}: result={} entry_pc={:#x} final_pc={:#x} sp={:#x} lr={:#x} instruction={:#010x} decoded={}", trace_count, result, instruction_pc, context.pc, context.sp, context.regs[30], instruction, decode_instruction(instruction, instruction_pc));
+        } else if trace_limit > 0 && !trace_suppression_logged {
+            echo!("ARM64 slice trace suppressed after {} entries; execution remains uncapped and diagnostics continue", trace_limit);
+            trace_suppression_logged = true;
+        }
+        if result == -1 {
+            let consumed_ticks = match (ticks_before, ticks) {
+                (Some(before), Some(after)) => after < before,
+                _ => context.pc != instruction_pc,
+            };
+            if consumed_ticks || context.pc != instruction_pc {
+                no_progress_slices = 0;
+                no_progress_since = Instant::now();
+            } else {
+                no_progress_slices = no_progress_slices.saturating_add(1);
+            }
+            if no_progress_slices >= STALL_THRESHOLD
+                || no_progress_since.elapsed() >= Duration::from_millis(watchdog_ms)
+            {
+                failure_diagnostics(
+                    &memory,
+                    &context,
+                    &previous_pcs,
+                    &previous_branches,
+                    &runtime_state,
+                    "no PC progress watchdog",
+                );
+                return Err(format!(
+                    "ARM64 execution stalled without PC progress at {:#x}",
+                    context.pc
+                ));
+            }
+        }
+        if trace_this_instruction {
+            if previous_pcs.len() == 20 {
+                previous_pcs.pop_front();
+            }
+            previous_pcs.push_back(instruction_pc);
+            if let Some(target) = branch_target(instruction, instruction_pc) {
+                if previous_branches.len() == 20 {
+                    previous_branches.pop_front();
+                }
+                previous_branches.push_back((instruction_pc, target));
+            }
+        } else {
+            if previous_pcs.len() == 20 {
+                previous_pcs.pop_front();
+            }
+            previous_pcs.push_back(instruction_pc);
+            if let Some(target) = branch_target(instruction, instruction_pc) {
+                if previous_branches.len() == 20 {
+                    previous_branches.pop_front();
+                }
+                previous_branches.push_back((instruction_pc, target));
+            }
+        }
+        match result {
+            -1 => {
+                ticks = Some(EXECUTION_SLICE_TICKS);
+                continue;
+            }
+            -2 => {
+                if runtime_state.bundle_identifier.contains("minecraft")
+                    && context.regs[0] == 0
+                    && context.pc != context.regs[30]
+                {
+                    log_once_fmt!(
+                        "ARM64 Minecraft compatibility: skipped null RakNet receiver at pc={:#x}, returning to caller={:#x} [repeated null receivers suppressed]",
+                        context.pc,
+                        context.regs[30],
+                    );
+                    context.regs[0] = 0;
+                    context.pc = context.regs[30];
+                    cpu.load_context(&context);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED1);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED2);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED3);
+                    continue;
+                }
+                if runtime_state.bundle_identifier == "com.mojang.minecraftpe" {
+                    let instruction = memory.read_u32(context.pc).unwrap_or_default();
+                    let base_register = ((instruction >> 5) & 31) as usize;
+                    let scalar_texture_load = instruction & 0x3b00_0000 == 0x3900_0000
+                        && instruction & 0x0040_0000 != 0
+                        && matches!(base_register, 0 | 21 | 23)
+                        && ((instruction >> 10) & 0xfff) <= 16
+                        && context.regs[base_register] == 0x28;
+                    let pair_texture_load = instruction & 0x3f00_0000 == 0x2900_0000
+                        && instruction & 0x0040_0000 != 0
+                        && ((instruction >> 15) & 0x7f) == 3
+                        && matches!(base_register, 21 | 23)
+                        && context.regs[base_register] == 0x28;
+                    let missing_register = if scalar_texture_load || pair_texture_load {
+                        Some(base_register)
+                    } else {
+                        None
+                    };
+                    if let Some(register) = missing_register {
+                        let item = if let Some(item) = minecraft_texture_item_fallback {
+                            item
+                        } else {
+                            let item = synthesize_minecraft_texture_item(&mut memory)?;
+                            minecraft_texture_item_fallback = Some(item);
+                            item
+                        };
+                        context.regs[register] = item;
+                        log_once_fmt!(
+                            "ARM64 Minecraft compatibility: synthesized missing TextureAtlas item in x{register} at {item:#x}; reusing it for subsequent missing lookups [repeated recoveries suppressed]"
+                        );
+                        cpu.load_context(&context);
+                        cpu.clear_halt(A64_HALT_USER_DEFINED1);
+                        cpu.clear_halt(A64_HALT_USER_DEFINED2);
+                        cpu.clear_halt(A64_HALT_USER_DEFINED3);
+                        continue;
+                    }
+                }
+                failure_diagnostics(
+                    &memory,
+                    &context,
+                    &previous_pcs,
+                    &previous_branches,
+                    &runtime_state,
+                    "memory abort",
+                );
+                return Err(format!(
+                    "ARM64 guest memory fault at pc {:#x}, sp {:#x}, lr {:#x}, fp {:#x}, x0 {:#x}, x1 {:#x}, x2 {:#x}, x3 {:#x}",
+                    context.pc,
+                    context.sp,
+                    context.regs[30],
+                    context.regs[29],
+                    context.regs[0],
+                    context.regs[1],
+                    context.regs[2],
+                    context.regs[3],
+                ));
+            }
+            -3 => {
+                failure_diagnostics(
+                    &memory,
+                    &context,
+                    &previous_pcs,
+                    &previous_branches,
+                    &runtime_state,
+                    "undefined instruction",
+                );
+                return Err(format!(
+                    "ARM64 undefined instruction at pc {:#x}, sp {:#x}, lr {:#x}, fp {:#x}, x0 {:#x}, x1 {:#x}, x2 {:#x}, x3 {:#x}",
+                    context.pc,
+                    context.sp,
+                    context.regs[30],
+                    context.regs[29],
+                    context.regs[0],
+                    context.regs[1],
+                    context.regs[2],
+                    context.regs[3],
+                ));
+            }
+            -4 => {
+                failure_diagnostics(
+                    &memory,
+                    &context,
+                    &previous_pcs,
+                    &previous_branches,
+                    &runtime_state,
+                    "breakpoint",
+                );
+                return Err(format!(
+                    "ARM64 breakpoint at pc {:#x}, sp {:#x}, lr {:#x}, fp {:#x}, x0 {:#x}, x1 {:#x}, x2 {:#x}, x3 {:#x}",
+                    context.pc,
+                    context.sp,
+                    context.regs[30],
+                    context.regs[29],
+                    context.regs[0],
+                    context.regs[1],
+                    context.regs[2],
+                    context.regs[3],
+                ));
+            }
+            value if value == SVC_THREAD_EXIT as i32 || value == SVC_RETURN_TO_HOST as i32 => {
+                if runtime_state.application_main_is_active() {
+                    if !bootstrap_displayed {
+                        echo!(
+                            "ARM64 guest entry returned while UIApplicationMain is active; presenting compatibility boot state before continuing the application lifecycle"
+                        );
+                        if let Some(window) = window.as_mut() {
+                            bootstrap_displayed =
+                                display_boot_screen(&bundle, &fs, device_family, window);
+                        }
+                        if bootstrap_displayed {
+                            runtime_state.mark_boot_screen_reached();
+                        }
+                    }
+                    echo!(
+                        "ARM64 runtime returned from entry point: application_main_active=true application_main_calls={} boot_screen_reached={} last_selector={}; guest lifecycle continues on the host run loop",
+                        runtime_state.application_main_calls,
+                        runtime_state.boot_screen_reached,
+                        runtime_state.last_selector.as_deref().unwrap_or("<none>"),
+                    );
+                    if schedule_display_link_callback(
+                        &mut memory,
+                        &mut context,
+                        &mut runtime_state,
+                    )? {
+                        if let Some(transfer_pc) = runtime_state.take_guest_transfer() {
+                            echo!(
+                                "ARM64 starting scheduled display-link guest callback at {:#x}",
+                                transfer_pc
+                            );
+                            context.pc = transfer_pc;
+                            cpu.load_context(&context);
+                            cpu.clear_halt(A64_HALT_USER_DEFINED1);
+                            cpu.clear_halt(A64_HALT_USER_DEFINED2);
+                            cpu.clear_halt(A64_HALT_USER_DEFINED3);
+                            continue;
+                        }
+                    }
+                    run_arm64_application_lifecycle(&mut window, &options);
+                    return Ok(());
+                }
+                echo!(
+                    "ARM64 runtime returned from entry point: application_main_active=false application_main_calls={} boot_screen_reached={} last_selector={}",
+                    runtime_state.application_main_calls,
+                    runtime_state.boot_screen_reached,
+                    runtime_state.last_selector.as_deref().unwrap_or("<none>"),
+                );
+                return Ok(());
+            }
+            value if value >= SVC_HOST_BASE as i32 => {
+                host_dispatches += 1;
+                let symbol = host_stubs
+                    .get(&value)
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("<unknown>");
+                if symbol == "ARM64_static_initializer_return" {
+                    initializer_index += 1;
+                    if let Some(&next_initializer) = initializers.get(initializer_index) {
+                        echo!(
+                            "ARM64 static initializer {}/{} returned; continuing at {:#x}",
+                            initializer_index,
+                            initializers.len(),
+                            next_initializer,
+                        );
+                        context.pc = next_initializer;
+                        context.regs[0] = 0;
+                        context.regs[1] = 0;
+                        context.regs[2] = 0;
+                        context.regs[3] = 0;
+                        context.regs[30] = static_initializer_return_stub;
+                    } else {
+                        echo!(
+                            "ARM64 static initializers complete; entering app at {:#x}",
+                            entry
+                        );
+                        context.pc = entry;
+                        context.regs[0] = argv.len() as u64;
+                        context.regs[1] = argv_ptr;
+                        context.regs[2] = envp_ptr;
+                        context.regs[3] = apple_ptr;
+                        context.regs[30] = return_stub;
+                    }
+                    cpu.load_context(&context);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED1);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED2);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED3);
+                    continue;
+                }
+                if !crate::arm64_runtime::is_light_host_call(symbol) {
+                    host_dispatches_since_callback += 1;
+                }
+                let continuation_pc = host_call_continuation(&context);
+                let call_site = host_call_site(&context);
+                let host_call = host_call_identity(&context);
+                if guest_progress_since_host_call {
+                    last_host_call = None;
+                    repeated_host_call = 0;
+                    guest_progress_since_host_call = false;
+                }
+                if last_host_call == Some(host_call) {
+                    repeated_host_call += 1;
+                } else {
+                    last_host_call = Some(host_call);
+                    repeated_host_call = 0;
+                }
+                if repeated_host_call > STALL_THRESHOLD {
+                    log_once_fmt!("ARM64 execution stall detected: repeated_guest_call={} host_stub_pc={:#x} guest_call_site={:#x} continuation_pc={:#x} binding={} previous_pcs={:?} branch_history={:?} [subsequent identical stalls suppressed]", repeated_host_call, context.pc, call_site, continuation_pc, symbol, previous_pcs, previous_branches);
+                    log_once_fmt!("ARM64 stall registers: {}", register_dump(&context));
+                    log_once_fmt!("ARM64 stall stack: {}", stack_dump(&memory, context.sp));
+                    return Err(format!(
+                        "ARM64 runtime stalled at host binding {}; host_stub_pc={:#x} guest_call_site={:#x} continuation_pc={:#x}; sp={:#x} lr={:#x} fp={:#x}; objc_messages={} metal_commands={} backend={}",
+                        symbol,
+                        context.pc,
+                        call_site,
+                        continuation_pc,
+                        context.sp,
+                        context.regs[30],
+                        context.regs[29],
+                        runtime_state.objc_messages,
+                        runtime_state.metal_commands,
+                        runtime_state.graphics_backend.label(),
+                    ));
+                }
+                if !crate::arm64_runtime::can_dispatch(symbol) {
+                    runtime_state.mark_unresolved_call(symbol, context.pc);
+                }
+                if matches!(
+                    symbol,
+                    "__Znam" | "_Znam" | "Znam" | "__Znwm" | "_Znwm" | "Znwm"
+                ) && (host_dispatches == 1 || host_dispatches % 1000 == 0)
+                {
+                    log_dbg!(
+                        "ARM64 allocation call #{}: symbol={} size={:#x} pc={:#x}",
+                        host_dispatches,
+                        symbol,
+                        context.regs[0],
+                        context.pc,
+                    );
+                }
+                if host_dispatches <= 16 || host_dispatches.is_power_of_two() {
+                    log_dbg!(
+                        "ARM64 host binding #{}: {} host_stub_pc={:#x} guest_call_site={:#x} continuation_pc={:#x}",
+                        host_dispatches,
+                        symbol,
+                        context.pc,
+                        call_site,
+                        continuation_pc,
+                    );
+                }
+                if context.sp == 0 || context.sp & 15 != 0 {
+                    verify_abi(&context, symbol);
+                }
+                let sp_before_dispatch = context.sp;
+                runtime_state.last_symbol = Some(symbol.to_owned());
+                let handled = match dispatch(
+                    &mut memory,
+                    &mut context,
+                    symbol,
+                    &mut runtime_state,
+                    Some(&mut fs),
+                    window.as_deref_mut(),
+                ) {
+                    Ok(handled) => {
+                        runtime_state.last_successful_symbol = Some(symbol.to_owned());
+                        handled
+                    }
+                    Err(error) => {
+                        failure_diagnostics(
+                            &memory,
+                            &context,
+                            &previous_pcs,
+                            &previous_branches,
+                            &runtime_state,
+                            &format!("host callback {} failed: {}", symbol, error),
+                        );
+                        return Err(format!("ARM64 host callback {} failed: {}", symbol, error));
+                    }
+                };
+                if context.sp != sp_before_dispatch {
+                    log_dbg!(
+                        "ARM64 host callback changed SP: symbol={} before={:#x} after={:#x}",
+                        symbol,
+                        sp_before_dispatch,
+                        context.sp,
+                    );
+                }
+                if runtime_state.take_present_request() {
+                    log_dbg!(
+                        "ARM64 compatibility frame {} submitted: commands={}, clear={:?}",
+                        runtime_state.frame_serial,
+                        runtime_state.metal_commands,
+                        runtime_state.clear_color
+                    );
+                    if let Some(window) = window.as_mut() {
+                        window.present_compatibility_frame(runtime_state.clear_color);
+                        if runtime_state.application_main_is_active() {
+                            runtime_state.mark_boot_screen_reached();
+                        }
+                    }
+                }
+                let guest_transfer = runtime_state.take_guest_transfer();
+                if let Some(transfer_pc) = guest_transfer {
+                    log_dbg!(
+                        "ARM64 continuing guest execution at transferred Objective-C method {:#x}",
+                        transfer_pc
+                    );
+                    context.pc = transfer_pc;
+                    cpu.load_context(&context);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED1);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED2);
+                    cpu.clear_halt(A64_HALT_USER_DEFINED3);
+                }
+                if runtime_state.take_boot_screen_request() {
+                    log_once_fmt!(
+                        "ARM64 boot screen notification consumed: application_main_calls={}; guest execution continuing [repeated notifications suppressed]",
+                        runtime_state.application_main_calls,
+                    );
+                }
+                if runtime_state.take_application_bootstrap_request() {
+                    bootstrap_grace_slices = ARM64_BOOTSTRAP_GRACE_SLICES;
+                    if !bootstrap_displayed {
+                        if let Some(window) = window.as_mut() {
+                            bootstrap_displayed =
+                                display_boot_screen(&bundle, &fs, device_family, window);
+                            if bootstrap_displayed {
+                                runtime_state.mark_boot_screen_reached();
+                            }
+                        }
+                    }
+                    echo!(
+                        "ARM64 application lifecycle bootstrap observed: displayed_boot_state={} grace_slices={}",
+                        bootstrap_displayed,
+                        bootstrap_grace_slices,
+                    );
+                }
+                if let Some(window) = window.as_mut() {
+                    window.poll_for_events(&options);
+                }
+                if bootstrap_grace_slices > 0 {
+                    bootstrap_grace_slices -= 1;
+                    if let Some(window) = window.as_mut() {
+                        window.poll_for_events(&options);
+                    }
+                }
+                if !handled {
+                    let first = runtime_state.mark_unimplemented_reached(symbol);
+                    if first {
+                        echo!("Warning: ARM64 reached unresolved host function {} at pc={:#x} lr={:#x} sp={:#x}; no safe signature is known, returning zero", symbol, context.pc, context.regs[30], context.sp);
+                    }
+                }
+                if host_dispatches_since_callback > MAX_HOST_DISPATCHES_PER_CALLBACK {
+                    return Err(format!(
+                        "ARM64 runtime made too many host calls within one guest callback; last binding was {}",
+                        symbol
+                    ));
+                }
+                if guest_transfer.is_none() {
+                    context.pc = context.regs[30];
+                }
+                if runtime_state.take_guest_yield() {
+                    let callback_return_pc = runtime_state
+                        .display_link_return_pc
+                        .unwrap_or(context.regs[30]);
+                    runtime_state.render_diagnostics.callback_return_pc = callback_return_pc;
+                    runtime_state.trace_render_event(format!("frame={} callback_return=drawFrame display_link_return_pc={:#x} lr={:#x} present={} next_scheduled={} last_gl={} last_guest_pc={:#x}", runtime_state.render_diagnostics.display_link_callbacks, context.pc, callback_return_pc, runtime_state.render_diagnostics.present_framebuffer_calls, runtime_state.display_link_is_scheduled(), runtime_state.render_diagnostics.last_gl_symbol.as_deref().unwrap_or("<none>"), runtime_state.render_diagnostics.last_guest_pc));
+                    host_dispatches_since_callback = 0;
+                    let callback_scheduled = schedule_display_link_callback(
+                        &mut memory,
+                        &mut context,
+                        &mut runtime_state,
+                    )?;
+                    if let Some(transfer_pc) = runtime_state.take_guest_transfer() {
+                        log_dbg!(
+                            "ARM64 scheduling next display-link guest callback at {:#x} (scheduled={})",
+                            transfer_pc,
+                            callback_scheduled,
+                        );
+                        context.pc = transfer_pc;
+                        cpu.load_context(&context);
+                        cpu.clear_halt(A64_HALT_USER_DEFINED1);
+                        cpu.clear_halt(A64_HALT_USER_DEFINED2);
+                        cpu.clear_halt(A64_HALT_USER_DEFINED3);
+                    }
+                }
+                no_progress_slices = 0;
+                no_progress_since = Instant::now();
+                cpu.load_context(&context);
+                cpu.clear_halt(A64_HALT_USER_DEFINED1);
+                cpu.clear_halt(A64_HALT_USER_DEFINED2);
+                cpu.clear_halt(A64_HALT_USER_DEFINED3);
+                continue;
+            }
+            -6 => {
+                failure_diagnostics(
+                    &memory,
+                    &context,
+                    &previous_pcs,
+                    &previous_branches,
+                    &runtime_state,
+                    "watchdog timeout",
+                );
+                return Err(format!(
+                    "ARM64 execution watchdog stopped the CPU at pc {:#x}",
+                    context.pc
+                ));
+            }
+            value if value >= 0 => {
+                return Err(format!(
+                    "ARM64 runtime reached unimplemented SVC {} at {:#x}",
+                    value, context.pc
+                ))
+            }
+            value => {
+                failure_diagnostics(
+                    &memory,
+                    &context,
+                    &previous_pcs,
+                    &previous_branches,
+                    &runtime_state,
+                    &format!("Dynarmic exit code {}", value),
+                );
+                return Err(format!(
+                    "ARM64 runtime failed with code {} at {:#x}",
+                    value, context.pc
+                ));
+            }
+        }
+    }
+}

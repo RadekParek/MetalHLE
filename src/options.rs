@@ -89,6 +89,63 @@ impl PresentMode {
 
 /// Whether host buffer swaps wait for the display's vertical refresh
 /// (`--vsync=`).
+/// Which graphics API (or GL context flavor) to request for rendering.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum GraphicsApi {
+    Default,
+    Translator,
+    TranslatorGLES30,
+    GLES10,
+    GLES11,
+    GLES20,
+    GLES30,
+    Wgpu,
+    Vulkan,
+    Software,
+    Metal,
+}
+
+impl Default for GraphicsApi {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl GraphicsApi {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "default" | "auto" => Ok(Self::Default),
+            "translator" | "gles1.1-gles2.0" => Ok(Self::Translator),
+            "translator-gles3" | "gles1.1-gles3.0" => Ok(Self::TranslatorGLES30),
+            "gles1.0" | "gles10" => Ok(Self::GLES10),
+            "gles1.1" | "gles11" => Ok(Self::GLES11),
+            "gles2.0" | "gles20" => Ok(Self::GLES20),
+            "gles3.0" | "gles30" => Ok(Self::GLES30),
+            "wgpu" | "webgpu" => Ok(Self::Wgpu),
+            "vulkan" => Ok(Self::Vulkan),
+            "software" | "software-rendering" | "cpu" => Ok(Self::Software),
+            "metal" => Ok(Self::Metal),
+            _ => Err(()),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default (game)",
+            Self::Translator => "OpenGL ES 1.1 to OpenGL ES 2.0 translator",
+            Self::TranslatorGLES30 => "OpenGL ES 1.1 to OpenGL ES 3.0 translator",
+            Self::GLES10 => "OpenGL ES 1.0",
+            Self::GLES11 => "OpenGL ES 1.1",
+            Self::GLES20 => "OpenGL ES 2.0",
+            Self::GLES30 => "OpenGL ES 3.0",
+            Self::Wgpu => "WGPU",
+            Self::Vulkan => "Vulkan",
+            Self::Software => "Software rendering",
+            Self::Metal => "Metal compatibility",
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VsyncMode {
     /// Android: off (the emulator paces frames itself and the Android
@@ -108,6 +165,61 @@ impl VsyncMode {
             "on" | "1" => Ok(Self::On),
             "off" | "0" => Ok(Self::Off),
             _ => Err(()),
+        }
+    }
+}
+
+/// Which execution engine to use for ARM64 executables.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Arm64Backend {
+    Auto,
+    Jit,
+    Interpreter,
+}
+
+impl Arm64Backend {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "jit" => Ok(Self::Jit),
+            "interpreter" => Ok(Self::Interpreter),
+            _ => Err(format!(
+                "Unknown ARM64 backend {value:?}; expected auto, jit, or interpreter"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Jit => "jit",
+            Self::Interpreter => "interpreter",
+        }
+    }
+}
+
+/// What to do when the selected ARM64 backend cannot run a given slice.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Arm64Fallback {
+    Jit,
+    Interpreter,
+}
+
+impl Arm64Fallback {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "jit" => Ok(Self::Jit),
+            "interpreter" => Ok(Self::Interpreter),
+            _ => Err(format!(
+                "Unknown ARM64 fallback {value:?}; expected jit or interpreter"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jit => "jit",
+            Self::Interpreter => "interpreter",
         }
     }
 }
@@ -159,6 +271,18 @@ pub struct Options {
     pub print_fps: bool,
     pub fps_limit: Option<f64>,
     pub force_composition: bool,
+    pub graphics_api: GraphicsApi,
+    pub metal_translator: bool,
+    pub custom_screen_size: Option<(u32, u32)>,
+    pub verbose_logging: bool,
+    /// Run the app's ARM64 slice in the 64-bit loader instead of failing.
+    pub force_64_bit: bool,
+    /// Prefer the app's 32-bit slice when both exist.
+    pub force_32_bit: bool,
+    /// Execution engine for ARM64 executables.
+    pub arm64_backend: Arm64Backend,
+    /// Execution engine fallback when the primary ARM64 backend is unavailable.
+    pub arm64_fallback: Arm64Fallback,
     /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
     /// environment variable (the option takes precedence).
     pub present_mode: PresentMode,
@@ -288,6 +412,14 @@ impl Default for Options {
             print_fps: false,
             fps_limit: Some(60.0),
             force_composition: false,
+            graphics_api: GraphicsApi::Default,
+            metal_translator: false,
+            custom_screen_size: None,
+            verbose_logging: false,
+            force_64_bit: false,
+            force_32_bit: false,
+            arm64_backend: Arm64Backend::Interpreter,
+            arm64_fallback: Arm64Fallback::Interpreter,
             present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
                 .ok()
                 .and_then(|value| PresentMode::from_short_name(value.trim()).ok())
@@ -541,19 +673,58 @@ impl Options {
             }
         } else if arg == "--force-composition" {
             self.force_composition = true;
+        } else if let Some(value) = arg.strip_prefix("--graphics-api=") {
+            let api = GraphicsApi::from_short_name(value)
+                .map_err(|_| "Unrecognized --graphics-api= value".to_string())?;
+            self.graphics_api = api;
+        } else if arg == "--metal-translator" {
+            self.metal_translator = true;
+        } else if arg == "--disable-metal-translator" {
+            self.metal_translator = false;
+        } else if let Some(value) = arg.strip_prefix("--custom-resolution=") {
+            let (w, h) = value
+                .split_once('x')
+                .and_then(|(w, h)| {
+                    Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+                })
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .ok_or_else(|| {
+                    "Invalid value for --custom-resolution= (expected WIDTHxHEIGHT)".to_string()
+                })?;
+            self.custom_screen_size = Some((w, h));
+            self.host_screen_size = Some((w, h));
+        } else if arg == "--clear-custom-resolution" {
+            self.custom_screen_size = None;
+            self.host_screen_size = None;
+        } else if arg == "--verbose-logging" {
+            self.verbose_logging = true;
+        } else if arg == "--no-verbose-logging" {
+            self.verbose_logging = false;
+        } else if arg == "--force-32-bit" {
+            self.force_32_bit = true;
+            self.force_64_bit = false;
+        } else if arg == "--disable-force-32-bit" {
+            self.force_32_bit = false;
+        } else if arg == "--force-64-bit" {
+            self.force_64_bit = true;
+            self.force_32_bit = false;
+        } else if arg == "--disable-force-64-bit" {
+            self.force_64_bit = false;
+        } else if let Some(value) = arg.strip_prefix("--arm64-backend=") {
+            self.arm64_backend = Arm64Backend::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--arm64-fallback=") {
+            self.arm64_fallback = Arm64Fallback::parse(value)?;
         } else if let Some(value) = arg.strip_prefix("--present-mode=") {
             self.present_mode = PresentMode::from_short_name(value).map_err(|_| {
-                "Invalid value for --present-mode= (expected auto, direct or readback)"
-                    .to_string()
+                "Invalid value for --present-mode= (expected auto, direct or readback)".to_string()
             })?;
         } else if arg == "--present-finish" {
             self.present_finish = true;
         } else if arg == "--no-present-finish" {
             self.present_finish = false;
         } else if let Some(value) = arg.strip_prefix("--vsync=") {
-            self.vsync = VsyncMode::from_short_name(value).map_err(|_| {
-                "Invalid value for --vsync= (expected auto, on or off)".to_string()
-            })?;
+            self.vsync = VsyncMode::from_short_name(value)
+                .map_err(|_| "Invalid value for --vsync= (expected auto, on or off)".to_string())?;
         } else if arg == "--vsync" {
             self.vsync = VsyncMode::On;
         } else if arg == "--no-vsync" {
@@ -611,19 +782,16 @@ impl Options {
         } else if arg == "--trainer" {
             self.trainer_disabled = false;
         } else if let Some(value) = arg.strip_prefix("--corrupt-interval=") {
-            let frames: u32 = value
-                .parse()
-                .ok()
-                .filter(|&v| v > 0)
-                .ok_or_else(|| "Invalid value for --corrupt-interval= (must be > 0)".to_string())?;
+            let frames: u32 =
+                value.parse().ok().filter(|&v| v > 0).ok_or_else(|| {
+                    "Invalid value for --corrupt-interval= (must be > 0)".to_string()
+                })?;
             self.corruption.enabled = true;
             self.corruption.interval_frames = frames;
         } else if let Some(value) = arg.strip_prefix("--corrupt-intensity=") {
-            let bytes: u32 = value
-                .parse()
-                .ok()
-                .filter(|&v| v > 0)
-                .ok_or_else(|| "Invalid value for --corrupt-intensity= (must be > 0)".to_string())?;
+            let bytes: u32 = value.parse().ok().filter(|&v| v > 0).ok_or_else(|| {
+                "Invalid value for --corrupt-intensity= (must be > 0)".to_string()
+            })?;
             self.corruption.enabled = true;
             self.corruption.bytes_per_burst = bytes;
         } else if let Some(value) = arg.strip_prefix("--corrupt-seed=") {

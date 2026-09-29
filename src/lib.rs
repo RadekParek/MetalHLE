@@ -26,11 +26,11 @@
 
 #[macro_use]
 mod log;
-mod env_flags;
-mod fastmap;
+mod a64_abi;
 mod abi;
 mod android_media;
 mod android_web_view;
+mod arm64_runtime;
 mod audio;
 mod bundle;
 mod corrupt;
@@ -38,23 +38,29 @@ mod cpu;
 mod crash_handler;
 mod debug;
 mod dyld;
+mod env_flags;
 mod environment;
+mod environment64;
+mod fastmap;
 pub mod font;
 mod frameworks;
 mod fs;
 mod gdb;
 mod gles;
+mod guest_clock;
 mod image;
 mod libc;
 mod mach_o;
+mod mach_o64;
 mod matrix;
 mod mem;
+mod mem64;
 mod objc;
 mod options;
 mod paths;
+mod perf;
 mod perf_hints;
 mod stack;
-mod guest_clock;
 mod trainer;
 mod trainer_ui;
 mod window;
@@ -139,7 +145,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         // openal-soft's wave backend only reads its output path from the
         // config key `wave/file`; it does not honour an env override, so
         // generate a minimal config file and point ALSOFT_CONF at it.
-        std::fs::write(&conf, format!("[wave]\nfile = {}\n", path.to_string_lossy())).ok();
+        std::fs::write(
+            &conf,
+            format!("[wave]\nfile = {}\n", path.to_string_lossy()),
+        )
+        .ok();
         // SAFETY: runs before any thread spawn or OpenAL call in this process.
         unsafe {
             std::env::set_var("ALSOFT_DRIVERS", "wave");
@@ -472,6 +482,37 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     for option_arg in option_args {
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
+    }
+
+    // Detect the executable's architecture so ARM64 slices are routed to the
+    // dedicated 64-bit environment instead of the 32-bit loader.
+    let architecture = {
+        let executable_bytes = fs
+            .read(bundle.executable_path())
+            .map_err(|_| "Could not read executable to detect its architecture".to_string())?;
+        mach_o::detect_architecture(
+            &executable_bytes,
+            options.force_32_bit,
+            options.force_64_bit,
+        )
+        .map_err(str::to_string)?
+    };
+    echo!(
+        "Selected executable architecture: {}",
+        mach_o::architecture_name(architecture)
+    );
+    if architecture == mach_o::MachOArchitecture::Arm64 {
+        if options.force_32_bit {
+            return Err(
+                "--force-32-bit was requested, but this executable is ARM64-only and cannot run in the 32-bit ARM loader".to_string(),
+            );
+        }
+        return environment64::run(bundle, fs, options, app_args.unwrap_or_default());
+    }
+    if options.force_64_bit {
+        return Err(
+            "--force-64-bit was requested, but this executable has no ARM64 slice".to_string(),
+        );
     }
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

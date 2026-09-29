@@ -29,3 +29,27 @@ This repo contains two products:
 - The SQLite DB is auto-created and seeded with demo data on first startup.
 - Submitting reports requires GitHub OAuth (`GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` env vars); without these, the app works in read-only mode.
 - The triage JSON API requires `APPDB_TRIAGE_TOKEN` env var.
+
+## MetalHLE workflow (RadekParek fork)
+
+### Upstream sync (mandatory, every session and before every push)
+
+1. `git fetch upstream trunk` (upstream = https://github.com/KlugKlugTG/HyperHLE-Fork.git)
+2. `git rev-list HEAD..upstream/trunk --count` — if > 0, KlugKlugTG has commits we don't:
+   - Stash local WIP (`git stash push -u`), merge (`git merge upstream/trunk --no-edit`),
+     pop the stash, resolve any conflicts before continuing.
+3. Then (and only then) proceed with new work or push.
+
+### Quality gates
+
+- Trunk stays green: `cargo check` must pass (and `cargo clippy` for touched files) before every push.
+- Update `CHANGELOG.md` at the end of every work session, before pushing.
+- One concern per commit; no AI slop; clean up Russian/placeholder markers in touched files.
+- Never break what's working: prefer additive ports over rewrites of existing behaviour.
+
+### Layout
+
+- `origin` = RadekParek/MetalHLE (our trunk), `upstream` = KlugKlugTG/HyperHLE-Fork (base fork).
+- Ported legacy features live in `src/environment64.rs` (ARM64 path), `src/arm64_runtime.rs`,
+  `src/cpu/a64/`, `src/mem64.rs`, `src/mach_o64.rs` — grafted from the geofasada-star/MetalHLE-test
+  fork, then adapted (Russian markers removed, APIs matched to this tree).

@@ -45,6 +45,7 @@ pub enum DeviceFamily {
     iPhone4s,
     iPhone5,
     iPhone5c,
+    iPhone5s,
     iPad,
     iPad2,
     iPad3,
@@ -74,6 +75,7 @@ impl DeviceFamily {
             DeviceFamily::iPhone4s => "iPhone 4s",
             DeviceFamily::iPhone5 => "iPhone 5",
             DeviceFamily::iPhone5c => "iPhone 5c",
+            DeviceFamily::iPhone5s => "iPhone 5s",
             DeviceFamily::iPad => "iPad",
             DeviceFamily::iPad2 => "iPad 2",
             DeviceFamily::iPad3 => "iPad 3",
@@ -104,6 +106,24 @@ impl DeviceFamily {
         )
     }
 
+    pub fn supports_arm64(&self) -> bool {
+        matches!(
+            self,
+            DeviceFamily::iPhone5s
+                | DeviceFamily::iPad5
+                | DeviceFamily::iPadMini2
+                | DeviceFamily::iPadMini3
+        )
+    }
+
+    pub fn oldest_arm64_for_class(is_ipad: bool) -> Self {
+        if is_ipad {
+            Self::iPadMini2
+        } else {
+            Self::iPhone5s
+        }
+    }
+
     pub fn is_ipod_touch(&self) -> bool {
         matches!(
             self,
@@ -129,6 +149,7 @@ impl DeviceFamily {
                 | DeviceFamily::iPhone4s
                 | DeviceFamily::iPhone5
                 | DeviceFamily::iPhone5c
+                | DeviceFamily::iPhone5s
                 | DeviceFamily::iPodTouch4
                 | DeviceFamily::iPodTouch5
                 | DeviceFamily::iPad3
@@ -169,6 +190,7 @@ impl DeviceFamily {
             DeviceFamily::iPhone4s => "iPhone4,1",
             DeviceFamily::iPhone5 => "iPhone5,1",
             DeviceFamily::iPhone5c => "iPhone5,3",
+            DeviceFamily::iPhone5s => "iPhone6,1",
             DeviceFamily::iPad => "iPad1,1",
             DeviceFamily::iPad2 => "iPad2,1",
             DeviceFamily::iPad3 => "iPad3,1",
@@ -216,6 +238,7 @@ impl DeviceFamily {
             DeviceFamily::iPhone4s
             | DeviceFamily::iPhone5
             | DeviceFamily::iPhone5c
+            | DeviceFamily::iPhone5s
             | DeviceFamily::iPad2
             | DeviceFamily::iPad3
             | DeviceFamily::iPad4
@@ -273,6 +296,7 @@ impl DeviceFamily {
             DeviceFamily::iPhone4s => "iphone-4s",
             DeviceFamily::iPhone5 => "iphone-5",
             DeviceFamily::iPhone5c => "iphone-5c",
+            DeviceFamily::iPhone5s => "iphone-5s",
             DeviceFamily::iPad => "ipad-1",
             DeviceFamily::iPad2 => "ipad-2",
             DeviceFamily::iPad3 => "ipad-3",
@@ -299,6 +323,7 @@ impl DeviceFamily {
         DeviceFamily::iPhone4s,
         DeviceFamily::iPhone5,
         DeviceFamily::iPhone5c,
+        DeviceFamily::iPhone5s,
         DeviceFamily::iPad,
         DeviceFamily::iPad2,
         DeviceFamily::iPad3,
@@ -336,6 +361,7 @@ impl TryFrom<&str> for DeviceFamily {
             "iphone-4s" | "iphone4,1" => Ok(DeviceFamily::iPhone4s),
             "iphone-5" | "iphone5,1" => Ok(DeviceFamily::iPhone5),
             "iphone-5c" | "iphone5,3" => Ok(DeviceFamily::iPhone5c),
+            "iphone-5s" | "iphone6,1" => Ok(DeviceFamily::iPhone5s),
             "ipad" => Ok(DeviceFamily::iPad2),
             "ipad-1" | "ipad1,1" => Ok(DeviceFamily::iPad),
             "ipad-2" | "ipad2,1" => Ok(DeviceFamily::iPad2),
@@ -652,7 +678,11 @@ fn configure_android_angle_driver(use_angle: bool) {
         // ANGLE's ES 1.1 front-end also resolves higher-version entry points
         // through EGL's get-proc-address mechanism.
         env::set_var("SDL_VIDEO_GL_DRIVER", gles1);
-        log!("Using bundled ANGLE for Android OpenGL ES ({} / {}).", egl, gles1);
+        log!(
+            "Using bundled ANGLE for Android OpenGL ES ({} / {}).",
+            egl,
+            gles1
+        );
         return;
     }
 
@@ -693,6 +723,9 @@ pub struct Window {
     /// native driver such as Qualcomm Adreno) so that driver-specific
     /// workarounds can be auto-enabled. See [Window::gl_driver_description].
     gl_driver_description: String,
+    /// Set when a backend without GL rendering wants plain software
+    /// presentation (used by the ARM64 compatibility path).
+    software_presentation: bool,
     splash_image: Option<Image>,
     /// Whether the selected image already targets the startup orientation.
     splash_image_is_orientation_specific: bool,
@@ -965,6 +998,7 @@ impl Window {
             host_screen_size,
             internal_gl_ins: None,
             gl_driver_description: String::new(),
+            software_presentation: false,
             splash_image,
             splash_image_is_orientation_specific,
             device_family,
@@ -1731,8 +1765,7 @@ impl Window {
     pub fn pop_event(&mut self) -> Option<Event> {
         // TEST HOOK: GD autoplay taps for verifying level music headlessly.
         if !self.auto_taps.is_empty() {
-            static POP_FRAMES: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static POP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let frame = POP_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let due: Vec<(f32, f32)> = self
                 .auto_taps
@@ -1753,11 +1786,15 @@ impl Window {
                     coords
                 );
                 self.event_queue
-                    .push_back(Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)])));
+                    .push_back(Event::TouchesDown(HashMap::from([(
+                        FingerId::Mouse,
+                        coords,
+                    )])));
                 self.event_queue
                     .push_back(Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)])));
             }
-            self.auto_taps.retain(|(tap_frame, _, _)| *tap_frame > frame);
+            self.auto_taps
+                .retain(|(tap_frame, _, _)| *tap_frame > frame);
         }
         self.high_priority_event
             .take()
@@ -2133,6 +2170,42 @@ impl Window {
                 )
         };
         gl_ins
+    }
+
+    pub fn display_compatibility_image(&mut self, image: Image, orientation: DeviceOrientation) {
+        self.device_orientation = orientation;
+        self.splash_image = Some(image);
+        self.splash_image_is_orientation_specific = false;
+        self.display_splash();
+    }
+
+    pub fn present_compatibility_frame(&mut self, clear_color: [f32; 4]) {
+        if self.software_presentation {
+            let color = sdl2::pixels::Color::RGBA(
+                (clear_color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (clear_color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (clear_color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                (clear_color[3].clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            let mut surface = self.window.surface(&self.event_pump).unwrap();
+            surface.fill_rect(None, color).unwrap();
+            surface.update_window().unwrap();
+            return;
+        }
+        let (x, y, width, height) = self.viewport();
+        let mut gl = self.make_internal_gl_ctx_current();
+        unsafe {
+            gl.Viewport(x as _, y as _, width as _, height as _);
+            gl.ClearColor(
+                clear_color[0],
+                clear_color[1],
+                clear_color[2],
+                clear_color[3],
+            );
+            gl.Clear(crate::gles::gles11_raw::COLOR_BUFFER_BIT);
+        }
+        drop(gl);
+        self.swap_window();
     }
 
     fn display_splash(&mut self) {
