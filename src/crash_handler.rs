@@ -83,7 +83,7 @@ pub fn install_panic_hook() {
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
         let msg = format!(
-            "touchHLE: PANIC in thread \"{}\" at {}: {}\n(panic is followed by unwinding; if this appears right before a FATAL SIGNAL line, the panic crossed a coroutine boundary and aborted the process)",
+            "MetalHLE: PANIC in thread \"{}\" at {}: {}\n(panic is followed by unwinding; if this appears right before a FATAL SIGNAL line, the panic crossed a coroutine boundary and aborted the process)",
             thread_name,
             info.location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
@@ -251,7 +251,7 @@ mod imp {
             format!(" at address {:#x}", addr)
         };
         let msg = format!(
-            "touchHLE: FATAL: native host crash: {}{} — the signal alone does not identify the root cause. Check preceding panic, loader and guest-fault messages. The process will now terminate.\n",
+            "MetalHLE: FATAL: native host crash: {}{} — the signal alone does not identify the root cause. Check preceding panic, loader and guest-fault messages. The process will now terminate.\n",
             std::str::from_utf8(&name[..name.len() - 1]).unwrap_or("SIGNAL"),
             location
         );

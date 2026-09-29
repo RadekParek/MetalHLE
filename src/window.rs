@@ -2745,7 +2745,7 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 0,
-            text: "Open touchHLE directory",
+            text: "Open MetalHLE directory",
         },
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,

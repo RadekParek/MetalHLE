@@ -16,6 +16,7 @@ Changes are categorised as follows:
 ## NEXT
 
 - The app picker now matches the legacy fork's home screen: scrolling icon grid, wallpaper, Add Game / Settings / Files / About buttons with their original icons, per-app context settings (device model, scale, GL driver, orientation), and full options surface (graphics API, render rotation, audio backend, memory model, texture filtering, PVRTC decoding and more).
+- User-facing branding is now "MetalHLE 2.0" (version 2.0.0): startup banner, window title, crash dialogs, picker error messages and the file-directory button label. Internal crate, binary and data-directory names remain `touchHLE` so existing installs, CI packaging and user data keep working.
 
 Compatibility:
 

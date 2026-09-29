@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "touchHLE"
-version = "0.2.3"
+version = "2.0.0"
 dependencies = [
  "bzip2",
  "caf",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "touchHLE_dynarmic_wrapper"
-version = "0.2.3"
+version = "2.0.0"
 dependencies = [
  "cc",
  "cmake",
@@ -1515,14 +1515,14 @@ dependencies = [
 
 [[package]]
 name = "touchHLE_gl_bindings"
-version = "0.2.3"
+version = "2.0.0"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "touchHLE_libxml2_wrapper"
-version = "0.2.3"
+version = "2.0.0"
 dependencies = [
  "cc",
  "cmake",
@@ -1530,28 +1530,28 @@ dependencies = [
 
 [[package]]
 name = "touchHLE_openal_soft_wrapper"
-version = "0.2.3"
+version = "2.0.0"
 dependencies = [
  "cmake",
 ]
 
 [[package]]
 name = "touchHLE_pvrt_decompress_wrapper"
-version = "0.2.3"
+version = "2.0.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "touchHLE_stb_image_wrapper"
-version = "0.2.3"
+version = "2.0.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "touchHLE_version"
-version = "0.2.3"
+version = "2.0.0"
 
 [[package]]
 name = "ttf-parser"
