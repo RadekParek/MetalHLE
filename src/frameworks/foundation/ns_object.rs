@@ -698,6 +698,29 @@ pub const CLASSES: ClassExports = objc_classes! {
     sig
 }
 
+// MARK: - Telemetry no-ops
+// Some SDKs (e.g. the analytics bundled with MCPE 0.14.x) call generic
+// setters like setSessionId:/enqueueTelemetryItem: on whatever object they
+// keep in a static. Because these are ordinary method calls, every object
+// must respond to avoid "does not respond to selector" warnings. Telemetry
+// itself is a no-op in the emulator, so these are silent no-ops too.
+
+- (())setSessionId:(id)session_id {
+    log_dbg!("setSessionId:{:?} — telemetry no-op", session_id);
+}
+
+- (())setIsFirstSession:(bool)is_first_session {
+    log_dbg!("setIsFirstSession:{} — telemetry no-op", is_first_session);
+}
+
+- (())setIsNewSession:(bool)is_new_session {
+    log_dbg!("setIsNewSession:{} — telemetry no-op", is_new_session);
+}
+
+- (())enqueueTelemetryItem:(id)item {
+    log_dbg!("enqueueTelemetryItem:{:?} — telemetry no-op", item);
+}
+
 - (id)performSelector:(SEL)sel {
     assert!(!sel.is_null());
     msg_send_no_type_checking(env, (this, sel))
@@ -867,10 +890,38 @@ pub const CLASSES: ClassExports = objc_classes! {
     // out from under us) rather than panicking. With no selector there is
     // nothing to fire, so just release any waiter and bail.
     if sel_str.is_empty() {
-        log!(
-            "Warning: _touchHLE_timerFireMethod: timer {:?} has no stored selector; skipping.",
-            which
-        );
+        // The userInfo dictionary carries the performSelector bookkeeping.
+        // If it is missing (e.g. the dict was released out from under us, or
+        // the timer reached us through another creation path), fall back to
+        // firing the timer's own target/selector pair, exactly as
+        // -[NSTimer fire] does, so a legitimate timer is not silently
+        // dropped. Never recurse through this method itself.
+        let (t_target, t_selector, t_repeats, t_valid) = {
+            let host = env
+                .objc
+                .borrow::<crate::frameworks::foundation::ns_timer::NSTimerHostObject>(which);
+            (host.target, host.selector, host.repeats, host.due_by.is_some())
+        };
+        let fire_sel = env.objc.lookup_selector("_touchHLE_timerFireMethod:").unwrap();
+        if t_valid && t_target != nil && !t_selector.is_null() && t_selector != fire_sel {
+            log_dbg!(
+                "_touchHLE_timerFireMethod: timer {:?} has no userInfo selector; \
+                 firing its own selector {} instead.",
+                which,
+                t_selector.as_str(&env.mem)
+            );
+            let pool: id = msg_class![env; NSAutoreleasePool new];
+            let _: () = msg_send(env, (t_target, t_selector, which));
+            release(env, pool);
+            if !t_repeats {
+                let _: () = msg![env; which invalidate];
+            }
+        } else {
+            log_dbg!(
+                "_touchHLE_timerFireMethod: timer {:?} has no stored selector; skipping.",
+                which
+            );
+        }
         if let Some(sem_bits) = sem_to_post {
             let sem: crate::mem::MutPtr<crate::libc::semaphore::sem_t> =
                 crate::mem::MutPtr::from_bits(sem_bits);

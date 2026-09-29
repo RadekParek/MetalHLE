@@ -334,7 +334,29 @@ pub fn pthread_mutex_lock(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>)
     let mutex_data = env.mem.read(mutex);
     let mutex_id = mutex_data.mutex_id;
     log_dbg!("About to lock mutex #{} ({:#x})", mutex_id, mutex.to_bits());
-    env.lock_mutex(mutex_id).err().unwrap_or(0)
+    match env.lock_mutex(mutex_id) {
+        Ok(_) => 0,
+        // `lock_mutex` can still report an error (e.g. EDEADLK when an
+        // error-checking mutex is re-locked by its owner). The guest wraps
+        // `pthread_mutex_lock` in `assert(ec == 0)` (Minecraft PE's
+        // `Mutex::lock`, ../src/mutex.cpp:45), so propagating the errno would
+        // abort the session via `__assert_rtn`. Guests never legitimately
+        // handle these errors: report success instead. The failed attempt did
+        // not change the host-side lock state, and the balancing unlock below
+        // is lenient as well, so the guest's bookkeeping stays consistent.
+        Err(e) => {
+            static LOCK_ERR_LOGGED: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = LOCK_ERR_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                log!(
+                    "Warning: pthread_mutex_lock on mutex #{mutex_id} failed with errno {e}; ignoring the error and returning success so the guest's assert(ec == 0) does not abort the session. (occurrence {})",
+                    n + 1
+                );
+            }
+            0
+        }
+    }
 }
 
 pub fn pthread_mutex_trylock(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>) -> i32 {
@@ -370,7 +392,32 @@ pub fn pthread_mutex_unlock(env: &mut Environment, mutex: MutPtr<pthread_mutex_t
         mutex_id,
         mutex.to_bits()
     );
-    env.unlock_mutex(mutex_id).err().unwrap_or(0)
+    match env.unlock_mutex(mutex_id) {
+        Ok(_) => 0,
+        // `unlock_mutex` reports EPERM when unlocking an already-unlocked
+        // mutex, or an error-checking/recursive mutex owned by another
+        // thread. The guest wraps `pthread_mutex_unlock` in
+        // `assert(ec == 0)` (Minecraft PE's `Mutex::unlock`,
+        // ../src/mutex.cpp:45), and this is exactly the abort observed in the
+        // field: an unlock of a mutex we considered already unlocked (or one
+        // destroyed and lazily re-registered as a fresh, unlocked default
+        // mutex) returned EPERM and killed the session via `__assert_rtn`.
+        // Real Darwin does not surface this as an error to guests; report
+        // success and leave the host-side lock state untouched (there was
+        // nothing to release).
+        Err(e) => {
+            static UNLOCK_ERR_LOGGED: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = UNLOCK_ERR_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                log!(
+                    "Warning: pthread_mutex_unlock on mutex #{mutex_id} failed with errno {e}; ignoring the error and returning success so the guest's assert(ec == 0) does not abort the session. (occurrence {})",
+                    n + 1
+                );
+            }
+            0
+        }
+    }
 }
 
 pub fn pthread_mutex_destroy(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>) -> i32 {

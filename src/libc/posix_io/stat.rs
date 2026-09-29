@@ -67,12 +67,32 @@ fn mkdir(env: &mut Environment, path: ConstPtr<u8>, mode: mode_t) -> i32 {
     // Безопасное чтение пути, чтобы избежать panic через unwrap()
     let path_str = match env.mem.cstr_at_utf8(path) {
         Ok(s) => {
-            // XaView BypassMkdirLoop: the game retries mkdir()/access() in a
-            // tight loop when they fail on paths with doubled separators.
-            if s.contains("//") {
-                return 0;
+            // Collapse doubled separators (`a//b` -> `a/b`). Some guests build
+            // paths by joining a directory that already ends in `/` with a
+            // sub-path, producing `//`. Previously mkdir bailed out with a fake
+            // `return 0` on any `//` path (the "XaView BypassMkdirLoop" hack),
+            // which stopped one game's retry loop but meant the directory was
+            // never actually created. Minecraft PE relies on mkdir of such a
+            // `//` path (e.g. `minecraftWorlds//<id>/db/db`) genuinely creating
+            // the directory before it opens LevelDB files inside it, so the
+            // fake-success caused world creation to fail with "cannot open".
+            // Normalising and then really creating the directory satisfies both
+            // cases: the retry loop stops (mkdir succeeds) and the directory
+            // exists.
+            let mut collapsed = String::with_capacity(s.len());
+            let mut prev_slash = false;
+            for c in s.chars() {
+                if c == '/' {
+                    if !prev_slash {
+                        collapsed.push(c);
+                    }
+                    prev_slash = true;
+                } else {
+                    collapsed.push(c);
+                    prev_slash = false;
+                }
             }
-            s.to_string()
+            collapsed
         }
         Err(_) => {
             set_errno(env, ENOENT);

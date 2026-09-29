@@ -995,6 +995,46 @@ fn strtof(env: &mut Environment, nptr: ConstPtr<u8>, endptr: MutPtr<ConstPtr<u8>
     number as f32
 }
 
+// `long double` on the iOS armv7 ABI is identical to `double`, so strtold*
+// return f64 exactly like strtod. The `_l` locale-aware variants take a
+// trailing `locale_t` we can ignore: our parsing is already locale-independent
+// (always the C locale). These were previously missing, so the dyld linker
+// installed return-0 stubs for them — which broke every guest that parses
+// numbers through them. Minecraft PE 0.14, for instance, parses its UI layout
+// percentage strings ("100%", "31.25%") with strtold_l; a stubbed 0 collapsed
+// all percentage-sized controls (main-menu buttons, title logo) to zero size,
+// making them invisible and untappable while fixed-pixel controls still worked.
+fn strtold(env: &mut Environment, nptr: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>) -> f64 {
+    strtod(env, nptr, endptr)
+}
+
+fn strtold_l(
+    env: &mut Environment,
+    nptr: ConstPtr<u8>,
+    endptr: MutPtr<MutPtr<u8>>,
+    _locale: ConstVoidPtr,
+) -> f64 {
+    strtod(env, nptr, endptr)
+}
+
+fn strtod_l(
+    env: &mut Environment,
+    nptr: ConstPtr<u8>,
+    endptr: MutPtr<MutPtr<u8>>,
+    _locale: ConstVoidPtr,
+) -> f64 {
+    strtod(env, nptr, endptr)
+}
+
+fn strtof_l(
+    env: &mut Environment,
+    nptr: ConstPtr<u8>,
+    endptr: MutPtr<ConstPtr<u8>>,
+    _locale: ConstVoidPtr,
+) -> f32 {
+    strtof(env, nptr, endptr)
+}
+
 pub fn strtoul(
     env: &mut Environment,
     str: ConstPtr<u8>,
@@ -1902,6 +1942,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func_aliased!("_abort", abort()),
     export_c_func!(bsearch(_, _, _, _, _)),
     export_c_func!(strtof(_, _)),
+    export_c_func!(strtold(_, _)),
+    export_c_func!(strtold_l(_, _, _)),
+    export_c_func!(strtod_l(_, _, _)),
+    export_c_func!(strtof_l(_, _, _)),
     export_c_func!(strtoul(_, _, _)),
     export_c_func!(strtoull(_, _, _)),
     export_c_func!(strtoull_l(_, _, _, _)),
