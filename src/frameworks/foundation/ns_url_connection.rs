@@ -45,6 +45,10 @@ struct NSURLConnectionHostObject {
     /// `id<NSURLConnectionDelegate>` — retained while the connection is
     /// alive, released on dealloc / cancel.
     delegate: id,
+    /// `NSOperationQueue *` from setDelegateQueue:. touchHLE schedules all
+    /// delegate callbacks on the main thread, so the queue is only stored
+    /// (retained) for API fidelity.
+    delegate_queue: id,
     /// Whether the connection has already been cancelled / finished.
     cancelled: bool,
 }
@@ -172,6 +176,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host = Box::new(NSURLConnectionHostObject {
         delegate: nil,
+        delegate_queue: nil,
         cancelled: false,
     });
     env.objc.alloc_object(this, host, &mut env.mem)
@@ -407,14 +412,30 @@ pub const CLASSES: ClassExports = objc_classes! {
         .cancelled = true;
 }
 
+- (())setDelegateQueue:(id)queue {
+    log_dbg!("NSURLConnection setDelegateQueue: {:?}", queue);
+    retain(env, queue);
+    let old_queue = {
+        let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(this);
+        std::mem::replace(&mut host.delegate_queue, queue)
+    };
+    release(env, old_queue);
+}
+
+- (id)delegateQueue {
+    env.objc.borrow::<NSURLConnectionHostObject>(this).delegate_queue
+}
+
 // MARK: - Dealloc
 
 - (())dealloc {
     log_dbg!("NSURLConnection dealloc");
-    let delegate = env.objc
-        .borrow::<NSURLConnectionHostObject>(this)
-        .delegate;
+    let (delegate, delegate_queue) = {
+        let host = env.objc.borrow::<NSURLConnectionHostObject>(this);
+        (host.delegate, host.delegate_queue)
+    };
     release(env, delegate);
+    release(env, delegate_queue);
     env.objc.dealloc_object(this, &mut env.mem);
 }
 

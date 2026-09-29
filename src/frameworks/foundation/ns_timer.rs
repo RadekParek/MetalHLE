@@ -15,28 +15,28 @@ use crate::Environment;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-struct NSTimerHostObject {
-    ns_interval: NSTimeInterval,
+pub struct NSTimerHostObject {
+    pub ns_interval: NSTimeInterval,
     /// Copy of `ns_interval` in Rust's type for time intervals. Keep in sync!
-    rust_interval: Duration,
+    pub rust_interval: Duration,
     /// Strong reference
-    target: id,
-    selector: SEL,
+    pub target: id,
+    pub selector: SEL,
     /// Strong reference
-    user_info: id,
+    pub user_info: id,
     /// Strong reference to an `NSInvocation*`, used by the
     /// `…:invocation:repeats:` variants. When non-nil, firing the timer calls
     /// `[invocation invoke]` instead of sending `selector` to `target`.
-    invocation: id,
-    repeats: bool,
+    pub invocation: id,
+    pub repeats: bool,
     /// Virtual game-clock deadline, not a host scheduler deadline.
-    due_by: Option<Instant>,
+    pub due_by: Option<Instant>,
     /// If the timer is currently running its callback, this is set so that the
     /// re-entering the run loop from inside the callback doesn't cause an
     /// infinite loop.
-    is_running_callback: bool,
+    pub is_running_callback: bool,
     /// Weak reference
-    run_loop: id,
+    pub run_loop: id,
 }
 impl HostObject for NSTimerHostObject {}
 

@@ -865,6 +865,22 @@ fn strftime(
                 let formatted_minute = format!("{:02}", minute);
                 res.extend_from_slice(formatted_minute.as_bytes());
             }
+            b'X' => {
+                // %X is the locale's time representation; in the C locale
+                // (touchHLE's only locale) that is exactly %H:%M:%S.
+                let hour = time_val.tm_hour.clamp(0, 23);
+                let minute = time_val.tm_min.clamp(0, 59);
+                let second = time_val.tm_sec.clamp(0, 60);
+                res.extend_from_slice(format!("{:02}:{:02}:{:02}", hour, minute, second).as_bytes());
+            }
+            b'x' => {
+                // %x is the locale's date representation; in the C locale
+                // that is %m/%d/%y.
+                let month = (time_val.tm_mon.clamp(0, 11)) + 1;
+                let day = time_val.tm_mday.clamp(1, 31);
+                let year = (time_val.tm_year + 1900) % 100;
+                res.extend_from_slice(format!("{:02}/{:02}/{:02}", month, day, year).as_bytes());
+            }
             b'b' | b'h' => {
                 let month = time_val.tm_mon.clamp(0, 11);
                 const MONTH_ABBRS: [&[u8]; 12] = [
