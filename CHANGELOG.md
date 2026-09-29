@@ -97,6 +97,7 @@ Compatibility:
 
 Quality and performance:
 
+- The app picker home screen is now a real paged `UIScrollView` with a `UIPageControl` instead of arrow buttons: pages scroll horizontally by swipe or drag with paging snap, the page dots update live (and follow the drag), and the arrows are gone. The picker also renders at triple logical resolution (on the host's aspect ratio when known) with a 3x scale hack, so icons and text come out sharp instead of blurry. The grid is rebuilt when a new IPA finishes copying, so freshly added apps appear immediately.
 - Debug builds now use an optimized Dynarmic CPU backend while retaining Rust debug assertions and the wrapper's memory-access abort checks; release builds are unchanged. This reduces guest CPU initialization time during game launches. (@j92580498-max)
 - Large PVRTC textures are now decompressed in parallel (up to four workers) on hosts without native PVRTC support, reducing game texture-load time without retaining decoded textures. (@j92580498-max)
 - The main emulation loop now skips trainer setup and app-ID allocation when the optional trainer is disabled; enabled-trainer behavior is unchanged. (@j92580498-max)

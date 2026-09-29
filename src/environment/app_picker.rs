@@ -154,9 +154,16 @@ fn list_top_level_ipa_files(apps_dir: &Path) -> Vec<(String, u64)> {
 /// refreshed, so that a file that is still being copied is left alone.
 const IPA_COPY_SETTLE_TIME: Duration = Duration::from_millis(500);
 
+/// Tag set on the app-picker's icon `UIScrollView` so the shared delegate can
+/// tell it apart from any other scroll view routed to the same callbacks.
+const ICON_SCROLL_TAG: NSInteger = 0x5248;
+
 #[derive(Default)]
 struct AppPickerDelegateHostObject {
     icon_tapped: id,
+    /// Set by the icon scroll view's delegate callbacks: the page the user
+    /// swiped to (`None` when no swipe happened since the last poll).
+    icon_scroll_page: Option<usize>,
     // Set by the add-app tile; kept separately from icon_tapped because the
     // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
@@ -210,6 +217,26 @@ const CLASSES: ClassExports = objc_classes! {
     // used within the app picker, so it can't be abused. :)
     let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
     host_obj.icon_tapped = sender;
+}
+
+- (())scrollViewDidScroll:(id)scroll_view {
+    let tag: NSInteger = msg![env; scroll_view tag];
+    if tag != ICON_SCROLL_TAG {
+        return;
+    }
+    let bounds: CGRect = msg![env; scroll_view bounds];
+    if bounds.size.width <= 0.0 {
+        return;
+    }
+    let offset: CGPoint = msg![env; scroll_view contentOffset];
+    let page = (offset.x / bounds.size.width).round().max(0.0) as usize;
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .icon_scroll_page = Some(page);
+}
+
+- (())scrollViewDidEndDecelerating:(id)scroll_view {
+    msg![env; this scrollViewDidScroll:scroll_view]
 }
 
 - (())addIpa {
@@ -350,6 +377,29 @@ fn show_app_picker_gui(
         );
         image
     };
+    let mut options = options;
+    let picker_canvas_size = crate::window::host_screen_size()
+        .map(|(width, height)| {
+            let short_side = width.min(height).max(1);
+            let long_side = width.max(height);
+            let logical_width = 320u32;
+            let logical_height = ((logical_width as f32 * long_side as f32 / short_side as f32)
+                .round() as u32)
+                .max(480);
+            (logical_width, logical_height)
+        })
+        .unwrap_or((320, 568));
+    options.host_screen_size = Some(picker_canvas_size);
+    options.scale_hack = NonZeroU32::new(3).unwrap();
+    log_dbg!(
+        "App picker: using fixed {}x{} logical canvas at 3x internal resolution, preserving host aspect ratio.",
+        picker_canvas_size.0,
+        picker_canvas_size.1
+    );
+    if !options.fullscreen && !crate::window::Window::rotatable_fullscreen() {
+        options.fullscreen = true;
+        log!("App picker: enabling fullscreen so the picker uses the complete host display");
+    }
     let environment = Environment::new_without_app(options, icon)?;
     Ok(environment.run_app_picker(|env| app_picker_inner(env, apps)))
 }
@@ -834,6 +884,23 @@ fn app_picker_inner(
         // Detect .ipa files copied in by the "+" tile flow and refresh the
         // grid once the new file has finished copying (its size stops
         // changing and has stayed stable for a moment).
+        // Consume any page change from a swipe: sync UIPageControl and
+        // remember the page the user settled on. Runs after the
+        // quick-options chain so the host-object borrow has ended.
+        if let Some(page) = env
+            .objc
+            .borrow_mut::<AppPickerDelegateHostObject>(delegate)
+            .icon_scroll_page
+            .take()
+        {
+            let max_page = icon_grid_stuff
+                .as_ref()
+                .map_or(0, |grid| grid.pages.len().saturating_sub(1));
+            current_page = page.min(max_page);
+            let page: NSInteger = current_page as NSInteger;
+            () = msg![env; (icon_grid_stuff.as_ref().unwrap().page_control) setCurrentPage:page];
+        }
+
         if let Some(watch) = &mut awaited_ipa {
             let new_listing = list_top_level_ipa_files(&apps_dir);
             if new_listing != watch.last_seen {
@@ -847,16 +914,22 @@ fn app_picker_inner(
             {
                 watch.dirty = false;
                 if let Ok(new_apps) = enumerate_apps(&apps_dir) {
-                    if let Some(grid) = icon_grid_stuff.as_mut() {
-                        let mut new_apps = new_apps;
-                        grid.pages =
-                            compute_pages(grid.icon_buttons_and_labels.len(), new_apps.len());
-                        if current_page >= grid.pages.len() {
-                            current_page = grid.pages.len() - 1;
-                        }
-                        update_icon_grid(env, grid, &mut new_apps, current_page);
-                        apps = Ok(new_apps);
+                    let mut new_apps = new_apps;
+                    if let Some(grid) = icon_grid_stuff.as_ref() {
+                        remove_icon_grid(env, grid);
                     }
+                    let mut new_grid = make_icon_grid(
+                        env,
+                        delegate,
+                        main_view,
+                        app_frame,
+                        new_apps.len(),
+                        have_wallpaper,
+                    );
+                    current_page = current_page.min(new_grid.pages.len().saturating_sub(1));
+                    update_icon_grid(env, &mut new_grid, &mut new_apps, current_page);
+                    icon_grid_stuff = Some(new_grid);
+                    apps = Ok(new_apps);
                 }
             }
         }
@@ -935,7 +1008,6 @@ const ICON_SIZE: CGSize = CGSize {
     width: 72.0,
     height: 72.0,
 };
-const ICON_IMAGE_INSET: CGFloat = 9.0;
 const ICON_LABEL_TOP_GAP: CGFloat = 2.0;
 const ICON_ROW_GAP: CGFloat = 2.0;
 
@@ -954,8 +1026,8 @@ fn app_picker_quick_options_button_top(app_height: CGFloat) -> CGFloat {
 }
 
 fn app_picker_icon_grid_num_rows(app_height: CGFloat, label_height: CGFloat) -> usize {
-    let grid_bottom = app_picker_quick_options_button_top(app_height)
-        - APP_PICKER_GRID_TO_BUTTON_GAP;
+    let grid_bottom =
+        app_picker_quick_options_button_top(app_height) - APP_PICKER_GRID_TO_BUTTON_GAP;
     let cell_content_height = ICON_SIZE.height + ICON_LABEL_TOP_GAP + label_height;
     let cell_step_y = cell_content_height + ICON_ROW_GAP;
     let available_height = (grid_bottom - APP_PICKER_GRID_TOP - cell_content_height).max(0.0);
@@ -969,7 +1041,10 @@ mod layout_tests {
     #[test]
     fn classic_phone_picker_has_four_icon_rows() {
         // A visible status bar leaves `UIScreen.applicationFrame` at 320x460.
-        assert_eq!(app_picker_icon_grid_num_rows(460.0, 12.0), APP_PICKER_ICON_ROWS);
+        assert_eq!(
+            app_picker_icon_grid_num_rows(460.0, 12.0),
+            APP_PICKER_ICON_ROWS
+        );
     }
 }
 
@@ -987,6 +1062,11 @@ struct IconGridStuff {
     plus_icon: Option<id>,
     pages: Vec<std::ops::Range<usize>>,
     icon_map: HashMap<id, TappedIcon>,
+    /// All pages live in one paging `UIScrollView`, built up front, so the
+    /// user can swipe horizontally between them instead of tapping arrows.
+    icon_scroll_view: id,
+    page_control: id,
+    page_width: CGFloat,
 }
 
 fn make_icon_grid(
@@ -1019,77 +1099,116 @@ fn make_icon_grid(
         y: grid_top,
     };
 
+    let slots_per_page = num_cols * num_rows;
+    let pages = compute_pages(slots_per_page, total_app_count);
+    let page_width = app_frame.size.width;
+    let grid_height = (num_rows as CGFloat) * (ICON_SIZE.height + icon_gap_y);
+
+    let icon_scroll_view: id = msg_class![env; UIScrollView alloc];
+    let icon_scroll_view: id = msg![env; icon_scroll_view initWithFrame:(CGRect {
+        origin: CGPoint { x: 0.0, y: grid_top },
+        size: CGSize {
+            width: page_width,
+            height: grid_height,
+        },
+    })];
+    () = msg![env; icon_scroll_view setTag:ICON_SCROLL_TAG];
+    () = msg![env; icon_scroll_view setDelegate:delegate];
+    () = msg![env; icon_scroll_view setPagingEnabled:true];
+    () = msg![env; icon_scroll_view setDelaysContentTouches:false];
+    () = msg![env; icon_scroll_view setCanCancelContentTouches:true];
+    () = msg![env; icon_scroll_view setScrollEnabled:true];
+    () = msg![env; icon_scroll_view setBounces:true];
+    () = msg![env; icon_scroll_view setAlwaysBounceHorizontal:(pages.len() > 1)];
+    () = msg![env; icon_scroll_view setAlwaysBounceVertical:false];
+    () = msg![env; icon_scroll_view setShowsHorizontalScrollIndicator:false];
+    () = msg![env; icon_scroll_view setShowsVerticalScrollIndicator:false];
+    () = msg![env; icon_scroll_view setContentSize:(CGSize {
+        width: page_width * pages.len() as CGFloat,
+        height: grid_height,
+    })];
+    () = msg![env; main_view addSubview:icon_scroll_view];
+
+    let page_control: id = msg_class![env; UIPageControl alloc];
+    let page_control: id = msg![env; page_control initWithFrame:(CGRect {
+        origin: CGPoint {
+            x: 0.0,
+            y: (grid_top + grid_height + 2.0).min(app_frame.size.height - 24.0),
+        },
+        size: CGSize {
+            width: page_width,
+            height: 20.0,
+        },
+    })];
+    let page_count: NSInteger = pages.len() as NSInteger;
+    () = msg![env; page_control setNumberOfPages:page_count];
+    () = msg![env; page_control setCurrentPage:0];
+    () = msg![env; page_control setHidesForSinglePage:true];
+    () = msg![env; page_control setUserInteractionEnabled:false];
+    () = msg![env; main_view addSubview:page_control];
+
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
 
     let mut icon_buttons_and_labels = Vec::new();
 
-    for i in 0..(num_cols * num_rows) {
-        let col = i % num_cols;
-        let row = i / num_cols;
+    for page in 0..pages.len() {
+        for i in 0..slots_per_page {
+            let col = i % num_cols;
+            let row = i / num_cols;
 
-        // Rounding is needed here to avoid a blurry or offset image.
-        let icon_frame = CGRect {
-            origin: CGPoint {
-                x: (icon_grid_origin.x + (col as CGFloat) * (ICON_SIZE.width + icon_gap_x)).round(),
-                y: (icon_grid_origin.y + (row as CGFloat) * (ICON_SIZE.height + icon_gap_y))
-                    .round(),
-            },
-            size: ICON_SIZE,
-        };
-        let icon_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-        () = msg![env; icon_button setFrame:icon_frame];
-        let image_view: id = msg![env; icon_button imageView];
-        let bounds: CGRect = msg![env; icon_button bounds];
-        let inset = ICON_IMAGE_INSET;
-        () = msg![env; image_view setFrame:(CGRect {
-            origin: CGPoint { x: inset, y: inset },
-            size: CGSize {
-                width: (bounds.size.width - inset * 2.0).max(1.0),
-                height: (bounds.size.height - inset * 2.0).max(1.0),
-            },
-        })];
-        let layer: id = msg![env; image_view layer];
-        let gravity = ns_string::get_static_str(env, "resizeAspect");
-        () = msg![env; layer setContentsGravity:gravity];
-        () = msg![env; icon_button addTarget:delegate
-                                      action:icon_tapped_sel
-                            forControlEvents:UIControlEventTouchUpInside];
-        () = msg![env; main_view addSubview:icon_button];
+            // Rounding is needed here to avoid a blurry or offset image. Icons
+            // are placed in page-local coordinates; each page's origin is
+            // `page_width * page` inside the scroll view's content area.
+            let icon_frame = CGRect {
+                origin: CGPoint {
+                    x: (page_width * page as CGFloat
+                        + icon_grid_origin.x
+                        + (col as CGFloat) * (ICON_SIZE.width + icon_gap_x))
+                        .round(),
+                    y: ((row as CGFloat) * (ICON_SIZE.height + icon_gap_y)).round(),
+                },
+                size: ICON_SIZE,
+            };
+            let icon_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+            let icon_button: id = msg![env;
+                icon_button initWithFrame:icon_frame
+            ];
+            () = msg![env; icon_button addTarget:delegate action:icon_tapped_sel forControlEvents:UIControlEventTouchUpInside];
+            () = msg![env; icon_button setImage:nil forState:UIControlStateNormal];
+            () = msg![env; icon_button setEnabled:false];
+            () = msg![env; (icon_scroll_view) addSubview:icon_button];
 
-        // Rounding is needed here to avoid blurry text.
-        let label_frame = CGRect {
-            origin: CGPoint {
-                x: (icon_frame.origin.x - (label_size.width - ICON_SIZE.width) / 2.0).round(),
-                y: (icon_frame.origin.y + ICON_SIZE.height + ICON_LABEL_TOP_GAP).round(),
-            },
-            size: label_size,
-        };
-        let label: id = msg_class![env; UILabel alloc];
-        let label: id = msg![env; label initWithFrame:label_frame];
-        () = msg![env; label setTextAlignment:UITextAlignmentCenter];
-        let font_size: CGFloat = label_size.height - 2.0;
-        let font: id = if have_wallpaper {
-            msg_class![env; UIFont systemFontOfSize:font_size]
-        } else {
-            msg_class![env; UIFont boldSystemFontOfSize:font_size]
-        };
-        () = msg![env; label setFont:font];
-        let text_color: id = if have_wallpaper {
-            msg_class![env; UIColor whiteColor]
-        } else {
-            msg_class![env; UIColor lightGrayColor]
-        };
-        () = msg![env; label setTextColor:text_color];
-        let bg_color: id = msg_class![env; UIColor clearColor];
-        () = msg![env; label setBackgroundColor:bg_color];
-        () = msg![env; main_view addSubview:label];
+            // Rounding is needed here to avoid blurry text.
+            let label_frame = CGRect {
+                origin: CGPoint {
+                    x: (icon_frame.origin.x - (label_size.width - ICON_SIZE.width) / 2.0).round(),
+                    y: (icon_frame.origin.y + ICON_SIZE.height + ICON_LABEL_TOP_GAP).round(),
+                },
+                size: label_size,
+            };
+            let label: id = msg_class![env; UILabel alloc];
+            let label: id = msg![env; label initWithFrame:label_frame];
+            () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+            let font_size: CGFloat = label_size.height - 2.0;
+            let font: id = if have_wallpaper {
+                msg_class![env; UIFont systemFontOfSize:font_size]
+            } else {
+                msg_class![env; UIFont boldSystemFontOfSize:font_size]
+            };
+            () = msg![env; label setFont:font];
+            let text_color: id = if have_wallpaper {
+                msg_class![env; UIColor whiteColor]
+            } else {
+                msg_class![env; UIColor lightGrayColor]
+            };
+            () = msg![env; label setTextColor:text_color];
+            let bg_color: id = msg_class![env; UIColor clearColor];
+            () = msg![env; label setBackgroundColor:bg_color];
+            () = msg![env; (icon_scroll_view) addSubview:label];
 
-        icon_buttons_and_labels.push((icon_button, label));
+            icon_buttons_and_labels.push((icon_button, label));
+        }
     }
-
-    // TODO: Use UIScrollView pagination and UIPageControl once available.
-    let total_slots = icon_buttons_and_labels.len();
-    let pages = compute_pages(total_slots, total_app_count);
 
     IconGridStuff {
         icon_buttons_and_labels,
@@ -1099,6 +1218,9 @@ fn make_icon_grid(
         plus_icon: None,
         pages,
         icon_map: HashMap::new(),
+        icon_scroll_view,
+        page_control,
+        page_width,
     }
 }
 
@@ -1206,6 +1328,10 @@ fn make_icon_from_glyph(
     ui_image
 }
 
+/// Fill in every page of the icon scroll view with the current app list.
+///
+/// `page_idx` is the page that should be scrolled into view (e.g. the page
+/// the user was on before the grid was rebuilt).
 fn update_icon_grid(
     env: &mut Environment,
     icon_grid_stuff: &mut IconGridStuff,
@@ -1213,84 +1339,98 @@ fn update_icon_grid(
     page_idx: usize,
 ) {
     icon_grid_stuff.icon_map.clear();
-
-    let app_idx_range = icon_grid_stuff.pages[page_idx].clone();
-    let have_prev_icon = page_idx != 0;
-    let have_next_icon = app_idx_range.end != apps.len();
-
+    let selected_page = page_idx.min(icon_grid_stuff.pages.len().saturating_sub(1));
     let mut icon_iter = icon_grid_stuff.icon_buttons_and_labels.iter();
 
-    if have_prev_icon {
-        let &(icon_button, label) = icon_iter.next().unwrap();
-        let image = *icon_grid_stuff.prev_icon.get_or_insert_with(|| {
-            make_icon_from_glyph(env, '←', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
-        });
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::ChangePage(page_idx - 1));
-    }
+    for page in 0..icon_grid_stuff.pages.len() {
+        let app_idx_range = icon_grid_stuff.pages[page].clone();
+        let have_prev_icon = page != 0;
+        let have_plus_icon = page == 0;
+        let have_next_icon = app_idx_range.end != apps.len();
 
-    // The iOS-style "+" tile on the first page lets the user add a new app
-    // by picking an .ipa file, which then gets copied into the apps folder.
-    if page_idx == 0 {
-        let &(icon_button, label) = icon_iter.next().unwrap();
-        let image = *icon_grid_stuff.plus_icon.get_or_insert_with(|| {
-            make_icon_from_glyph(env, '+', 50.0, -6.0, (0.25, 0.25, 0.25, 1.0))
-        });
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::AddIpa);
-    }
-
-    for app_idx in app_idx_range.clone() {
-        let app = &mut apps[app_idx];
-
-        let &(icon_button, label) = icon_iter.next().unwrap();
-
-        if let Some(icon) = app.icon.take() {
-            let image = cg_image::from_image(env, icon);
-            let image: id = msg_class![env; UIImage imageWithCGImage:image];
-            app.icon_ui_image = Some(image);
+        if have_prev_icon {
+            let &(icon_button, label) = icon_iter.next().unwrap();
+            let image = *icon_grid_stuff.prev_icon.get_or_insert_with(|| {
+                make_icon_from_glyph(env, '\u{2190}', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
+            });
+            () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
+            () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
+            icon_grid_stuff
+                .icon_map
+                .insert(icon_button, TappedIcon::ChangePage(page - 1));
         }
 
-        let image = app.icon_ui_image.unwrap_or_else(|| {
-            *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
-                make_icon_from_glyph(env, '?', 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
-            })
-        });
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
+        if have_plus_icon {
+            let &(icon_button, label) = icon_iter.next().unwrap();
+            let image = *icon_grid_stuff.plus_icon.get_or_insert_with(|| {
+                make_icon_from_glyph(env, '+', 50.0, -6.0, (0.25, 0.25, 0.25, 1.0))
+            });
+            () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
+            () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
+            icon_grid_stuff
+                .icon_map
+                .insert(icon_button, TappedIcon::AddIpa);
+        }
 
-        let text = *app
-            .display_name_ns_string
-            .get_or_insert_with(|| ns_string::from_rust_string(env, app.display_name.clone()));
-        () = msg![env; label setText:text];
+        for app_idx in app_idx_range.clone() {
+            let app = &mut apps[app_idx];
 
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::App(app_idx));
+            let &(icon_button, label) = icon_iter.next().unwrap();
+
+            if let Some(icon) = app.icon.take() {
+                let cg_image = cg_image::from_image(env, icon);
+                let image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
+                app.icon_ui_image = Some(image);
+            }
+
+            let image = app.icon_ui_image.unwrap_or_else(|| {
+                *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
+                    make_icon_from_glyph(env, '?', 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
+                })
+            });
+            () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
+
+            let text = *app
+                .display_name_ns_string
+                .get_or_insert_with(|| ns_string::from_rust_string(env, app.display_name.clone()));
+            () = msg![env; label setText:text];
+
+            icon_grid_stuff
+                .icon_map
+                .insert(icon_button, TappedIcon::App(app_idx));
+        }
+
+        if have_next_icon {
+            let &(icon_button, label) = icon_iter.next().unwrap();
+            let image = *icon_grid_stuff.next_icon.get_or_insert_with(|| {
+                make_icon_from_glyph(env, '\u{2192}', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
+            });
+            () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
+            () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
+            icon_grid_stuff
+                .icon_map
+                .insert(icon_button, TappedIcon::ChangePage(page + 1));
+        }
     }
 
-    if have_next_icon {
-        let &(icon_button, label) = icon_iter.next().unwrap();
-        let image = *icon_grid_stuff.next_icon.get_or_insert_with(|| {
-            make_icon_from_glyph(env, '→', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
-        });
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::ChangePage(page_idx + 1));
-    }
-
-    // There may be remaining spaces might need to be blanked.
+    // Slots past the end of the app list (only possible on the last page)
+    // stay blank.
     for &(icon_button, label) in icon_iter {
         () = msg![env; icon_button setImage:nil forState:UIControlStateNormal];
         () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
     }
+
+    () = msg![env; (icon_grid_stuff.icon_scroll_view) setContentOffset:(CGPoint {
+        x: icon_grid_stuff.page_width * selected_page as CGFloat,
+        y: 0.0,
+    })];
+    let page: NSInteger = selected_page as NSInteger;
+    () = msg![env; (icon_grid_stuff.page_control) setCurrentPage:page];
+}
+
+fn remove_icon_grid(env: &mut Environment, icon_grid_stuff: &IconGridStuff) {
+    () = msg![env; (icon_grid_stuff.icon_scroll_view) removeFromSuperview];
+    () = msg![env; (icon_grid_stuff.page_control) removeFromSuperview];
 }
 
 fn make_button_row(
@@ -1930,7 +2070,10 @@ mod quick_options_gles_native_tests {
 
         let mut enabled = quick_options_gles_native_enabled(&options);
         assert!(!enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--no-gles-native");
+        assert_eq!(
+            quick_options_gles_native_argument(enabled),
+            "--no-gles-native"
+        );
 
         options.parse_argument("--gles-native").unwrap();
         enabled = quick_options_gles_native_enabled(&options);
@@ -1940,6 +2083,9 @@ mod quick_options_gles_native_tests {
         options.parse_argument("--no-gles-native").unwrap();
         enabled = quick_options_gles_native_enabled(&options);
         assert!(!enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--no-gles-native");
+        assert_eq!(
+            quick_options_gles_native_argument(enabled),
+            "--no-gles-native"
+        );
     }
 }
