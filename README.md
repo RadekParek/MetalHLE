@@ -20,19 +20,19 @@ The titles below have been tested with HyperHLE-Fork and are known to run. Compa
 
 - N.O.V.A. 3 (Playable)
 - Gangstar Vegas (Unplayable)
-- Geometry Dash (2.11 and 1.0 + Playable)
-- Terraria (1.0 + Playable)
-- Modern Combat 3 (1.5.0 + Playable)
+- Geometry Dash (2.11 and 1.0 + playable)
+- Terraria (1.0 + playable)
+- Modern Combat 3 (1.5.0 + playable)
 - Asphalt 7 (Playable)
-- Turbo Dismount (Pretty Playable)
+- Turbo Dismount (Pretty playable)
 - Scarface (Playable)
 - Zombie Safari (Playable)
-- Real Racing 1 (Playable
-- Silent Ops (Playable
+- Real Racing 1 (Playable)
+- Silent Ops (Playable)
 - Need For Speed: Most Wanted (Unplayable)
 - Minecraft 0.14.2-0.16.2 (Playable)
 - Oceanhorn (Unplayable)
-- Asphalt 8 (1.0.0) (Maybe playable)
+- Asphalt 8 (1.0.0 + maybe playable)
 - And more more games
 
 ## Build and documentation
