@@ -15,6 +15,7 @@ Changes are categorised as follows:
 
 ## NEXT
 
+- Fixed the release pipeline versioning: the release scripts still computed `v1.0.x` tags while the project is MetalHLE 2.0, and `prepare-release.sh` was not executable in the repo (CI packaging died with "Permission denied"). Version selection now emits `v2.0.x`, and the script mode is fixed.
 - Fixed the desktop release bundles: the Linux, Windows and macOS bundle scripts referenced a root-level `touchHLE_wallpaper.png` that never existed in this repository, so every "Create bundle" CI job failed. They now ship `res/MetalHLE_v7_wallpaper.png` (the first name the app picker searches for).
 - Merged KlugKlugTG upstream `trunk` (Asphalt 8 detached-EAGL-view fix re-applied on top of the rewritten present path, README refresh, CI merge): orphaned EAGL drawables now re-attach to the root layer, with the fullscreen-layer fallback the rework needed.
 - Fixed the release publish job: `prepare-release.sh` still copied a root-level `touchHLE_wallpaper.png` that never existed, so packaging failed after all builds succeeded; it now ships `res/MetalHLE_v7_wallpaper.png` like the bundle scripts. Rebranded README.md to MetalHLE (keeping Klug's compatibility-list fixes).

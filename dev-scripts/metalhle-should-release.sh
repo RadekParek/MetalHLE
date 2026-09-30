@@ -1,17 +1,17 @@
 #!/bin/sh
-# Decide whether to publish a MetalHLE release and which v1.0.x tag to use.
-# A release is due every 5 commits on HEAD since the latest v1.0.* tag, or since
+# Decide whether to publish a MetalHLE release and which v2.0.x tag to use.
+# A release is due every 5 commits on HEAD since the latest v2.0.* tag, or since
 # the commit that introduced metalhle release automation when no tag exists yet.
 set -eu
 
 RELEASE_EVERY=5
 WORKFLOW_MARKER="dev-scripts/metalhle-should-release.sh"
 
-latest_tag="$(git tag -l 'v1.0.*' --sort=-v:refname | head -n 1 || true)"
+latest_tag="$(git tag -l 'v2.0.*' --sort=-v:refname | head -n 1 || true)"
 
 if [ -n "$latest_tag" ]; then
     commits_since="$(git rev-list --count "${latest_tag}..HEAD")"
-    patch="${latest_tag#v1.0.}"
+    patch="${latest_tag#v2.0.}"
     next_patch=$((patch + 1))
 else
     baseline="$(git rev-list -n 1 HEAD -- "$WORKFLOW_MARKER" 2>/dev/null || true)"
@@ -23,7 +23,7 @@ else
     next_patch=0
 fi
 
-version="v1.0.${next_patch}"
+version="v2.0.${next_patch}"
 
 if [ "${FORCE_METALHLE_RELEASE:-}" = "true" ]; then
     should_release=true
