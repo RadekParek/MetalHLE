@@ -570,7 +570,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     }
     echo!();
     // Apply command-line options
+    let mut cli_disabled_trace_gl_errors = false;
     for option_arg in option_args {
+        if option_arg == "--disable-trace-gl-errors" {
+            cli_disabled_trace_gl_errors = true;
+        }
         match options.parse_argument(&option_arg) {
             Ok(true) => (),
             Ok(false) => log!("Warning: ignoring unknown option {option_arg:?}"),
@@ -609,6 +613,16 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         unsafe {
             std::env::remove_var("TOUCHHLE_CORE_AUDIO");
         }
+    }
+    // MetalHLE 2.0: GL error tracing is on by default for every build so
+    // regressions like the broken present path produce actionable log lines
+    // instead of silent black/flat frames. Explicit opt-outs are honoured:
+    // --disable-trace-gl-errors on the command line, or the
+    // TOUCHHLE_DISABLE_TRACE_GL_ERRORS=1 environment variable.
+    if !cli_disabled_trace_gl_errors
+        && std::env::var_os("TOUCHHLE_DISABLE_TRACE_GL_ERRORS").is_none()
+    {
+        options.trace_gl_errors = true;
     }
     crate::gles::configure_translator_tracing(options.trace_gl_errors, options.verbose_logging);
     crate::gles::configure_shader_compatibility_fixes(options.shader_compatibility_fixes);

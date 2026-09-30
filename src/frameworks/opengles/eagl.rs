@@ -795,26 +795,56 @@ pub const CLASSES: ClassExports = objc_classes! {
     // compositor must run so its output can be presented without touching the
     // window surface the guest owns.
     if drawable == fullscreen_layer && !guest_renders_into_default_fb {
-        let presentation_mode = {
+        // Decide between presenting on the GPU (copy the renderbuffer into a
+        // texture and draw it into the window -- cheap) and reading the frame
+        // back to RAM and pushing it through the compositor (a full pipeline
+        // stall plus two full-frame copies per frame -- very slow, but it
+        // never touches the app's GL state).
+        //
+        // Policy restored from the proven e52493cb behaviour: native ES 1.1
+        // and translator backends default to readback. The GPU-copy path
+        // mutates guest-visible fixed-function state in ways 2D engines
+        // (cocos2d etc.) notice -- sprite blending/tinting breaks, up to a
+        // flat single-colour screen -- so it is only the default for ES 2.0
+        // backends, where its save/restore is exact. Set
+        // TOUCHHLE_FORCE_PRESENT_READBACK=1 to force readback on an ES 2.0
+        // backend whose direct presenter misbehaves.
+        let (backend_is_translator, backend_is_native_es1, backend_is_es2) = {
             let maybe_gles = super::sync_context(
                 &mut env.framework_state.opengles,
                 &mut env.objc,
                 env.window.as_mut().unwrap(),
                 env.current_thread,
             );
-            maybe_gles.map(|gles| {
-                if gles.is_translator() {
-                    "translator-readback"
-                } else {
-                    "shader-direct"
-                }
-            })
+            maybe_gles
+                .map(|gles| (gles.is_translator(), gles.is_native_es1(), gles.is_es2()))
+                .unwrap_or((false, false, false))
         };
-        if matches!(presentation_mode, Some("translator-readback")) {
-            log_once_fmt!(
-                "Layer {:?} uses {}; presenting renderbuffer {:?} through resolved RAM readback to preserve tile contents and alpha.",
+        let force_readback = std::env::var_os("TOUCHHLE_FORCE_PRESENT_READBACK").is_some();
+        let use_readback =
+            backend_is_translator || backend_is_native_es1 || (backend_is_es2 && force_readback);
+        {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                log!(
+                    "EAGL presenter: fullscreen layer {:?} will be presented via {} (translator={}, native_es1={}, es2={}, force_readback={}) [this log will only be shown once]",
+                    drawable,
+                    if use_readback {
+                        "glReadPixels readback + compositor"
+                    } else {
+                        "GPU copy (direct)"
+                    },
+                    backend_is_translator,
+                    backend_is_native_es1,
+                    backend_is_es2,
+                    force_readback,
+                );
+            });
+        }
+        if use_readback {
+            log_dbg!(
+                "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} through RAM readback.",
                 drawable,
-                presentation_mode.unwrap_or("unknown"),
                 renderbuffer,
             );
             unsafe {

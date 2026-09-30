@@ -84,7 +84,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let state = &mut env.framework_state.foundation.url_protocol;
     if let Some(pos) = state.registered_classes.iter().position(|&c| c == protocol_class) {
         state.registered_classes.remove(pos);
-        drop(state);
+        let _ = &state;
         release(env, protocol_class);
     }
 }

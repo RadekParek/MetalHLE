@@ -15,6 +15,9 @@ Changes are categorised as follows:
 
 ## NEXT
 
+- Restored the proven EAGL present policy from the last known-good render build: native ES 1.1 and translator backends default back to the glReadPixels readback presenter (the GPU-copy fast path mutates guest-visible fixed-function state and rendered flat single-colour screens on 2D engines); ES 2.0 backends keep the fast path, with `TOUCHHLE_FORCE_PRESENT_READBACK=1` as a manual override. Apps rendering into the default framebuffer still go through the compositor.
+- GL error tracing is now on by default (settings toggle and `--disable-trace-gl-errors` still opt out), and `presentRenderbuffer:` checkpoints, state snapshots and renderbuffer probes log under it when a backend misbehaves.
+- Fixed `putchar()` to handle partial writes (`write_all`), silencing a clippy error.
 - Fixed the release pipeline versioning: the release scripts still computed `v1.0.x` tags while the project is MetalHLE 2.0, and `prepare-release.sh` was not executable in the repo (CI packaging died with "Permission denied"). Version selection now emits `v2.0.x`, and the script mode is fixed.
 - Fixed the desktop release bundles: the Linux, Windows and macOS bundle scripts referenced a root-level `touchHLE_wallpaper.png` that never existed in this repository, so every "Create bundle" CI job failed. They now ship `res/MetalHLE_v7_wallpaper.png` (the first name the app picker searches for).
 - Merged KlugKlugTG upstream `trunk` (Asphalt 8 detached-EAGL-view fix re-applied on top of the rewritten present path, README refresh, CI merge): orphaned EAGL drawables now re-attach to the root layer, with the fullscreen-layer fallback the rework needed.
