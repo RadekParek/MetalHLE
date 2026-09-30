@@ -9,8 +9,8 @@ use crate::abi::DotDotDot;
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::fs::{FsError, GuestPath};
 use crate::libc::errno::{
-    set_errno, EACCES, EEXIST, EFAULT, EINVAL, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, ENOTSUP, ENOTTY,
-    EPERM,
+    set_errno, EACCES, EEXIST, EFAULT, EINVAL, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM,
+    EROFS,
 };
 use crate::libc::posix_io::{FileDescriptor, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use crate::mem::{ConstPtr, GuestISize, GuestUSize, MutPtr, PAGE_SIZE};
@@ -24,6 +24,12 @@ const F_OK: i32 = 0; // file existence
 const X_OK: i32 = 1; // execute/search permission
 const W_OK: i32 = 2; // write permission
 const R_OK: i32 = 4; // read permission
+const B_OK: i32 = 5;
+const T_OK: i32 = 6;
+const P_OK: i32 = 7;
+const A_OK: i32 = 8;
+const C_OK: i32 = 9;
+const D_OK: i32 = 10;
 
 type SysConfName = i32;
 const _SC_ARG_MAX: SysConfName = 1;
@@ -62,7 +68,7 @@ const _SC_MONOTONIC_CLOCK: SysConfName = 201;
 const _SC_THREAD_SAFE_FUNCTIONS: SysConfName = 202;
 
 fn sleep(env: &mut Environment, seconds: u32) -> u32 {
-    env.sleep_guest(Duration::from_secs(seconds.into()));
+    env.sleep(Duration::from_secs(seconds.into()));
     // sleep() returns the amount of time remaining that should have been slept,
     // but wasn't, if the thread was woken up early by a signal.
     // touchHLE never does that currently, so 0 is always correct here.
@@ -70,15 +76,10 @@ fn sleep(env: &mut Environment, seconds: u32) -> u32 {
 }
 
 fn usleep(env: &mut Environment, useconds: useconds_t) -> i32 {
-    // POSIX: an interval of one second or more is invalid and fails with
-    // EINVAL without sleeping. A valid interval must not clobber errno.
-    if useconds >= 1_000_000 {
-        log_dbg!("usleep({useconds}) -> -1, EINVAL (interval of 1s or more)");
-        set_errno(env, EINVAL);
-        return -1;
-    }
+    // TODO: handle errno properly
+    set_errno(env, 0);
 
-    env.sleep_guest(Duration::from_micros(useconds.into()));
+    env.sleep(Duration::from_micros(useconds.into()));
     0 // success
 }
 
@@ -86,7 +87,7 @@ fn alarm(_env: &mut Environment, seconds: u32) -> u32 {
     // touchHLE does not currently deliver Unix signals. These games use alarm
     // only around best-effort network/service checks, so accepting/cancelling
     // it without a pending signal matches the non-blocking path they need.
-    log_dbg!("alarm({seconds}) -> 0 (signals are not emulated)");
+    log_dbg!("TODO: alarm({seconds}) -> 0 (signals are not emulated)");
     0
 }
 
@@ -122,18 +123,20 @@ fn geteuid(env: &mut Environment) -> gid_t {
 }
 
 fn isatty(env: &mut Environment, fd: FileDescriptor) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     if [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO].contains(&fd) {
         1
     } else {
-        // POSIX: isatty() on a non-terminal descriptor returns 0 with errno
-        // ENOTTY. Our std streams are pipes rather than ttys, but reporting
-        // them as ttys is harmless and keeps line-buffered logging sane.
-        set_errno(env, ENOTTY);
         0
     }
 }
 
 fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     let binding = match env.mem.cstr_at_utf8(path) {
         Ok(s) => s.to_owned(),
         Err(bytes) => {
@@ -146,55 +149,120 @@ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
             return -1;
         }
     };
-    // Keep `access` in lockstep with stat/open.  Unity uses access() as an
-    // existence probe for Data/data.unity3d on some player versions, so a
-    // case-only or stale-bundle-path mismatch must not make it reject a file
-    // that open() would successfully load.
-    let Some(resolved_binding) =
-        crate::libc::posix_io::resolve_existing_guest_path(env, &binding)
-    else {
-        env.note_missing_unity_player_archive(&binding);
-        set_errno(env, ENOENT);
-        return -1;
+    let resolved_binding = if !binding.starts_with('/') && !env.fs.exists(GuestPath::new(&binding))
+    {
+        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+        let relative = binding.strip_prefix("Data/").unwrap_or(&binding);
+        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
+        let candidate = format!("{bundle_root}/Data/{relative}");
+        if env.fs.exists(GuestPath::new(&candidate)) {
+            candidate
+        } else {
+            binding.clone()
+        }
+    } else {
+        binding.clone()
     };
     let guest_path = GuestPath::new(&resolved_binding);
     let (exists, read, write, execute) = env.fs.access(guest_path);
-    // POSIX access() takes a bitmask: modes can be ORed together
-    // (e.g. R_OK | W_OK). Check every requested bit; all must pass.
-    if mode == F_OK {
-        if exists {
-            0
-        } else {
-            set_errno(env, ENOENT);
-            -1
+    // TODO: support ORing
+    match mode {
+        F_OK => {
+            if exists {
+                0
+            } else {
+                set_errno(env, ENOENT);
+                -1
+            }
         }
-    } else {
-        // POSIX access() accepts any combination of F_OK/R_OK/W_OK/X_OK;
-        // reject unknown mode bits with EINVAL.
-        let valid_mode_bits = F_OK | R_OK | W_OK | X_OK;
-        if mode & !valid_mode_bits != mode || mode == 0 {
-            // Unknown mode bits: real access() returns -1 with EINVAL.
+        X_OK => {
+            if execute {
+                0
+            } else {
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        W_OK => {
+            if write {
+                0
+            } else {
+                set_errno(env, EROFS);
+                -1
+            }
+        }
+        R_OK => {
+            if read {
+                0
+            } else {
+                // TODO: is it the correct error?
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        B_OK => {
+            if read {
+                0
+            } else {
+                // TODO: is it the correct error?
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        T_OK => {
+            if read {
+                0
+            } else {
+                // TODO: is it the correct error?
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        P_OK => {
+            if read {
+                0
+            } else {
+                // TODO: is it the correct error?
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        A_OK => {
+            if read {
+                0
+            } else {
+                // TODO: is it the correct error?
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        C_OK => {
+            if read {
+                0
+            } else {
+                // TODO: is it the correct error?
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        D_OK => {
+            if read {
+                0
+            } else {
+                // TODO: is it the correct error?
+                set_errno(env, EACCES);
+                -1
+            }
+        }
+        _ => {
+            // Real access() returns -1 with EINVAL for unknown modes. Match
+            // that instead of crashing the host on a malformed guest call.
             log!(
                 "Warning: access(): unknown mode {:#x}; returning EINVAL.",
                 mode
             );
             set_errno(env, EINVAL);
             -1
-        } else {
-            let mut result = 0;
-            if mode & R_OK != 0 && !read {
-                set_errno(env, EACCES);
-                result = -1;
-            }
-            if result == 0 && mode & W_OK != 0 && !write {
-                set_errno(env, EACCES);
-                result = -1;
-            }
-            if result == 0 && mode & X_OK != 0 && !execute {
-                set_errno(env, EACCES);
-                result = -1;
-            }
-            result
         }
     }
 }
@@ -202,9 +270,7 @@ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
 fn fork(env: &mut Environment) -> i32 {
     // fork() is not supported in touchHLE — iOS does not support forking
     // Return -1 and set errno to ENOSYS
-    // Real iOS never allows fork(), and games calling it on-device would get
-    // the same failure, so this warning is once-per-process noise reduction.
-    log_once!("fork() called: not supported on iOS (returns -1/ENOSYS)");
+    log!("Warning: fork() called but is not supported on iOS, returning -1");
     set_errno(env, ENOSYS);
     -1
 }
@@ -413,9 +479,10 @@ fn symlink(env: &mut Environment, path1: ConstPtr<u8>, path2: ConstPtr<u8>) -> i
 }
 
 fn gethostname(env: &mut Environment, name: MutPtr<u8>, namelen: GuestUSize) -> i32 {
-    // A unique per-device hostname needs networking support; until then
-    // this hardcoded name matches the emulator's advertised identity.
-    let hostname = "touchHLE";
+    // Real hostname derived from the emulated device, consistent with
+    // sysctl hw.machine (e.g. "iPhone2,1") — networked games embed it in
+    // packets and match against peer names.
+    let hostname = env.window().device_family().machine_name().to_owned();
     let len: GuestUSize = hostname.len().try_into().unwrap();
     if namelen <= len {
         // POSIX: name buffer too small -> ENAMETOOLONG. Don't crash the host.
@@ -468,9 +535,8 @@ fn readlink(
 }
 
 fn getdtablesize(_env: &mut Environment) -> i32 {
-    // Both macOS 15.7.4 and iOS 4.0.1 report the same dtable size. The
-    // matching EMFILE check on open() lives with the descriptor table in
-    // posix_io.rs.
+    // Both macOS 15.7.4 and iOS 4.0.1 reports same dtable size.
+    // TODO: Issue an error on `open` if table is full.
     256
 }
 
@@ -551,8 +617,6 @@ fn fchmod(_env: &mut Environment, _fd: i32, _mode: u32) -> i32 {
 // Darwin/XNU `<sys/syscall.h>` selector numbers used by the few syscalls
 // touchHLE knows how to implement directly. The full list is enormous; we
 // only enumerate the ones we resolve here.
-const SYS_FORK: i32 = 2;
-const SYS_STAT: i32 = 188;
 const SYS_THREAD_SELFID: i32 = 372;
 const SYS_GETPID: i32 = 20;
 const SYS_GETPPID: i32 = 39;
@@ -578,16 +642,9 @@ const SYS_GETEGID: i32 = 43;
 /// `syscall(SYS_thread_selfid)` etc, and return `-1` with `errno = ENOSYS`
 /// for every other selector, which is exactly the contract Apple's
 /// kernel uses for selectors the host doesn't implement.
-fn syscall(env: &mut Environment, number: i32, args: DotDotDot) -> i32 {
+fn syscall(env: &mut Environment, number: i32, _args: DotDotDot) -> i32 {
     log_dbg!("syscall({}) called", number);
     match number {
-        SYS_FORK => self::fork(env),
-        SYS_STAT => {
-            let mut args = args.start();
-            let path: ConstPtr<u8> = args.next(env);
-            let buffer: MutPtr<crate::libc::posix_io::stat::stat> = args.next(env);
-            crate::libc::posix_io::stat::stat(env, path, buffer)
-        }
         SYS_GETPID => self::getpid(env),
         SYS_GETPPID => self::getppid(env),
         SYS_GETUID => self::getuid(env) as i32,

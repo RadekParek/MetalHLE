@@ -129,11 +129,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)boldSystemFontOfSize:(CGFloat)size {
-    let size = if size.is_finite() && size > 0.0 {
-        size
-    } else {
-        14.0
-    };
     let host_object = UIFontHostObject {
         size,
         kind: FontKind::SansBold,

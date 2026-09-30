@@ -9,30 +9,11 @@
 use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles_generic::GLES;
-use super::util::{try_decode_pvrtc, PalettedTextureFormat};
+use super::util::{try_decode_pvrtc, try_decode_pvrtc_sub, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::marker::PhantomData;
-use std::sync::OnceLock;
-
-/// Hardcoded GPU identity strings matching the iPhone (2007) PowerVR MBX
-/// driver. The guest must never see the host desktop GPU, because games
-/// branch on these strings to pick render paths.
-static POWERVR_VENDOR: &[u8] = b"Imagination Technologies\0";
-static POWERVR_RENDERER: &[u8] = b"PowerVR MBXLite with VGPLite\0";
-static POWERVR_VERSION: &[u8] = b"OpenGL ES-CM 1.1 (76)\0";
-
-fn c_string_from_gl(pointer: *const GLubyte) -> String {
-    if pointer.is_null() {
-        return String::new();
-    }
-    unsafe {
-        CStr::from_ptr(pointer as *const _)
-            .to_string_lossy()
-            .into_owned()
-    }
-}
 
 pub struct GLES1NativeContext {
     gl_ctx: GLContext,
@@ -51,60 +32,7 @@ pub struct GLES1NativeContext {
     /// to the first `make_current` because we need a current GL context to
     /// query `GL_EXTENSIONS`.
     pvrtc_native_checked: bool,
-    /// Whether the host ES 1.1 driver exports `glDiscardFramebufferEXT`
-    /// (`GL_EXT_discard_framebuffer`). Checked together with `pvrtc_native`
-    /// in `make_current` (needs a current context to query `GL_EXTENSIONS`).
-    /// Honouring the guest's discard hints lets tile-based mobile GPUs
-    /// (Mali, Adreno, PowerVR) skip writing depth/stencil tile memory back to
-    /// system RAM at the end of a frame.
     discard_ext: bool,
-    discard_ext_checked: bool,
-}
-
-/// Texture parameters that only exist in OpenGL ES 2.0+ (or are otherwise
-/// invalid for ES 1.1). Games ported from other platforms routinely set them
-/// unconditionally (e.g. `GL_TEXTURE_WRAP_R` when refreshing a video texture
-/// every frame). Strict ES 1.1 front-ends (ANGLE) reject each call with a
-/// sticky `GL_INVALID_ENUM` that then pollutes the game's own error checks;
-/// lenient iOS-era drivers (PowerVR) silently accepted them. Since these
-/// parameters have no effect in an ES 1.1 pipeline, swallowing them matches
-/// the lenient behaviour and keeps the error queue clean.
-fn is_es2_only_texture_parameter(pname: GLenum) -> bool {
-    // GL_TEXTURE_WRAP_R, GL_TEXTURE_MIN_LOD, GL_TEXTURE_MAX_LOD,
-    // GL_TEXTURE_BASE_LEVEL, GL_TEXTURE_MAX_LEVEL, GL_DEPTH_STENCIL_TEXTURE_MODE,
-    // GL_TEXTURE_COMPARE_MODE, GL_TEXTURE_COMPARE_FUNC, GL_TEXTURE_IMMUTABLE_FORMAT,
-    // GL_TEXTURE_SWIZZLE_R/G/B/A/RGBA, GL_TEXTURE_BORDER_COLOR,
-    // GL_TEXTURE_MAX_ANISOTROPY_EXT, GL_TEXTURE_STORAGE_HINT_APPLE
-    matches!(
-        pname,
-        0x8072 // GL_TEXTURE_WRAP_R
-        | 0x813A // GL_TEXTURE_MIN_LOD
-        | 0x813B // GL_TEXTURE_MAX_LOD
-        | 0x8136 // GL_TEXTURE_BASE_LEVEL
-        | 0x813D // GL_TEXTURE_MAX_LEVEL
-        | 0x84F9 // GL_DEPTH_STENCIL_TEXTURE_MODE
-        | 0x884C // GL_TEXTURE_COMPARE_MODE
-        | 0x884D // GL_TEXTURE_COMPARE_FUNC
-        | 0x912F // GL_TEXTURE_IMMUTABLE_FORMAT
-        | 0x8E42..=0x8E45 // GL_TEXTURE_SWIZZLE_R..GL_TEXTURE_SWIZZLE_RGBA
-        | 0x2804 // GL_TEXTURE_BORDER_COLOR
-        | 0x84FF // GL_TEXTURE_MAX_ANISOTROPY_EXT
-        | 0x85BC // GL_TEXTURE_STORAGE_HINT_APPLE
-    )
-}
-
-/// Whether the mipmapped-NPOT-texture workaround (see `TexImage2D`) is
-/// enabled. Defaults to `true` on Android, mirroring
-/// [crate::options::Options::fix_texture_min_filter]; the
-/// `--fix-texture-min-filter` / `--no-fix-texture-min-filter` flags and the
-/// `TOUCHHLE_FIX_TEXTURE_MIN_FILTER` environment variable override it.
-fn fix_texture_min_filter_enabled() -> bool {
-    static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => cfg!(target_os = "android"),
-    })
 }
 
 impl GLESContext for GLES1NativeContext {
@@ -119,7 +47,6 @@ impl GLESContext for GLES1NativeContext {
             pvrtc_native: false,
             pvrtc_native_checked: false,
             discard_ext: false,
-            discard_ext_checked: false,
         })
     }
 
@@ -127,7 +54,7 @@ impl GLESContext for GLES1NativeContext {
         &'gl_ctx mut self,
         window: &'win mut Window,
     ) -> Box<dyn GLES + 'gl_ctx> {
-        if self.gl_ctx.is_current() && self.is_loaded {
+        if self.gl_ctx.is_current() && self.is_loaded && Window::gl_ctx_bound_on_this_thread() {
             return Box::new(GLES1Native {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
@@ -143,9 +70,7 @@ impl GLESContext for GLES1NativeContext {
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
             self.pvrtc_native = unsafe { detect_pvrtc_support() };
-            self.discard_ext =
-                unsafe { host_extension_present("GL_EXT_discard_framebuffer") };
-            self.discard_ext_checked = true;
+            self.discard_ext = unsafe { host_extension_present("GL_EXT_discard_framebuffer") };
             self.pvrtc_native_checked = true;
             log!(
                 "GLES1Native: GL_IMG_texture_compression_pvrtc {} (PVRTC textures will \
@@ -175,7 +100,7 @@ impl GLESContext for GLES1NativeContext {
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
     ) -> Box<dyn GLES + 'gl_ctx> {
-        if self.gl_ctx.is_current() && self.is_loaded {
+        if self.gl_ctx.is_current() && self.is_loaded && Window::gl_ctx_bound_on_this_thread() {
             return Box::new(GLES1Native {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
@@ -190,7 +115,6 @@ impl GLESContext for GLES1NativeContext {
         if !self.pvrtc_native_checked {
             self.pvrtc_native = detect_pvrtc_support();
             self.discard_ext = host_extension_present("GL_EXT_discard_framebuffer");
-            self.discard_ext_checked = true;
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES1Native {
@@ -203,11 +127,7 @@ impl GLESContext for GLES1NativeContext {
 }
 
 /// Query `GL_EXTENSIONS` on the currently-bound OpenGL ES 1.1 context and
-/// return whether it advertises `GL_IMG_texture_compression_pvrtc`.
-///
-/// Must be called with a current GL context. Returns `false` on any
-/// driver-reported error (NULL string, non-UTF-8 string, missing token);
-/// software-decoding PVRTC is the safe-default behaviour.
+/// return whether it advertises PVRTC. Software decoding is the safe default.
 unsafe fn detect_pvrtc_support() -> bool {
     let raw = gles11::GetString(gles11::EXTENSIONS);
     if raw.is_null() {
@@ -223,17 +143,17 @@ unsafe fn detect_pvrtc_support() -> bool {
         .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
 }
 
-/// Whether the host ES 1.1 driver exports `glDiscardFramebufferEXT`
-/// (`GL_EXT_discard_framebuffer`). Must be called with a current GL context.
 unsafe fn host_extension_present(name: &str) -> bool {
     let raw = gles11::GetString(gles11::EXTENSIONS);
     if raw.is_null() {
         return false;
     }
-    let Ok(s) = CStr::from_ptr(raw as *const _).to_str() else {
+    let Ok(extensions) = CStr::from_ptr(raw as *const _).to_str() else {
         return false;
     };
-    s.split(' ').any(|ext| ext == name)
+    extensions
+        .split_ascii_whitespace()
+        .any(|extension| extension == name)
 }
 
 pub struct GLES1Native<'gl_ctx> {
@@ -254,8 +174,6 @@ pub struct GLES1Native<'gl_ctx> {
     /// time so the per-call `CompressedTexImage2D` path doesn't have to
     /// re-query `GL_EXTENSIONS`.
     pvrtc_native: bool,
-    /// Mirror of [`GLES1NativeContext::discard_ext`]; copied at make_current
-    /// time so the per-call discard path doesn't have to re-query anything.
     discard_ext: bool,
 }
 
@@ -264,31 +182,28 @@ impl GLES for GLES1Native<'_> {
         true
     }
 
-    fn discard_ext_supported(&self) -> bool {
-        self.discard_ext
-    }
-
     unsafe fn DiscardFramebufferEXT(
         &mut self,
         target: GLenum,
         num_attachments: GLsizei,
         attachments: *const GLenum,
     ) -> bool {
-        if !self.discard_ext
-            || target != 0x8D40 // GL_FRAMEBUFFER (not in the ES 1.1 registry)
-            || num_attachments <= 0
-            || attachments.is_null()
-        {
+        if !self.discard_ext || target != 0x8D40 || num_attachments <= 0 || attachments.is_null() {
             return false;
         }
         gles11::DiscardFramebufferEXT(target, num_attachments, attachments);
         true
     }
     unsafe fn driver_description(&self) -> String {
-        let version = c_string_from_gl(gles11::GetString(gles11::VERSION));
-        let vendor = c_string_from_gl(gles11::GetString(gles11::VENDOR));
-        let renderer = c_string_from_gl(gles11::GetString(gles11::RENDERER));
-        format!("{version} / {vendor} / {renderer}")
+        let version = CStr::from_ptr(gles11::GetString(gles11::VERSION) as *const _);
+        let vendor = CStr::from_ptr(gles11::GetString(gles11::VENDOR) as *const _);
+        let renderer = CStr::from_ptr(gles11::GetString(gles11::RENDERER) as *const _);
+        format!(
+            "{} / {} / {}",
+            version.to_string_lossy(),
+            vendor.to_string_lossy(),
+            renderer.to_string_lossy()
+        )
     }
 
     // Generic state manipulation
@@ -381,38 +296,26 @@ impl GLES for GLES1Native<'_> {
         gles11::Flush()
     }
 
+    // MALI HACK: Прячем сломанные расширения
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte {
-        // Hardcoded GPU identity: report the iPhone (2007) PowerVR MBX stack
-        // instead of the host desktop GPU so guest drivers games that key
-        // behavior off renderer strings always take the well-tested path.
-        match name {
-            gles11::VENDOR => return POWERVR_VENDOR.as_ptr() as *const GLubyte,
-            gles11::RENDERER => return POWERVR_RENDERER.as_ptr() as *const GLubyte,
-            gles11::VERSION => return POWERVR_VERSION.as_ptr() as *const GLubyte,
-            _ => {}
-        }
-        if name != gles11::EXTENSIONS {
-            return gles11::GetString(name);
-        }
-
-        static FILTERED_EXTS: OnceLock<Option<CString>> = OnceLock::new();
-        FILTERED_EXTS
-            .get_or_init(|| {
-                let original = c_string_from_gl(gles11::GetString(name));
-                if original.is_empty() {
-                    return None;
+        if name == gles11::EXTENSIONS {
+            static mut FILTERED_EXTS: *mut std::os::raw::c_char = std::ptr::null_mut();
+            if FILTERED_EXTS.is_null() {
+                let orig_ptr = gles11::GetString(name);
+                if !orig_ptr.is_null() {
+                    let orig_str = std::ffi::CStr::from_ptr(orig_ptr as *const _).to_string_lossy();
+                    // Вырезаем OES_matrix_palette чтобы заставить AC2
+                    // использовать CPU анимацию
+                    let filtered = orig_str.replace("GL_OES_matrix_palette", "");
+                    let c_str = std::ffi::CString::new(filtered).unwrap();
+                    FILTERED_EXTS = c_str.into_raw();
+                } else {
+                    return std::ptr::null();
                 }
-                let filtered = original
-                    .split_whitespace()
-                    .filter(|extension| *extension != "GL_OES_matrix_palette")
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                CString::new(filtered).ok()
-            })
-            .as_ref()
-            .map_or(std::ptr::null(), |extensions| {
-                extensions.as_ptr() as *const GLubyte
-            })
+            }
+            return FILTERED_EXTS as *const GLubyte;
+        }
+        gles11::GetString(name)
     }
 
     // Other state manipulation
@@ -620,7 +523,7 @@ impl GLES for GLES1Native<'_> {
         gles11::Normal3x(nx, ny, nz)
     }
 
-    // Pointers - Возвращаем твою изначальную правильную защиту от крашей Mali
+    // Pointers
     unsafe fn ColorPointer(
         &mut self,
         size: GLint,
@@ -628,29 +531,11 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::COLOR_ARRAY);
-                return;
-            }
-        }
         gles11::ColorPointer(size, type_, stride, pointer)
     }
-
     unsafe fn NormalPointer(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::NORMAL_ARRAY);
-                return;
-            }
-        }
         gles11::NormalPointer(type_, stride, pointer)
     }
-
     unsafe fn TexCoordPointer(
         &mut self,
         size: GLint,
@@ -658,17 +543,8 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::TEXTURE_COORD_ARRAY);
-                return;
-            }
-        }
         gles11::TexCoordPointer(size, type_, stride, pointer)
     }
-
     unsafe fn VertexPointer(
         &mut self,
         size: GLint,
@@ -676,14 +552,6 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::VERTEX_ARRAY);
-                return;
-            }
-        }
         gles11::VertexPointer(size, type_, stride, pointer)
     }
 
@@ -708,13 +576,6 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         indices: *const GLvoid,
     ) {
-        if indices.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ELEMENT_ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                return;
-            }
-        }
         gles11::DrawElements(mode, count, type_, indices)
     }
 
@@ -822,39 +683,21 @@ impl GLES for GLES1Native<'_> {
         gles11::BindTexture(target, texture)
     }
     unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, param: GLint) {
-        if is_es2_only_texture_parameter(pname) {
-            return;
-        }
         gles11::TexParameteri(target, pname, param)
     }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) {
-        if is_es2_only_texture_parameter(pname) {
-            return;
-        }
         gles11::TexParameterf(target, pname, param)
     }
     unsafe fn TexParameterx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) {
-        if is_es2_only_texture_parameter(pname) {
-            return;
-        }
         gles11::TexParameterx(target, pname, param)
     }
     unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) {
-        if is_es2_only_texture_parameter(pname) {
-            return;
-        }
         gles11::TexParameteriv(target, pname, params)
     }
     unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
-        if is_es2_only_texture_parameter(pname) {
-            return;
-        }
         gles11::TexParameterfv(target, pname, params)
     }
     unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
-        if is_es2_only_texture_parameter(pname) {
-            return;
-        }
         gles11::TexParameterxv(target, pname, params)
     }
 
@@ -862,7 +705,7 @@ impl GLES for GLES1Native<'_> {
         &mut self,
         target: GLenum,
         level: GLint,
-        internalformat: GLint,
+        mut internalformat: GLint,
         width: GLsizei,
         height: GLsizei,
         border: GLint,
@@ -870,18 +713,10 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        // Strict drivers (ANGLE, Adreno's native ES 1.1) default to
-        // `UNPACK_ALIGNMENT` = 4. Guest uploads whose row stride isn't a
-        // multiple of 4 bytes (RGB/RGB565 textures whose width isn't
-        // divisible by 4 — common in 2D games) then get their rows shifted,
-        // which renders as scrambled / magenta ("pink") texture garbage.
-        // Upload with tightly-packed rows, then restore the host state.
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
+        if format == gles11::BGRA_EXT {
+            internalformat = gles11::BGRA_EXT as GLint;
         }
-        self.tex_image_2d_inner(
+        gles11::TexImage2D(
             target,
             level,
             internalformat,
@@ -891,31 +726,8 @@ impl GLES for GLES1Native<'_> {
             format,
             type_,
             pixels,
-        );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
-        // A guest-set mipmapped `TEXTURE_MIN_FILTER` on a non-power-of-two
-        // level-0 texture makes the texture incomplete on strict drivers:
-        // sampled texels come back undefined (pink/black garbage) instead of
-        // falling back to base-level sampling like lenient drivers do.
-        // Degrade the mipmap filter to its base filtering mode (preserving
-        // the guest's nearest/linear intent). Only for non-power-of-two
-        // dimensions; power-of-two textures support mipmaps everywhere.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
-        {
-            self.fix_mipmap_min_filter(target);
-        }
+        )
     }
-
-
-
-    /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound
-    /// texture to its base filtering mode, preserving the guest's
-    /// nearest/linear intent. See `TexImage2D` for why.
-
 
     unsafe fn TexSubImage2D(
         &mut self,
@@ -929,18 +741,9 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        // Same `UNPACK_ALIGNMENT` row-stride hazard as `TexImage2D`.
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
-        }
         gles11::TexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, type_, pixels,
-        );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
+        )
     }
 
     unsafe fn CompressedTexImage2D(
@@ -954,27 +757,162 @@ impl GLES for GLES1Native<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
-        // Same `UNPACK_ALIGNMENT` row-stride hazard as `TexImage2D`.
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
+        // POSIX-style guard: a NULL data pointer with image_size==0 is
+        // technically allowed by the spec for some texture-storage queries,
+        // but in practice no iPhone OS app does this — it'd just be a guest
+        // bug. Drop the call on the floor instead of dereferencing the
+        // pointer.
+        if data.is_null() && image_size > 0 {
+            log!(
+                "Warning: GLES1Native::CompressedTexImage2D: NULL data with \
+                 non-zero image_size {image_size} (target={target:#x}, \
+                 level={level}, format={internalformat:#x}, {width}x{height}); \
+                 dropping upload."
+            );
+            return;
         }
-        self.compressed_tex_image_2d_inner(
-            target, level, internalformat, width, height, border, image_size, data,
+
+        // Slice the guest payload exactly once. Even when the host driver
+        // advertises PVRTC natively, we need a `&[u8]` for the paletted /
+        // decode fallbacks below.
+        let payload: &[u8] = if image_size > 0 {
+            std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize)
+        } else {
+            &[]
+        };
+
+        // PowerVR-class drivers (Apple's iPhone OS, plus desktop GL via the
+        // Mesa PowerVR backend) support `GL_IMG_texture_compression_pvrtc`
+        // natively, in which case the most efficient thing to do is to hand
+        // the compressed payload straight to the driver. ARM Mali, Qualcomm
+        // Adreno's ES 1.1 surface, the Mesa software rasteriser, etc. do
+        // *not* advertise PVRTC, so we need to software-decode to RGBA
+        // before uploading. The decision is based on the
+        // `GL_EXTENSIONS` string queried at context creation; see
+        // [`GLES1NativeContext::pvrtc_native`].
+        if crate::gles::should_decode_pvrtc() && !self.pvrtc_native && !payload.is_empty() {
+            if try_decode_pvrtc(
+                self,
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                payload,
+            ) {
+                return;
+            }
+            // Apple-targeted apps also sometimes ship
+            // `GL_OES_compressed_paletted_texture` data. Mali / Adreno ES 1.1
+            // surfaces likewise don't advertise that extension, so a
+            // straight passthrough would silently fail with
+            // `GL_INVALID_ENUM`. Software-decode paletted textures to
+            // uncompressed RGBA/RGB and upload via glTexImage2D.
+            if let Some(PalettedTextureFormat {
+                index_is_nibble,
+                palette_entry_format,
+                palette_entry_type,
+            }) = PalettedTextureFormat::get_info(internalformat)
+            {
+                let palette_entry_size = match palette_entry_type {
+                    gles11::UNSIGNED_BYTE => match palette_entry_format {
+                        gles11::RGB => 3,
+                        gles11::RGBA => 4,
+                        _ => unreachable!(),
+                    },
+                    gles11::UNSIGNED_SHORT_5_6_5
+                    | gles11::UNSIGNED_SHORT_4_4_4_4
+                    | gles11::UNSIGNED_SHORT_5_5_5_1 => 2,
+                    _ => unreachable!(),
+                };
+                let palette_entry_count: usize = if index_is_nibble { 16 } else { 256 };
+                let palette_size = palette_entry_size * palette_entry_count;
+
+                let index_count = width as usize * height as usize;
+                let (index_word_size, index_word_count) = if index_is_nibble {
+                    (1, index_count.div_ceil(2))
+                } else {
+                    (4, index_count.div_ceil(4))
+                };
+                let indices_size = index_word_size * index_word_count;
+
+                let expected_size = palette_size + indices_size;
+                if payload.len() < expected_size {
+                    log!(
+                        "Warning: GLES1Native::CompressedTexImage2D: paletted \
+                         format {internalformat:#x} payload too small: got {} \
+                         bytes, expected at least {expected_size} for \
+                         {width}x{height}; skipping upload.",
+                        payload.len()
+                    );
+                    return;
+                }
+
+                let (palette, indices) = payload.split_at(palette_size);
+
+                let mut decoded = Vec::<u8>::with_capacity(palette_entry_size * index_count);
+                for i in 0..index_count {
+                    let index = if index_is_nibble {
+                        (indices[i / 2] >> ((1 - (i % 2)) * 4)) & 0xf
+                    } else {
+                        indices[i]
+                    } as usize;
+                    let start = index * palette_entry_size;
+                    let palette_entry = &palette[start..start + palette_entry_size];
+                    decoded.extend_from_slice(palette_entry);
+                }
+
+                log_dbg!(
+                    "GLES1Native: software-decoded paletted texture \
+                     {width}x{height} (format {internalformat:#x})"
+                );
+
+                gles11::TexImage2D(
+                    target,
+                    level,
+                    palette_entry_format as GLint,
+                    width,
+                    height,
+                    border,
+                    palette_entry_format,
+                    palette_entry_type,
+                    decoded.as_ptr() as *const _,
+                );
+                return;
+            }
+            // Unknown compressed format AND host driver doesn't advertise
+            // PVRTC — passthrough would just produce GL_INVALID_ENUM. Log
+            // once per (format) value so a misbehaving guest can't spam
+            // the console.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SEEN_UNKNOWN: AtomicBool = AtomicBool::new(false);
+            if !SEEN_UNKNOWN.swap(true, Ordering::Relaxed) {
+                log!(
+                    "Warning: GLES1Native::CompressedTexImage2D: unknown \
+                     compressed format {internalformat:#x} on a host that does \
+                     not advertise PVRTC; passing through to driver but \
+                     expecting GL_INVALID_ENUM. {width}x{height}, level {level}. \
+                     [this log will only be shown once for unknown formats]"
+                );
+            }
+        }
+
+        // Either we're on a PVRTC-capable host (let the driver do its thing),
+        // or we hit a non-PVRTC, non-paletted format on a non-PVRTC host
+        // (let it fail loudly with GL_INVALID_ENUM, exactly like a real
+        // device would).
+        gles11::CompressedTexImage2D(
+            target,
+            level,
+            internalformat,
+            width,
+            height,
+            border,
+            image_size,
+            data,
         );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
-        {
-            self.fix_mipmap_min_filter(target);
-        }
     }
-
-
 
     unsafe fn CompressedTexSubImage2D(
         &mut self,
@@ -988,10 +926,6 @@ impl GLES for GLES1Native<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
-        // PVRTC sub-image updates aren't allowed by the IMG spec — Apple's
-        // ES 1.1 driver returns GL_INVALID_OPERATION too — but we forward
-        // anyway so the guest sees the expected error. Most apps never call
-        // this entry point.
         if data.is_null() && image_size > 0 {
             log!(
                 "Warning: GLES1Native::CompressedTexSubImage2D: NULL data with \
@@ -999,17 +933,33 @@ impl GLES for GLES1Native<'_> {
             );
             return;
         }
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
+        // PVRTC sub-image updates aren't allowed by the IMG spec on a driver
+        // that stores the texture compressed (Apple's ES 1.1 driver returns
+        // GL_INVALID_OPERATION). But when this backend software-decoded the
+        // full upload into RGBA storage (`!pvrtc_native`), the level lives as
+        // plain RGBA, so the sub-update must be decoded the same way or the
+        // streamed-in mip never appears (BioShock's loader does this).
+        if crate::gles::should_decode_pvrtc()
+            && !self.pvrtc_native
+            && !data.is_null()
+            && image_size > 0
+            && try_decode_pvrtc_sub(
+                self,
+                target,
+                level,
+                xoffset,
+                yoffset,
+                width,
+                height,
+                format,
+                std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize),
+            )
+        {
+            return;
         }
         gles11::CompressedTexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, image_size, data,
         );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
     }
 
     unsafe fn CopyTexImage2D(
@@ -1049,19 +999,17 @@ impl GLES for GLES1Native<'_> {
     }
 
     unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
-        if target == gles11::TEXTURE_FILTER_CONTROL_EXT && pname == gles11::TEXTURE_LOD_BIAS_EXT {
-            let extensions = gles11::GetString(gles11::EXTENSIONS);
-            if extensions.is_null()
-                || !CStr::from_ptr(extensions as *const _)
-                    .to_string_lossy()
-                    .split_whitespace()
-                    .any(|extension| extension == "GL_EXT_texture_lod_bias")
-            {
-                return;
-            }
-        }
-        if params.is_null() {
-            return;
+        if target == gles11::TEXTURE_FILTER_CONTROL_EXT {
+            assert!(pname == gles11::TEXTURE_LOD_BIAS_EXT);
+            unsafe {
+                if !CStr::from_ptr(gles11::GetString(gles11::EXTENSIONS) as _)
+                    .to_str()
+                    .unwrap()
+                    .contains("EXT_texture_lod_bias")
+                {
+                    return;
+                }
+            };
         }
         gles11::TexEnvfv(target, pname, params)
     }
@@ -1709,275 +1657,6 @@ impl GLES for GLES1Native<'_> {
     // default `unsafe fn ReleaseShaderCompiler` in `gles_generic` already
     // returns `()` cleanly so we don't need to override it.
 }
-
-impl GLES1Native<'_> {
-    unsafe fn tex_image_2d_inner(
-        &mut self,
-        target: GLenum,
-        level: GLint,
-        mut internalformat: GLint,
-        width: GLsizei,
-        height: GLsizei,
-        border: GLint,
-        format: GLenum,
-        type_: GLenum,
-        pixels: *const GLvoid,
-    ) {
-        if format == gles11::BGRA_EXT {
-            internalformat = gles11::BGRA_EXT as GLint
-        }
-        // Strict ES 1.1 drivers (ANGLE's GLES1 front-end, Adreno's native ES
-        // 1.1) reject non-power-of-two uploads unless the texture samples
-        // with CLAMP_TO_EDGE and a non-mipmap filter: the upload fails with
-        // GL_INVALID_ENUM and every draw sampling the texture shows garbage
-        // / black. Guest UI surfaces are typically NPOT (320x480 video
-        // planes, 640x1136 compositor framebuffers), and guests routinely
-        // leave GL_REPEAT as the wrap mode. Force CLAMP_TO_EDGE on the
-        // current binding for NPOT uploads; wrap is per-texture-object
-        // state, so other textures are unaffected.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
-        {
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_S,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_T,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-        }
-        gles11::TexImage2D(
-            target,
-            level,
-            internalformat,
-            width,
-            height,
-            border,
-            format,
-            type_,
-            pixels,
-        )
-    }
-    unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
-        let mut min_filter: GLint = 0;
-        gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
-        // 0x2700 NEAREST_MIPMAP_NEAREST, 0x2701 LINEAR_MIPMAP_NEAREST,
-        // 0x2702 NEAREST_MIPMAP_LINEAR, 0x2703 LINEAR_MIPMAP_LINEAR
-        let replacement: GLint = match min_filter {
-            0x2700 | 0x2702 => gles11::NEAREST as GLint,
-            0x2701 | 0x2703 => gles11::LINEAR as GLint,
-            _ => return,
-        };
-        let p_target = if (0x8515..=0x851A).contains(&target) {
-            0x8513
-        } else {
-            target
-        };
-        gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, replacement as _);
-        log_dbg!(
-            "GLES1Native: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \
-             non-power-of-two level-0 texture replaced with {replacement:#x} \
-             [incomplete-texture workaround for strict drivers]"
-        );
-    }
-    unsafe fn compressed_tex_image_2d_inner(
-        &mut self,
-        target: GLenum,
-        level: GLint,
-        internalformat: GLenum,
-        width: GLsizei,
-        height: GLsizei,
-        border: GLint,
-        image_size: GLsizei,
-        data: *const GLvoid,
-    ) {
-
-        // POSIX-style guard: a NULL data pointer with image_size==0 is
-        // technically allowed by the spec for some texture-storage queries,
-        // but in practice no iPhone OS app does this — it'd just be a guest
-        // bug. Drop the call on the floor instead of dereferencing the
-        // pointer.
-        if data.is_null() && image_size > 0 {
-            log!(
-                "Warning: GLES1Native::CompressedTexImage2D: NULL data with \
-                 non-zero image_size {image_size} (target={target:#x}, \
-                 level={level}, format={internalformat:#x}, {width}x{height}); \
-                 dropping upload."
-            );
-            return;
-        }
-
-        if width <= 0 || height <= 0 {
-            gles11::CompressedTexImage2D(
-                target,
-                level,
-                internalformat,
-                width,
-                height,
-                border,
-                image_size,
-                data,
-            );
-            return;
-        }
-
-        // Slice the guest payload exactly once. Even when the host driver
-        // advertises PVRTC natively, we need a `&[u8]` for the paletted /
-        // decode fallbacks below.
-        let payload: &[u8] = if image_size > 0 {
-            std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize)
-        } else {
-            &[]
-        };
-
-        // PowerVR-class drivers (Apple's iPhone OS, plus desktop GL via the
-        // Mesa PowerVR backend) support `GL_IMG_texture_compression_pvrtc`
-        // natively, in which case the most efficient thing to do is to hand
-        // the compressed payload straight to the driver. ARM Mali, Qualcomm
-        // Adreno's ES 1.1 surface, the Mesa software rasteriser, etc. do
-        // *not* advertise PVRTC, so we need to software-decode to RGBA
-        // before uploading. The decision is based on the
-        // `GL_EXTENSIONS` string queried at context creation; see
-        // [`GLES1NativeContext::pvrtc_native`].
-        if !self.pvrtc_native && !payload.is_empty() {
-            if try_decode_pvrtc(
-                self,
-                target,
-                level,
-                internalformat,
-                width,
-                height,
-                border,
-                payload,
-            ) {
-                return;
-            }
-            // Apple-targeted apps also sometimes ship
-            // `GL_OES_compressed_paletted_texture` data. Mali / Adreno ES 1.1
-            // surfaces likewise don't advertise that extension, so a
-            // straight passthrough would silently fail with
-            // `GL_INVALID_ENUM`. Software-decode paletted textures to
-            // uncompressed RGBA/RGB and upload via glTexImage2D.
-            if let Some(PalettedTextureFormat {
-                index_is_nibble,
-                palette_entry_format,
-                palette_entry_type,
-            }) = PalettedTextureFormat::get_info(internalformat)
-            {
-                let palette_entry_size = match palette_entry_type {
-                    gles11::UNSIGNED_BYTE => match palette_entry_format {
-                        gles11::RGB => 3,
-                        gles11::RGBA => 4,
-                        _ => unreachable!(),
-                    },
-                    gles11::UNSIGNED_SHORT_5_6_5
-                    | gles11::UNSIGNED_SHORT_4_4_4_4
-                    | gles11::UNSIGNED_SHORT_5_5_5_1 => 2,
-                    _ => unreachable!(),
-                };
-                let palette_entry_count: usize = if index_is_nibble { 16 } else { 256 };
-                let palette_size = palette_entry_size * palette_entry_count;
-
-                let Some(index_count) = (usize::try_from(width).ok()).and_then(|width| {
-                    usize::try_from(height)
-                        .ok()
-                        .and_then(|height| width.checked_mul(height))
-                }) else {
-                    log!(
-                        "Warning: GLES1Native::CompressedTexImage2D: invalid paletted texture dimensions {width}x{height}; skipping upload."
-                    );
-                    return;
-                };
-                let (index_word_size, index_word_count) = if index_is_nibble {
-                    (1, index_count.div_ceil(2))
-                } else {
-                    (4, index_count.div_ceil(4))
-                };
-                let indices_size = index_word_size * index_word_count;
-
-                let expected_size = palette_size + indices_size;
-                if payload.len() < expected_size {
-                    log!(
-                        "Warning: GLES1Native::CompressedTexImage2D: paletted \
-                         format {internalformat:#x} payload too small: got {} \
-                         bytes, expected at least {expected_size} for \
-                         {width}x{height}; skipping upload.",
-                        payload.len()
-                    );
-                    return;
-                }
-
-                let (palette, indices) = payload.split_at(palette_size);
-
-                let mut decoded = Vec::<u8>::with_capacity(palette_entry_size * index_count);
-                for i in 0..index_count {
-                    let index = if index_is_nibble {
-                        (indices[i / 2] >> ((1 - (i % 2)) * 4)) & 0xf
-                    } else {
-                        indices[i]
-                    } as usize;
-                    let start = index * palette_entry_size;
-                    let palette_entry = &palette[start..start + palette_entry_size];
-                    decoded.extend_from_slice(palette_entry);
-                }
-
-                log_dbg!(
-                    "GLES1Native: software-decoded paletted texture \
-                     {width}x{height} (format {internalformat:#x})"
-                );
-
-                GLES::TexImage2D(
-                    self,
-                    target,
-                    level,
-                    palette_entry_format as GLint,
-                    width,
-                    height,
-                    border,
-                    palette_entry_format,
-                    palette_entry_type,
-                    decoded.as_ptr() as *const _,
-                );
-                return;
-            }
-            // Unknown compressed format AND host driver doesn't advertise
-            // PVRTC — passthrough would just produce GL_INVALID_ENUM. Log
-            // once per (format) value so a misbehaving guest can't spam
-            // the console.
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static SEEN_UNKNOWN: AtomicBool = AtomicBool::new(false);
-            if !SEEN_UNKNOWN.swap(true, Ordering::Relaxed) {
-                log!(
-                    "Warning: GLES1Native::CompressedTexImage2D: unknown \
-                     compressed format {internalformat:#x} on a host that does \
-                     not advertise PVRTC; passing through to driver but \
-                     expecting GL_INVALID_ENUM. {width}x{height}, level {level}. \
-                     [this log will only be shown once for unknown formats]"
-                );
-            }
-        }
-
-        // Either we're on a PVRTC-capable host (let the driver do its thing),
-        // or we hit a non-PVRTC, non-paletted format on a non-PVRTC host
-        // (let it fail loudly with GL_INVALID_ENUM, exactly like a real
-        // device would).
-        gles11::CompressedTexImage2D(
-            target,
-            level,
-            internalformat,
-            width,
-            height,
-            border,
-            image_size,
-            data,
-        );
-    }
-}
-
 
 impl<'gl_ctx> GLES1Native<'gl_ctx> {
     /// Helper used by every `OpenGL ES 2.0` shader-pipeline override above

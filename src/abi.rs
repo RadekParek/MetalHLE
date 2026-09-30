@@ -133,10 +133,10 @@ macro_rules! impl_CallFromGuest {
                     ($(read_next_arg::<$P>(&mut reg_offset, regs, Ptr::from_bits(regs[Cpu::SP]), &env.mem),)*)
                 };
 
-                log_dbg!("CallFromGuest"); // Убрали попытку вывести args из-за ограничений трейта Debug
+                log_sampled!(1024, "CallFromGuest");
 
                 let retval = self(env, $(args.$p),*);
-                log_dbg!("CallFromGuest => {:?}", retval);
+                log_sampled!(1024, "CallFromGuest => {:?}", retval);
                 if let Some(retval_ptr) = retval_ptr {
                     retval.to_mem(retval_ptr, &mut env.mem);
                 } else {
@@ -162,10 +162,10 @@ macro_rules! impl_CallFromGuest {
                     stack_pointer: Ptr::from_bits(regs[Cpu::SP])
                 });
 
-                log_dbg!("CallFromGuest with va_list: {:?}", va_list); // Аналогично убрали args
+                log_sampled!(1024, "CallFromGuest with va_list: {:?}", va_list);
 
                 let retval = self(env, $(args.$p,)* va_list);
-                log_dbg!("CallFromGuest => {:?}", retval);
+                log_sampled!(1024, "CallFromGuest => {:?}", retval);
                 if let Some(retval_ptr) = retval_ptr {
                     retval.to_mem(retval_ptr, &mut env.mem);
                 } else {
@@ -288,7 +288,7 @@ macro_rules! impl_CallFromHost {
                 // Create a new guest stack frame. This is redundant considering
                 // we are storing this data on the host stack, but this makes
                 // stack traces work nicely. :)
-                let (old_sp, old_fp, host_to_guest_frame_pointer) = {
+                let (old_sp, old_fp) = {
                     let regs = env.cpu.regs_mut();
                     let old_sp = regs[Cpu::SP];
                     let old_fp = regs[FRAME_POINTER];
@@ -298,7 +298,7 @@ macro_rules! impl_CallFromHost {
                     env.mem
                         .write(Ptr::from_bits(regs[Cpu::SP]), old_fp);
                     env.mem.write(Ptr::from_bits(regs[Cpu::SP] + 4), old_lr);
-                    (old_sp, old_fp, regs[FRAME_POINTER])
+                    (old_sp, old_fp)
                 };
 
                 assert!(R::SIZE_IN_MEM.is_none()); // pointer return TODO
@@ -316,15 +316,7 @@ macro_rules! impl_CallFromHost {
                 // [GuestFunction::call_without_pushing_stack_frame] here, but
                 // it would mess up debug logging, so duplicating the code
                 // is easier.
-                let host_to_guest_stack_frame =
-                    env.push_host_to_guest_stack_frame(host_to_guest_frame_pointer);
-                let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    env.run_call();
-                }));
-                env.pop_host_to_guest_stack_frame(host_to_guest_stack_frame);
-                if let Err(error) = run_result {
-                    std::panic::resume_unwind(error);
-                }
+                env.run_call();
 
                 env.cpu.branch(old_pc);
 

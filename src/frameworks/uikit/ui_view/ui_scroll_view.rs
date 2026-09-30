@@ -48,7 +48,7 @@ pub struct UIScrollViewHostObject {
     zoom_scale: CGFloat,
     keyboard_dismiss_mode: UIScrollViewKeyboardDismissMode,
     decelerates: bool,
-    scrolls_to_top: bool,
+    scrolls_to_top: bool, // (с прошлого фикса)
     drag_start_location: Option<CGPoint>,
     drag_start_offset: CGPoint,
     can_cancel_content_touches: bool,

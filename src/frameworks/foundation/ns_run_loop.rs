@@ -21,7 +21,7 @@ use crate::frameworks::core_foundation::cf_run_loop::{
 use crate::frameworks::{core_animation, media_player, uikit};
 use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject};
 use crate::Environment;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// `NSString*`
 pub type NSRunLoopMode = id;
@@ -258,10 +258,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 /// For use by Audio Toolbox.
 pub fn add_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) {
-    env.objc
+    let units = &mut env
+        .objc
         .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .audio_units
-        .push(unit);
+        .audio_units;
+    if !units.contains(&unit) {
+        units.push(unit);
+    }
 }
 
 /// For use by Audio Toolbox.
@@ -360,12 +363,12 @@ pub fn run_run_loop(
 
     let is_main_run_loop = env.current_thread == 0;
 
-    if is_main_run_loop && !single_iteration {
-        // Diagnostic: everything the app's UI does — event delivery,
-        // composition, timers — is dispatched from this loop. If this line
-        // never appears in the log, the app hung before its run loop ever
-        // started (e.g. somewhere inside applicationDidFinishLaunching).
-        log_once!("Main run loop: now dispatching events, timers and composition");
+    if is_main_run_loop {
+        // Important breadcrumb for diagnosing "app freezes after splash"
+        // reports: this only fires once, when the main run loop actually
+        // starts iterating, which means UIApplicationMain has finished
+        // applicationDidFinishLaunching: + applicationDidBecomeActive:.
+        log_once!("Main NSRunLoop reached its first iteration (app finished launching)");
     }
 
     loop {
@@ -378,15 +381,6 @@ pub fn run_run_loop(
         //  committed automatically when the thread’s runloop next iterates."
         ca_transaction::State::commit_implicit_transaction(env);
 
-        // We want to process those only on the main run loop
-        if is_main_run_loop {
-            let next_due = uikit::handle_events(env);
-            limit_sleep_time(&mut sleep_until, next_due);
-
-            let next_due = core_animation::recomposite_if_necessary(env, false);
-            limit_sleep_time(&mut sleep_until, next_due);
-        }
-
         assert!(timers_tmp.is_empty());
         timers_tmp.extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).timers);
         // Retain the timers in case a timer cancels another timer
@@ -397,9 +391,7 @@ pub fn run_run_loop(
 
         for timer in timers_tmp.drain(..) {
             let next_due = ns_timer::handle_timer(env, timer);
-            // Timer deadlines are virtual; audio/UI deadlines remain real.
-            let host_due = next_due.map(|due| env.guest_clock.host_deadline(due));
-            limit_sleep_time(&mut sleep_until, host_due);
+            limit_sleep_time(&mut sleep_until, next_due);
             release(env, timer);
         }
 
@@ -413,18 +405,33 @@ pub fn run_run_loop(
                 .borrow::<NSRunLoopHostObject>(run_loop)
                 .audio_queues,
         );
+        let has_audio_sources = !audio_queues_tmp.is_empty()
+            || !env
+                .objc
+                .borrow::<NSRunLoopHostObject>(run_loop)
+                .audio_units
+                .is_empty();
 
         for audio_queue in audio_queues_tmp.drain(..) {
             handle_audio_queue(env, audio_queue);
         }
 
-        // TODO: not clear if audio units should be processed in the run loop
         assert!(audio_units_tmp.is_empty());
         audio_units_tmp
             .extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).audio_units);
 
         for audio_unit in audio_units_tmp.drain(..) {
             render_audio_unit(env, audio_unit);
+        }
+
+        if is_main_run_loop {
+            let next_due = uikit::handle_events(env);
+            limit_sleep_time(&mut sleep_until, next_due);
+
+            crate::frameworks::avfoundation::av_capture::deliver_native_frames(env);
+
+            let next_due = core_animation::recomposite_if_necessary(env, false);
+            limit_sleep_time(&mut sleep_until, next_due);
         }
 
         // Process Audio Services completion callbacks. Apple's
@@ -449,10 +456,24 @@ pub fn run_run_loop(
         // events that are scheduled but we can't get the time for currently
         // (audio queue buffer exhaustion).
         //
-        // The compromise used here is that we will wait for a 60th of a second,
-        // or until the next scheduled event, whichever is sooner. iPhone OS
-        // apps can't do more than 60fps so this should be fine.
-        let limit = Duration::from_millis(1000 / 60);
+        // Poll frequently enough for the configured host refresh rate while
+        // still waking early for audio and scheduled timers.
+        let display_rate = env.window().display_refresh_rate().max(1.0);
+        let capped_rate = env.options.effective_fps_limit(display_rate);
+        let refresh_interval = if env.options.frame_pacing_enabled() {
+            Duration::from_secs_f64(1.0 / capped_rate)
+        } else {
+            Duration::ZERO
+        };
+        let limit = if has_audio_sources {
+            // Keep audio callbacks ahead of the host mixer instead of tying
+            // their refill cadence to the display frame rate. This matters
+            // on fast displays where a busy render frame can otherwise drain
+            // the short OpenAL queue before the next guest callback runs.
+            refresh_interval.min(Duration::from_millis(2))
+        } else {
+            refresh_interval
+        };
         env.sleep(sleep_until.map_or(limit, |i| i.duration_since(Instant::now()).min(limit)));
 
         if single_iteration {
@@ -470,9 +491,7 @@ pub fn run_run_loop(
             // (Apple's epoch is less convenient in Rust. And "pure"
             // Rust approach with Duration/Instant is just too troublesome
             // and not worthy to convert back and forth)
-            // The host clock could be set before the Unix epoch (or skew
-            // backwards); never panic on that, just treat it as "not yet".
-            let now_secs = env.guest_clock.system_time()
+            let now_secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();

@@ -16,25 +16,30 @@ use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::openal::OpenALManager;
 use crate::cpu::Cpu;
 use crate::libc::semaphore::sem_t;
-use crate::mem::{self, GuestUSize, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{GuestUSize, MutPtr, MutVoidPtr};
 use crate::{
-    abi, bundle, cpu, dyld, frameworks, fs, gdb, image, libc, mach_o, objc, options, stack, window,
+    abi, bundle, cpu, dyld, frameworks, fs, gdb, image, libc, mach_o, mem, msg_class, objc,
+    options, stack, window,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::TcpListener;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::libc::pthread::cond::pthread_cond_t;
+use crate::libc::stdio::FILE;
 use crate::window::DeviceFamily;
-use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, Yielder};
 pub use mutex::{MutexId, MutexType, PTHREAD_MUTEX_DEFAULT};
 use nullable_box::NullableBox;
 
 /// Index into the [Vec] of threads. Thread 0 is always the main thread.
 pub type ThreadId = usize;
+
+/// Guest TLS storage attached to every emulated thread. The first word is the
+/// per-thread errno value exposed through `__error()`.
+pub const THREAD_LOCAL_STORAGE_SIZE: GuestUSize = 4096;
 
 pub type HostContext = Coroutine<Environment, Environment, Environment>;
 
@@ -47,6 +52,8 @@ pub struct Thread {
     pub blocked_by: ThreadBlock,
     /// Container for thread local state of various child modules
     pub thread_local_framework_state: frameworks::ThreadLocalState,
+    /// Guest address used as the ARM32 r9 thread-local/static-base pointer.
+    pub thread_local_storage: MutVoidPtr,
     /// After a secondary thread finishes, this is set to the returned value.
     return_value: Option<MutVoidPtr>,
     /// Context object containing the CPU state for this thread.
@@ -76,6 +83,46 @@ impl Thread {
     }
 }
 
+#[derive(Default)]
+struct SchedulerWatchdog {
+    last_switch: Option<(ThreadId, ThreadId)>,
+    alternating_switches: u32,
+    burst_started: Option<Instant>,
+    warning_issued: bool,
+}
+
+impl SchedulerWatchdog {
+    fn record_switch(&mut self, current: ThreadId, next: ThreadId) -> bool {
+        const WARNING_THRESHOLD: u32 = 1024;
+        const WARNING_WINDOW: Duration = Duration::from_millis(250);
+
+        if self.last_switch == Some((next, current)) {
+            self.alternating_switches = self.alternating_switches.saturating_add(1);
+            if self.alternating_switches == 1 {
+                self.burst_started = Some(Instant::now());
+            }
+        } else {
+            self.alternating_switches = 0;
+            self.burst_started = None;
+            self.warning_issued = false;
+        }
+        self.last_switch = Some((current, next));
+
+        if self.alternating_switches >= WARNING_THRESHOLD && !self.warning_issued {
+            let burst_is_hot = self
+                .burst_started
+                .is_some_and(|started| started.elapsed() <= WARNING_WINDOW);
+            if burst_is_hot {
+                self.warning_issued = true;
+                return true;
+            }
+            self.alternating_switches = 0;
+            self.burst_started = Some(Instant::now());
+        }
+        false
+    }
+}
+
 impl std::fmt::Debug for Thread {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -86,12 +133,13 @@ impl std::fmt::Debug for Thread {
     }
 }
 
+/// The struct containing the entire emulator state. Methods are provided for
+/// execution and management of threads.
+
 /// Last guest PC seen by the CPU loop, for crash diagnostics.
 pub static LAST_GUEST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 /// Last guest LR seen by the CPU loop, for crash diagnostics.
 pub static LAST_GUEST_LR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 /// Ring buffer of the last N guest PCs, for crash diagnostics.
 pub static GUEST_PC_RING: [std::sync::atomic::AtomicU32; 32] = {
     #[allow(clippy::declare_interior_mutable_const)]
@@ -101,8 +149,6 @@ pub static GUEST_PC_RING: [std::sync::atomic::AtomicU32; 32] = {
 pub static GUEST_PC_RING_IDX: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// The struct containing the entire emulator state. Methods are provided for
-/// execution and management of threads.
 pub struct Environment {
     /// Reference point for various timing functions.
     pub startup_time: Instant,
@@ -130,6 +176,14 @@ pub struct Environment {
     /// Set to [true] when created using [Environment::new_without_app].
     pub dump_file: Option<std::fs::File>,
     pub is_app_picker: bool,
+    /// Guest-only termination request from the `exit`/`abort` family: observed
+    /// by the CPU loop after the host stub returns so no further guest
+    /// instruction runs on a `noreturn` path.
+    pub(crate) guest_termination_requested: bool,
+    /// Set when Unity reports its mandatory player archive is unavailable; the
+    /// `exit` family then ends the session instead of attempting recovery.
+    pub(crate) missing_unity_player_archive: Option<String>,
+    pub(crate) active_host_function: Option<String>,
     yielder: *const Yielder<Environment, Environment>,
     // The amount of ticks to run for Some(value), or single-stepping for None.
     // Sadly, setting ticks to 1 does not step properly, so Option is required.
@@ -138,39 +192,20 @@ pub struct Environment {
     /// Tracks repeated UndefinedInstruction bypasses. See `debug_cpu_error`.
     udf_bypass_last: Option<(u32, u32)>,
     udf_bypass_count: u32,
-    /// Total number of UndefinedInstruction bypasses, independent of the call
-    /// site. Logging is keyed on this so a guest that cycles through many
-    /// different `(pc, lr)` pairs (each with a pair count of 1) cannot flood
-    /// the log with one "occurrence 1" line per pair. See `debug_cpu_error`.
-    udf_bypass_total: u32,
-    /// Tracks consecutive UndefinedInstruction bypasses that all fake-return
-    /// to the *same* LR, regardless of the faulting PC. This catches runaway
-    /// loops where the faulting PC alternates between several bogus addresses
-    /// (so the `(pc, lr)` key above keeps resetting) but the guest keeps
-    /// bouncing back to a single return site — e.g. a game that called
-    /// through a nil/garbage function pointer. See `debug_cpu_error`.
-    udf_bypass_last_lr: Option<u32>,
-    udf_bypass_lr_count: u32,
-    /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
-    /// at the existing return-to-host boundary so it cannot terminate the host
-    /// process from inside a linked libc function.
-    guest_termination_requested: bool,
-    /// A required Unity player archive could not be resolved or read from the
-    /// mounted bundle. Continuing after Unity calls its fatal exit would
-    /// execute a half-initialized engine, so termination recovery is disabled
-    /// for this guest session.
-    missing_unity_player_archive: Option<String>,
-    /// A linked host function deliberately redirected the guest PC. This skips
-    /// the normal post-SVC return, which would overwrite the new continuation
-    /// for compact four-byte stubs.
-    guest_control_flow_redirected: bool,
-    /// Synthetic guest frames installed by `GuestFunction::call_from_host`.
-    /// They are host-call boundaries, not safe recovery targets.
-    host_to_guest_stack_frames: Vec<(usize, u32)>,
-    /// Optional RTCV-style game-corruption engine. Always present, but only
-    /// does anything when enabled via the `--corrupt*` options.
-    corruptor: crate::corrupt::Corruptor,
+    /// Aggregates UDF diagnostics by faulting PC so changing return addresses
+    /// cannot flood the log with otherwise identical warnings.
+    udf_log_counts: HashMap<u32, u32>,
+    scheduler_watchdog: SchedulerWatchdog,
     trainer: crate::trainer::Trainer,
+    corruptor: crate::corrupt::Corruptor,
+    /// Set when the main guest thread was terminated by the C++ exception
+    /// bypass machinery (unrecoverable exception loop, assert, etc.). Unlike
+    /// a normal main() return, this leaves the main thread's saved CPU state
+    /// pointing at corrupt code, so letting the executor re-enter it makes it
+    /// re-execute the same garbage forever (Terraria 1.0 burned the CPU and
+    /// flooded the log with millions of repeated assertion lines). Once set,
+    /// the main run loop stops instead of resuming the dead thread.
+    pub(crate) main_thread_terminated: bool,
 }
 
 /// What to do next when executing this thread.
@@ -190,8 +225,6 @@ pub enum ThreadBlock {
     NotBlocked,
     // Thread is sleeping. (until Instant)
     Sleeping(Instant),
-    // Guest deadline, rescaled dynamically by the game clock.
-    GuestSleeping(Instant),
     // Thread is waiting for a mutex to unlock.
     Mutex(MutexId),
     // Thread is waiting on a semaphore.
@@ -207,45 +240,13 @@ pub enum ThreadBlock {
     // resuming.
     #[allow(dead_code)]
     Suspended(usize, Box<ThreadBlock>),
+    // Thread is waiting on a FILE object lock.
+    FileObjectLock(MutPtr<FILE>),
 }
 
 struct BinaryDependencyNode {
     name: String,
     dependencies: Vec<String>,
-}
-
-fn canonicalize_dylib_path(path: &str) -> String {
-    let (directory, name) = path.rsplit_once('/').unwrap_or(("", path));
-    let canonical_name = match name {
-        "libstdc++.6.dylib" => "libstdc++.6.0.9.dylib",
-        "libz.1.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => "libz.1.2.3.dylib",
-        "libsqlite3.0.dylib" => "libsqlite3.dylib",
-        _ => name,
-    };
-    if directory.is_empty() {
-        canonical_name.to_owned()
-    } else {
-        format!("{directory}/{canonical_name}")
-    }
-}
-
-fn load_transitive_dependencies<T>(
-    roots: &[String],
-    mut load: impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, String>,
-) -> Result<Vec<T>, String> {
-    let mut pending: VecDeque<String> = roots.iter().cloned().collect();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut loaded = Vec::new();
-    while let Some(path) = pending.pop_front() {
-        if !visited.insert(canonicalize_dylib_path(&path)) {
-            continue;
-        }
-        if let Some((binary, dependencies)) = load(&path)? {
-            pending.extend(dependencies);
-            loaded.push(binary);
-        }
-    }
-    Ok(loaded)
 }
 
 /// Topologically sorts the binary dylibs using Kahn's algorithm
@@ -337,6 +338,20 @@ static ENVIRONMENT_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 impl Environment {
+    /// Reports whether network access is enabled. Network access NEVER
+    /// auto-enables: if the user left it off in the options, guest network
+    /// APIs fail gracefully until the user explicitly turns it on.
+    pub fn ensure_network_access(&mut self, caller: &str) -> bool {
+        if self.options.network_access {
+            return true;
+        }
+        log_once_fmt!(
+            "Network access: request from {} denied (disabled in settings); pass --network-access to enable",
+            caller
+        );
+        false
+    }
+
     /// Loads the binary and sets up the emulator.
     pub fn new(
         bundle: bundle::Bundle,
@@ -344,6 +359,7 @@ impl Environment {
         mut options: options::Options,
         app_args: Vec<String>,
     ) -> Result<Environment, String> {
+        let trainer_enabled = !options.trainer_disabled;
         let startup_time = Instant::now();
         let launched_bundle_id = bundle.bundle_identifier().to_owned();
 
@@ -369,63 +385,6 @@ impl Environment {
         // why this is needed.
         if ENVIRONMENT_INSTANCE_EXISTS.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err("Only one (real) Environment can exist at a time!".to_string());
-        }
-
-        // Certain apps need to launch in a non-portrait orientation, and this
-        // should be handled before creating the window because handling of
-        // window rotation after-the-fact is somewhat glitchy.
-        // This also ensures the splash screen is correctly oriented.
-        //
-        // Only force a non-portrait orientation when the app explicitly
-        // does NOT advertise portrait support. Storyboard apps (and any
-        // other modern UIKit binary) routinely declare every orientation
-        // they can run in via `UISupportedInterfaceOrientations`, and
-        // picking the first non-portrait entry would force them into
-        // landscape even when portrait is perfectly fine. Apple's own
-        // launch logic uses portrait by default whenever it's listed, so
-        // mirror that.
-        let portrait_supported = bundle
-            .supported_interface_orientations()
-            .contains(&"UIInterfaceOrientationPortrait");
-        if options.initial_orientation == window::DeviceOrientation::Portrait && !portrait_supported
-        {
-            if let Some(&non_portrait_orientation) = bundle
-                .supported_interface_orientations()
-                .iter()
-                .find(|&&o| o != "UIInterfaceOrientationPortrait")
-            {
-                // TODO: Overwriting the options might not be ideal; do we need
-                //       to distinguish this kind of orientation change from
-                //       others?
-                options.initial_orientation = match non_portrait_orientation {
-                    // UIInterfaceOrientation values are flipped relative to
-                    // (UI)DeviceOrientation values (content has to rotate in
-                    // the opposite direction to how the device rotates).
-                    "UIInterfaceOrientationLandscapeLeft" => {
-                        window::DeviceOrientation::LandscapeRight
-                    }
-                    "UIInterfaceOrientationLandscapeRight" => {
-                        window::DeviceOrientation::LandscapeLeft
-                    }
-                    // This appears to be an older way set the orientation.
-                    // From testing, it seems to correspond to left.
-                    "UIInterfaceOrientationLandscape" => window::DeviceOrientation::LandscapeLeft,
-
-                    // ДОБАВЛЯЕМ СЮДА ПРИВЯЗКУ К ОБЫЧНОМУ ПОРТРЕТУ:
-                    "UIInterfaceOrientationPortraitUpsideDown" => {
-                        window::DeviceOrientation::Portrait
-                    }
-
-                    other => {
-                        log!(
-                            "Warning: Unsupported startup orientation: {:?}; defaulting to Portrait.",
-                            other
-                        );
-                        window::DeviceOrientation::Portrait
-                    }
-                };
-                log!("App needs non-portrait user interface orientation {:?}, applying device orientation {:?}.", non_portrait_orientation, options.initial_orientation);
-            }
         }
 
         let device_family_override = options.device_family;
@@ -470,29 +429,37 @@ impl Environment {
         // Default model picked for each class when the user hasn't chosen one.
         // iPhone 3GS (iPhone2,1) is the historical touchHLE phone default
         // (320x480, GLES2-capable); iPad 2 (iPad2,1) is the tablet default.
+        //
+        // When the app's MinimumOSVersion is newer than a candidate's last
+        // iOS release, the app itself will often refuse to run on it (e.g.
+        // BioShock prints "THIS IS AN UNSUPPORTED DEVICE" for iPhone2,1 and
+        // takes degraded code paths). Walk up the ladder to the oldest
+        // default model whose final iOS release can actually host the app.
+                // Fixed historical touchHLE phone default (iPhone 3GS / iPhone2,1).
+        // Device upgrades are deliberately NOT automatic: some apps probe the
+        // device model and reject anything outside their supported list (e.g.
+        // BioShock prints "THIS IS AN UNSUPPORTED DEVICE" for iPhone4,1 too).
+        // Users can still override per-app with --device-family <model>.
         let default_phone = DeviceFamily::iPhone3GS;
-        let default_ipad = DeviceFamily::iPad2;
+let default_ipad = DeviceFamily::iPad2;
 
         let device_family = if let Some(dfo) = device_family_override {
+            // An explicit user override always wins. Previously an override
+            // whose class the bundle didn't declare was silently ignored
+            // (Dead Space HD is an iPad-only bundle, so an iPhone override
+            // was discarded and the user was stuck on iPad2). Warn about the
+            // mismatch, but respect the user's choice.
             let override_is_ipad = dfo.is_ipad();
-            if override_is_ipad && bundle_supports_ipad {
-                dfo
-            } else if !override_is_ipad && bundle_supports_phone {
-                dfo
-            } else {
+            if (override_is_ipad && !bundle_supports_ipad)
+                || (!override_is_ipad && !bundle_supports_phone)
+            {
                 log!(
-                    "Warning: User-defined {:?} device family override is not supported by the app (supported: {:?}); ignoring.",
+                    "Warning: User-defined {:?} device family override does not match the bundle's declared families ({:?}); using it anyway.",
                     dfo,
                     device_family_array
                 );
-                if bundle_supports_phone {
-                    default_phone
-                } else if bundle_supports_ipad {
-                    default_ipad
-                } else {
-                    default_phone
-                }
             }
+            dfo
         } else if bundle_supports_phone {
             // Prefer the phone family when the bundle supports it, matching the
             // previous behaviour for universal (iPhone + iPad) bundles.
@@ -508,14 +475,88 @@ impl Environment {
         };
         log!("{:?} device family is chosen.", device_family);
         options.device_family = Some(device_family);
+        // Certain apps need to launch in a non-portrait orientation, and this
+        // should be handled before creating the window because handling of
+        // window rotation after-the-fact is somewhat glitchy.
+        // This also ensures the splash screen is correctly oriented.
+        //
+        // Only force a non-portrait orientation when the app explicitly
+        // does NOT advertise portrait support. Storyboard apps (and any
+        // other modern UIKit binary) routinely declare every orientation
+        // they can run in via `UISupportedInterfaceOrientations`, and
+        // picking the first non-portrait entry would force them into
+        // landscape even when portrait is perfectly fine. Apple's own
+        // launch logic uses portrait by default whenever it's listed, so
+        // mirror that.
+        // Must run after the device family is known: universal apps carry
+        // `~ipad` orientation overrides whose order regularly differs from the
+        // iPhone list, and using the wrong one rotates the screen 180 degrees
+        // (HyperHLE af60a979).
+        let supported_orientations =
+            bundle.supported_interface_orientations_for_family(device_family.is_ipad());
+        let portrait_supported =
+            supported_orientations.contains(&"UIInterfaceOrientationPortrait");
+        if options.initial_orientation == window::DeviceOrientation::Portrait && !portrait_supported
+        {
+            if let Some(&non_portrait_orientation) = supported_orientations
+                .iter()
+                .find(|&&o| o != "UIInterfaceOrientationPortrait")
+            {
+                // TODO: Overwriting the options might not be ideal; do we need
+                //       to distinguish this kind of orientation change from
+                //       others?
+                options.initial_orientation = match non_portrait_orientation {
+                    // UIInterfaceOrientation values are flipped relative to
+                    // (UI)DeviceOrientation values (content has to rotate in
+                    // the opposite direction to how the device rotates).
+                    "UIInterfaceOrientationLandscapeLeft" => {
+                        window::DeviceOrientation::LandscapeRight
+                    }
+                    "UIInterfaceOrientationLandscapeRight" => {
+                        window::DeviceOrientation::LandscapeLeft
+                    }
+                    // This appears to be an older way set the orientation.
+                    // From testing, it seems to correspond to left.
+                    "UIInterfaceOrientationLandscape" => window::DeviceOrientation::LandscapeLeft,
 
-        // Read the executable before constructing the Mach-O image below;
-        // this lets us reuse the bytes instead of reading the file twice.
+                    // ДОБАВЛЯЕМ СЮДА ПРИВЯЗКУ К ОБЫЧНОМУ ПОРТРЕТУ:
+                    "UIInterfaceOrientationPortraitUpsideDown" => {
+                        window::DeviceOrientation::PortraitUpsideDown
+                    }
+
+                    other => {
+                        log!(
+                            "Warning: Unsupported startup orientation: {:?}; defaulting to Portrait.",
+                            other
+                        );
+                        window::DeviceOrientation::Portrait
+                    }
+                };
+                log!("App needs non-portrait user interface orientation {:?}, applying device orientation {:?}.", non_portrait_orientation, options.initial_orientation);
+            }
+        }
+
+
+        // Read the executable before the window exists: which OpenGL ES API
+        // generation the app can use decides which host GL driver the window
+        // should load on Android (see `Window::new`). The same bytes are
+        // parsed into guest memory further down, so the file is read once.
         let executable_path = bundle.executable_path();
         let executable_name = executable_path.file_name().unwrap().to_string();
         let executable_bytes = fs
             .read(executable_path)
             .map_err(|_| "Could not load executable: Could not read executable file".to_string())?;
+        let gles_api_usage = mach_o::scan_gles_api_usage(&executable_bytes);
+        log!(
+            "Executable imports OpenGL ES entry points: ES 1.1 fixed-function: {}, ES 2.0 shaders: {}{}",
+            if gles_api_usage.uses_es1 { "yes" } else { "no" },
+            if gles_api_usage.uses_es2 { "yes" } else { "no" },
+            if gles_api_usage.is_es2_only() {
+                " (OpenGL ES 2.0-only app)"
+            } else {
+                ""
+            }
+        );
 
         let window = if options.headless {
             None
@@ -539,11 +580,19 @@ impl Environment {
                 };
                 res.ok()
             } else {
-                None
+                log!(
+                    "Warning: No launch image found for {}; using generated blank fallback",
+                    bundle.bundle_identifier()
+                );
+                Some(image::Image::from_pixels(
+                    320,
+                    480,
+                    vec![255; 320 * 480 * 4],
+                ))
             };
             Some(Box::new(window::Window::new(
                 &format!(
-                    "{} (touchHLE {}{}{})",
+                    "{} (MetalHLE 1.0 {}{}{})",
                     bundle.display_name(),
                     super::branding(),
                     if super::branding().is_empty() {
@@ -556,6 +605,7 @@ impl Environment {
                 icon.ok(),
                 launch_image.map(|image| (image, false)),
                 &options,
+                Some(gles_api_usage),
             )))
         };
 
@@ -568,11 +618,8 @@ impl Environment {
             || bundle
                 .bundle_identifier()
                 .starts_with("com.go.starwave.CritterCrunch");
-        let is_geometry_dash = bundle
-            .bundle_identifier()
-            .starts_with("com.robtop.geometryjump");
         // We always reset this flag depending on which game is launched.
-        mem.zero_memory_on_free = !is_spore && !is_critter_crunch && !is_geometry_dash;
+        mem.zero_memory_on_free = !is_spore && !is_critter_crunch;
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }
@@ -580,19 +627,6 @@ impl Environment {
             // Without this hack, every time a critter 'explodes',
             // the game crashes with a null page access error.
             log!("Applying game-specific hack for Critter Crunch: zeroing memory on alloc instead of free.");
-        }
-        if is_geometry_dash {
-            // Geometry Dash plays its music as FMOD streams fed from a memory
-            // buffer that the game frees as soon as createStream() has
-            // returned. Scrubbing freed memory (the default) therefore wipes
-            // the song out from under FMOD's streamer, which then decodes
-            // silence and the game retries loading the track, while one-shot
-            // samples — decoded before the buffer is freed — keep working.
-            // That is exactly the reported symptom: sound effects are audible,
-            // music never is. Real malloc leaves freed bytes in place until the
-            // chunk is reused, so zero on alloc instead, as for Spore Origins
-            // and Critter Crunch above.
-            log!("Applying game-specific hack for Geometry Dash: zeroing memory on alloc instead of free.");
         }
         let executable = mach_o::MachO::load_from_bytes(
             &executable_bytes,
@@ -603,19 +637,45 @@ impl Environment {
         .map_err(|e| format!("Could not load executable: {e}"))?;
         drop(executable_bytes);
 
-        let dylibs = load_transitive_dependencies(&executable.dynamic_libraries, |dylib| {
+        let mut dylibs = Vec::new();
+        for dylib in &executable.dynamic_libraries {
+            // There are some Free Software libraries bundled with touchHLE and
+            // exposed via the guest file system (see Fs::new()).
             let dylib_path = fs::GuestPath::new(dylib);
             if fs.is_file(dylib_path) {
+                // We use hardcoded slide values for libgcc and libstdc++
+                // based on base addresses of those dylibs prior to iOS 3.1
+                // TODO: implement some kind of ASLR instead of hardcoding
                 assert!(dylib_path.as_str().starts_with("/usr/lib/"));
+
                 let name = dylib_path.file_name().unwrap();
                 let dylib_slide = match name {
                     "libstdc++.6.dylib" | "libstdc++.6.0.9.dylib" => 0x3748a000,
+
+                    // ДОБАВИТЬ ЭТО: Честный базовый адрес для libc++ (iOS 5.0+)
                     "libc++.1.dylib" => 0x38000000,
+                    // На случай, если игра также потянет за собой libc++abi
                     "libc++abi.dylib" => 0x38100000,
                     "libiconv.2.dylib" => 0x32000000,
+
                     "libgcc_s.1.dylib" => 0x30000000,
-                    "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => 0,
-                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => 0,
+                    "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => {
+                        // We build `libz` from sources with our OSS toolchain,
+                        // the base address is already set and sliding is not
+                        // needed.
+                        0
+                    }
+                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => {
+                        // We build `libsqlite3` from sources with our OSS
+                        // toolchain, the base address is already set and
+                        // sliding is not needed.
+                        0
+                    }
+                    "libxml2.2.dylib" | "libxml2.dylib" | "libxml2.2.7.8.dylib" => {
+                        // The bundled ARM32 dylib is loaded at its preferred guest
+                        // address, so no additional slide is needed.
+                        0
+                    }
                     _ => {
                         log!(
                             "Warning: unknown binary slide for {:?}; loading at slide 0. App may fail to bind some symbols.",
@@ -624,29 +684,32 @@ impl Environment {
                         0
                     }
                 };
-                let binary = mach_o::MachO::load_from_file(
+
+                let dylib = mach_o::MachO::load_from_file(
                     fs::GuestPath::new(dylib),
                     &fs,
                     &mut mem,
                     dylib_slide,
                 )
                 .map_err(|e| format!("Could not load bundled dylib: {e}"))?;
-                let dependencies = binary.dynamic_libraries.clone();
-                Ok(Some((binary, dependencies)))
-            } else {
-                let implemented_in_host = crate::dyld::DYLIB_LIST
-                    .iter()
-                    .any(|d| d.path == dylib || d.aliases.contains(&dylib));
-                let is_swift = dylib.rsplit('/').next().unwrap_or(dylib).starts_with("libswift");
-                if !implemented_in_host && !is_swift {
-                    log!(
-                        "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
-                        dylib
-                    );
-                }
-                Ok(None)
+
+                dylibs.push(dylib);
+            // Otherwise, look for it in our host implementations.
+            } else if !crate::dyld::DYLIB_LIST
+                .iter()
+                .any(|d| d.path == dylib || d.aliases.contains(&dylib.as_str()))
+            {
+                log!(
+                    "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
+                    dylib
+                );
             }
-        })?;
+        }
+
+        let main_thread_tls = mem.calloc(THREAD_LOCAL_STORAGE_SIZE);
+        if main_thread_tls.is_null() {
+            return Err("Could not allocate main-thread TLS".to_string());
+        }
 
         let entry_point_addr = executable
             .entry_point_pc
@@ -670,179 +733,167 @@ impl Environment {
         let mut dyld = dyld::Dyld::new();
         dyld.do_initial_linking(&bundle, &bins, &mut mem, &mut objc);
 
-        let cpu = cpu::Cpu::new(match options.direct_memory_access {
+        let direct_memory_access = options.direct_memory_access;
+
+        let cpu = cpu::Cpu::new(match direct_memory_access {
             true => Some(&mut mem),
             false => None,
         });
 
-        // XaView BypassStackOverflow: guest code runs on this coroutine stack.
-        // The 1MB corosensei default is too small for deeply-nested guest -> host
-        // -> JNI calls on Android (ART's CheckJNI aborts with a pending
-        // StackOverflowError -> SIGABRT). Give it the same 16MB as SDLThread.
-        let main_thread_init_stack = DefaultStack::new(16 * 1024 * 1024)
-            .expect("failed to allocate main guest coroutine stack");
-        let main_thread_init_routine = Coroutine::with_stack(
-            main_thread_init_stack,
-            move |yielder, mut env: Environment| {
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    env.with_yielder(yielder, move |env| {
-                        echo!("CPU emulation begins now.");
-                        // Some apps use the stack inside the static initializer.
-                        // While properly behaving apps should be fine, some app
-                        // will try to poke the top of the stack, so we'll give
-                        // it some room.
-                        env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
+        let main_thread_init_routine = Coroutine::new(move |yielder, mut env: Environment| {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.with_yielder(yielder, move |env| {
+                    let _implicit_autorelease_pool: objc::id =
+                        msg_class![env; NSAutoreleasePool new];
+                    echo!("CPU emulation begins now.");
+                    env.cpu.regs_mut()[Cpu::R9] = main_thread_tls.to_bits();
+                    log_dbg!(
+                        "Initialised main guest thread TLS: r9={:#x}",
+                        main_thread_tls.to_bits()
+                    );
+                    // Some apps use the stack inside the static initializer.
+                    // While properly behaving apps should be fine, some app
+                    // will try to poke the top of the stack, so we'll give
+                    // it some room.
+                    env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
 
-                        // Call `+load` method on classes where it's defined.
-                        // TODO: `+load` methods from our image should take priority
-                        // over frameworks ones.
-                        // TODO: a category `+load` method should be called after
-                        // the class's own +load method.
-                        // Note: `+load` is sent without triggering `+initialize`,
-                        // matching the runtime's guarantee that `+load` runs first.
-                        let mut to_be_loaded = Vec::new();
-                        let mut processed = HashSet::new();
-                        let load_sel: objc::SEL = env
+                    // Call `+load` method on classes where it's defined.
+                    // TODO: `+load` methods from our image should take priority
+                    // over frameworks ones.
+                    // TODO: a category `+load` method should be called after
+                    // the class's own +load method.
+                    // Note: `+load` is sent without triggering `+initialize`,
+                    // matching the runtime's guarantee that `+load` runs first.
+                    let mut to_be_loaded = Vec::new();
+                    let mut processed = HashSet::new();
+                    let load_sel: objc::SEL = env
+                        .objc
+                        .register_host_selector("load".to_string(), &mut env.mem);
+                    for (class_name, &class) in env.objc.all_classes() {
+                        if processed.contains(&class) {
+                            continue;
+                        }
+                        if env.objc.is_unimplemented_class(class) || env.objc.is_fake_class(class) {
+                            continue;
+                        }
+                        if env
                             .objc
-                            .register_host_selector("load".to_string(), &mut env.mem);
-                        for (class_name, &class) in env.objc.all_classes() {
-                            if processed.contains(&class) {
-                                continue;
-                            }
-                            if env.objc.is_unimplemented_class(class)
-                                || env.objc.is_fake_class(class)
-                            {
-                                continue;
-                            }
-                            if env
-                                .objc
-                                .object_has_uninherited_method(&env.mem, class, load_sel)
-                            {
-                                log_dbg!(
-                                    "Calling +load on inheritance chain of {} class",
-                                    class_name
-                                );
-                                let mut inherited = Vec::new();
-                                let mut curr_class = class;
-                                while curr_class != objc::nil
-                                    && !env.objc.is_unimplemented_class(curr_class)
-                                    && !env.objc.is_fake_class(curr_class)
-                                {
-                                    if !processed.contains(&curr_class)
-                                        && env.objc.object_has_uninherited_method(
-                                            &env.mem, curr_class, load_sel,
-                                        )
-                                    {
-                                        inherited.push(curr_class);
-                                        processed.insert(curr_class);
-                                    }
-                                    curr_class = env.objc.get_superclass(curr_class);
-                                }
-                                to_be_loaded.extend(inherited.into_iter().rev());
-                            }
-                        }
-                        for &class in &to_be_loaded {
-                            () = objc::msg_send_no_initialize(env, (class, load_sel));
-                        }
-
-                        // Static initializers for libraries must be run before
-                        // the initializer in the app binary.
-                        for bin_idx in env.get_sorted_bin_indices().unwrap() {
-                            let Some(bin) = env.bins.get(bin_idx) else {
-                                continue;
-                            };
-                            let Some(section) =
-                                bin.get_section(mach_o::SectionType::ModInitFuncPointers)
-                            else {
-                                continue;
-                            };
-
-                            log_dbg!("Calling static initializers for {:?}", bin.name);
-                            assert!(section.size % 4 == 0);
-
-                            let base: mem::ConstPtr<abi::GuestFunction> =
-                                mem::Ptr::from_bits(section.addr);
-
-                            let count = section.size / 4;
-                            for i in 0..count {
-                                let func = env.mem.read(base + i);
-
-                                log_dbg!(
-                                    "Calling static initializer at {:?} from {:?}",
-                                    func,
-                                    (base + i)
-                                );
-
-                                () = func.call_from_host(env, ());
-                            }
-                            log_dbg!("Static initialization done");
-                        }
-
+                            .object_has_uninherited_method(&env.mem, class, load_sel)
                         {
-                            let bin_path = env.bundle.executable_path();
-
-                            let envp_list: Vec<String> = env
-                                .env_vars
-                                .clone()
-                                .iter_mut()
-                                .map(|tuple| {
-                                    [
-                                        std::str::from_utf8(tuple.0).unwrap(),
-                                        "=",
-                                        env.mem.cstr_at_utf8(*tuple.1).unwrap(),
-                                    ]
-                                    .concat()
-                                })
-                                .collect();
-
-                            let envp_ref_list: Vec<&str> =
-                                envp_list.iter().map(|keyvalue| keyvalue.as_str()).collect();
-
-                            let bin_path_apple_key =
-                                format!("executable_path={}", bin_path.as_str());
-
-                            let argv = Vec::from_iter(
-                                std::iter::once(bin_path.as_str())
-                                    .chain(app_args.iter().map(|s| s.as_str())),
-                            );
-
-                            let envp = envp_ref_list.as_slice();
-                            let apple = &[bin_path_apple_key.as_str()];
-                            stack::prep_stack_for_start(
-                                &mut env.mem,
-                                &mut env.cpu,
-                                &argv,
-                                envp,
-                                apple,
-                                entry_point_is_lc_main,
-                            );
+                            log_dbg!("Calling +load on inheritance chain of {} class", class_name);
+                            let mut inherited = Vec::new();
+                            let mut curr_class = class;
+                            while curr_class != objc::nil
+                                && !env.objc.is_unimplemented_class(curr_class)
+                                && !env.objc.is_fake_class(curr_class)
+                            {
+                                if !processed.contains(&curr_class)
+                                    && env.objc.object_has_uninherited_method(
+                                        &env.mem, curr_class, load_sel,
+                                    )
+                                {
+                                    inherited.push(curr_class);
+                                    processed.insert(curr_class);
+                                }
+                                curr_class = env.objc.get_superclass(curr_class);
+                            }
+                            to_be_loaded.extend(inherited.into_iter().rev());
                         }
+                    }
+                    for &class in &to_be_loaded {
+                        () = objc::msg_send_no_initialize(env, (class, load_sel));
+                    }
 
-                        // Manually call here, since running call_from_host pushes
-                        // a stack frame and disrupts abi for _start.
-                        env.cpu
-                            .branch_with_link(entry_point_addr, env.dyld.thread_exit_routine());
+                    // Static initializers for libraries must be run before
+                    // the initializer in the app binary.
+                    for bin_idx in env.get_sorted_bin_indices().unwrap() {
+                        let Some(bin) = env.bins.get(bin_idx) else {
+                            continue;
+                        };
+                        let Some(section) =
+                            bin.get_section(mach_o::SectionType::ModInitFuncPointers)
+                        else {
+                            continue;
+                        };
 
-                        env.run_call();
+                        log_dbg!("Calling static initializers for {:?}", bin.name);
+                        assert!(section.size % 4 == 0);
 
-                        if env.guest_termination_requested {
-                            echo!(
-                                "Guest requested controlled termination; returning to the host."
+                        let base: mem::ConstPtr<abi::GuestFunction> =
+                            mem::Ptr::from_bits(section.addr);
+
+                        let count = section.size / 4;
+                        for i in 0..count {
+                            let func = env.mem.read(base + i);
+
+                            log_dbg!(
+                                "Calling static initializer at {:?} from {:?}",
+                                func,
+                                (base + i)
                             );
-                        } else {
-                            panic!("Main function exited unexpectedly!");
-                        }
-                    })
-                }));
 
-                if let Err(e) = res {
-                    let panic_cell = env.panic_cell.clone();
-                    panic_cell.set(Some(env));
-                    std::panic::resume_unwind(e);
-                }
-                env
-            },
-        );
+                            () = func.call_from_host(env, ());
+                        }
+                        log_dbg!("Static initialization done");
+                    }
+
+                    {
+                        let bin_path = env.bundle.executable_path();
+
+                        let envp_list: Vec<String> = env
+                            .env_vars
+                            .clone()
+                            .iter_mut()
+                            .map(|tuple| {
+                                [
+                                    std::str::from_utf8(tuple.0).unwrap(),
+                                    "=",
+                                    env.mem.cstr_at_utf8(*tuple.1).unwrap(),
+                                ]
+                                .concat()
+                            })
+                            .collect();
+
+                        let envp_ref_list: Vec<&str> =
+                            envp_list.iter().map(|keyvalue| keyvalue.as_str()).collect();
+
+                        let bin_path_apple_key = format!("executable_path={}", bin_path.as_str());
+
+                        let argv = Vec::from_iter(
+                            std::iter::once(bin_path.as_str())
+                                .chain(app_args.iter().map(|s| s.as_str())),
+                        );
+
+                        let envp = envp_ref_list.as_slice();
+                        let apple = &[bin_path_apple_key.as_str()];
+                        stack::prep_stack_for_start(
+                            &mut env.mem,
+                            &mut env.cpu,
+                            &argv,
+                            envp,
+                            apple,
+                            entry_point_is_lc_main,
+                        );
+                    }
+
+                    // Manually call here, since running call_from_host pushes
+                    // a stack frame and disrupts abi for _start.
+                    env.cpu
+                        .branch_with_link(entry_point_addr, env.dyld.thread_exit_routine());
+
+                    env.run_call();
+
+                    panic!("Main function exited unexpectedly!");
+                })
+            }));
+
+            if let Err(e) = res {
+                let panic_cell = env.panic_cell.clone();
+                panic_cell.set(Some(env));
+                std::panic::resume_unwind(e);
+            }
+            env
+        });
 
         let main_thread = Thread {
             active: true,
@@ -852,6 +903,7 @@ impl Environment {
             host_context: Some(main_thread_init_routine),
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
             thread_local_framework_state: Default::default(),
+            thread_local_storage: main_thread_tls,
         };
 
         let mut env = Environment {
@@ -876,23 +928,22 @@ impl Environment {
             env_vars: Default::default(),
             dump_file: None,
             is_app_picker: false,
+            active_host_function: None,
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
-            udf_bypass_total: 0,
-            udf_bypass_last_lr: None,
-            udf_bypass_lr_count: 0,
+            udf_log_counts: HashMap::new(),
             guest_termination_requested: false,
             missing_unity_player_archive: None,
-            guest_control_flow_redirected: false,
-            host_to_guest_stack_frames: Vec::new(),
+            scheduler_watchdog: SchedulerWatchdog::default(),
+            trainer: crate::trainer::Trainer::new(trainer_enabled),
             corruptor: crate::corrupt::Corruptor::default(),
-            trainer: crate::trainer::Trainer::new(false),
+            main_thread_terminated: false,
         };
+        crate::trainer_ui::set_hardware_enabled(trainer_enabled);
 
-        env.trainer = crate::trainer::Trainer::new(!env.options.trainer_disabled);
         env.corruptor = crate::corrupt::Corruptor::new(env.options.corruption.clone());
         if env.corruptor.is_enabled() {
             log!(
@@ -936,7 +987,7 @@ impl Environment {
 
             echo!("Debugger client connected on {}.", client_addr);
             let mut gdb_server = gdb::GdbServer::new(client);
-            let step = gdb_server.wait_for_debugger(None, &mut env.cpu, &mut env.mem);
+            let step = gdb_server.wait_for_debugger(None, &mut env);
 
             assert!(!step, "Can't step right now!"); // TODO?
             env.gdb_server = Some(Box::new(gdb_server));
@@ -983,7 +1034,7 @@ impl Environment {
         assert!(!options.headless);
         let window = Some(Box::new(window::Window::new(
             &format!(
-                "touchHLE {}{}{}",
+                "MetalHLE 1.0 {}{}{}",
                 super::branding(),
                 if super::branding().is_empty() {
                     ""
@@ -995,9 +1046,15 @@ impl Environment {
             Some(icon),
             launch_image,
             &options,
+            None,
         )));
 
         let mut mem = mem::Mem::new();
+        mem.set_null_segment_size(mem::PAGE_SIZE);
+        let main_thread_tls = mem.calloc(THREAD_LOCAL_STORAGE_SIZE);
+        if main_thread_tls.is_null() {
+            return Err("Could not allocate app-picker TLS".to_string());
+        }
 
         let bins = Vec::new();
 
@@ -1007,7 +1064,9 @@ impl Environment {
 
         dyld.do_initial_linking_with_no_bins(&mut mem, &mut objc);
 
-        let cpu = cpu::Cpu::new(match options.direct_memory_access {
+        let direct_memory_access = options.direct_memory_access;
+
+        let cpu = cpu::Cpu::new(match direct_memory_access {
             true => Some(&mut mem),
             false => None,
         });
@@ -1020,6 +1079,7 @@ impl Environment {
             host_context: None,
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
             thread_local_framework_state: Default::default(),
+            thread_local_storage: main_thread_tls,
         };
 
         let mut env = Environment {
@@ -1044,21 +1104,21 @@ impl Environment {
             env_vars: Default::default(),
             dump_file: None,
             is_app_picker: true,
+            active_host_function: None,
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
-            udf_bypass_total: 0,
-            udf_bypass_last_lr: None,
-            udf_bypass_lr_count: 0,
+            udf_log_counts: HashMap::new(),
+            scheduler_watchdog: SchedulerWatchdog::default(),
             guest_termination_requested: false,
             missing_unity_player_archive: None,
-            guest_control_flow_redirected: false,
-            host_to_guest_stack_frames: Vec::new(),
-            corruptor: crate::corrupt::Corruptor::default(),
             trainer: crate::trainer::Trainer::new(false),
+            corruptor: crate::corrupt::Corruptor::default(),
+            main_thread_terminated: false,
         };
+        crate::trainer_ui::set_hardware_enabled(false);
 
         env.set_up_initial_env_vars();
 
@@ -1073,6 +1133,11 @@ impl Environment {
         }
 
         env.cpu.set_cpsr(cpu::Cpu::CPSR_USER_MODE);
+        env.cpu.regs_mut()[Cpu::R9] = main_thread_tls.to_bits();
+        log_dbg!(
+            "Initialised app-picker guest thread TLS: r9={:#x}",
+            main_thread_tls.to_bits()
+        );
 
         // GDB server setup would be done here, but there's no need for it.
 
@@ -1115,20 +1180,19 @@ impl Environment {
             env_vars: HashMap::new(),
             dump_file: None,
             is_app_picker: true,
+            active_host_function: None,
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
-            udf_bypass_total: 0,
-            udf_bypass_last_lr: None,
-            udf_bypass_lr_count: 0,
+            udf_log_counts: HashMap::new(),
+            scheduler_watchdog: SchedulerWatchdog::default(),
             guest_termination_requested: false,
             missing_unity_player_archive: None,
-            guest_control_flow_redirected: false,
-            host_to_guest_stack_frames: Vec::new(),
-            corruptor: crate::corrupt::Corruptor::default(),
             trainer: crate::trainer::Trainer::new(false),
+            corruptor: crate::corrupt::Corruptor::default(),
+            main_thread_terminated: false,
         }
     }
 
@@ -1296,30 +1360,15 @@ impl Environment {
         } else {
             echo_no_panic!(" 1. {:#x} (LR)", lr);
         }
-        // A corrupted guest frame chain used to make diagnostics loop forever
-        // before a recovery path could reject it. Keep stack traces
-        // best-effort: only read complete, aligned records inside the current
-        // thread's stack; require older frames to be higher on ARM's
-        // descending stack; and bound the walk even if guest memory cycles.
-        const MAX_STACK_TRACE_FRAMES: usize = 64;
         let mut i = 2;
-        let mut fp = regs[abi::FRAME_POINTER];
-        for _ in 0..MAX_STACK_TRACE_FRAMES {
-            if fp == 0 || !fp.is_multiple_of(4) {
-                echo_no_panic!("Next FP ({:#x}) is null or unaligned.", fp);
+        let mut fp: mem::ConstPtr<u8> = mem::Ptr::from_bits(regs[abi::FRAME_POINTER]);
+        loop {
+            if !stack_range.contains(&fp.to_bits()) {
+                echo_no_panic!("Next FP ({:?}) is outside the stack.", fp);
                 break;
             }
-            let Some(saved_lr_addr) = fp.checked_add(4) else {
-                echo_no_panic!("Next FP ({:#x}) overflows its frame record.", fp);
-                break;
-            };
-            if !stack_range.contains(&fp) || !stack_range.contains(&saved_lr_addr) {
-                echo_no_panic!("Next FP ({:#x}) is outside the stack.", fp);
-                break;
-            }
-
-            lr = self.mem.read(mem::ConstPtr::<u32>::from_bits(saved_lr_addr));
-            let previous_fp: u32 = self.mem.read(mem::ConstPtr::<u32>::from_bits(fp));
+            lr = self.mem.read((fp + 4).cast());
+            fp = self.mem.read(fp.cast());
             if lr == return_to_host_routine_addr {
                 echo_no_panic!("{:2}. [host function]", i);
             } else if lr == thread_exit_routine_addr {
@@ -1328,19 +1377,6 @@ impl Environment {
             } else {
                 echo_no_panic!("{:2}. {:#x}", i, lr);
             }
-
-            if previous_fp == 0 {
-                echo_no_panic!("Next FP is null.");
-                break;
-            }
-            if previous_fp <= fp || !previous_fp.is_multiple_of(4) {
-                echo_no_panic!(
-                    "Next FP ({:#x}) does not advance toward an older frame.",
-                    previous_fp
-                );
-                break;
-            }
-            fp = previous_fp;
             i += 1;
         }
     }
@@ -1357,40 +1393,47 @@ impl Environment {
         let stack_alloc = self.mem.alloc(stack_size);
         let stack_high_addr = stack_alloc.to_bits() + stack_size;
         assert!(stack_high_addr.is_multiple_of(4));
+        let thread_local_storage = self.mem.calloc(THREAD_LOCAL_STORAGE_SIZE);
+        if thread_local_storage.is_null() {
+            log!("Warning: failed to allocate TLS for guest thread; starting it with r9=0");
+        }
 
-        let thread_stack =
-            DefaultStack::new(16 * 1024 * 1024).expect("failed to allocate guest coroutine stack");
-        let thread_routine =
-            Coroutine::with_stack(thread_stack, move |yielder, mut env: Environment| {
-                log_dbg!(
-                    "touchHLE: guest worker thread now running (start_routine={:#x})",
-                    start_routine.addr_with_thumb_bit()
-                );
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    env.with_yielder(yielder, move |env| {
-                        let regs = env.cpu.regs_mut();
-                        regs[cpu::Cpu::LR] = env.dyld.thread_exit_routine().addr_with_thumb_bit();
-                        regs[cpu::Cpu::SP] = stack_high_addr;
-                        regs[0] = user_data.to_bits();
+        let thread_routine = Coroutine::new(move |yielder, mut env: Environment| {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.with_yielder(yielder, move |env| {
+                    let _implicit_autorelease_pool: objc::id =
+                        msg_class![env; NSAutoreleasePool new];
+                    let regs = env.cpu.regs_mut();
+                    regs[cpu::Cpu::LR] = env.dyld.thread_exit_routine().addr_with_thumb_bit();
+                    regs[cpu::Cpu::SP] = stack_high_addr;
+                    regs[cpu::Cpu::R9] = thread_local_storage.to_bits();
+                    regs[0] = user_data.to_bits();
+                    log_dbg!(
+                        "Starting guest thread {} with r9/TLS={:#x}, entry={:?}, arg={:?}",
+                        env.current_thread,
+                        thread_local_storage.to_bits(),
+                        start_routine,
+                        user_data
+                    );
 
-                        env.cpu.set_cpsr(
-                            cpu::Cpu::CPSR_USER_MODE
-                                | ((start_routine.is_thumb() as u32) * cpu::Cpu::CPSR_THUMB),
-                        );
-                        let return_value: mem::MutVoidPtr =
-                            start_routine.call_from_host(env, (user_data,));
-                        let curr_thread = &mut env.threads[env.current_thread];
-                        curr_thread.return_value = Some(return_value);
-                        curr_thread.active = false;
-                    });
-                }));
-                if let Err(e) = res {
-                    let panic_cell = env.panic_cell.clone();
-                    panic_cell.set(Some(env));
-                    std::panic::resume_unwind(e);
-                }
-                env
-            });
+                    env.cpu.set_cpsr(
+                        cpu::Cpu::CPSR_USER_MODE
+                            | ((start_routine.is_thumb() as u32) * cpu::Cpu::CPSR_THUMB),
+                    );
+                    let return_value: mem::MutVoidPtr =
+                        start_routine.call_from_host(env, (user_data,));
+                    let curr_thread = &mut env.threads[env.current_thread];
+                    curr_thread.return_value = Some(return_value);
+                    curr_thread.active = false;
+                });
+            }));
+            if let Err(e) = res {
+                let panic_cell = env.panic_cell.clone();
+                panic_cell.set(Some(env));
+                std::panic::resume_unwind(e);
+            }
+            env
+        });
 
         self.threads.push(Thread {
             active: true,
@@ -1400,10 +1443,21 @@ impl Environment {
             host_context: Some(thread_routine),
             stack: Some(stack_alloc.to_bits()..=(stack_high_addr - 1)),
             thread_local_framework_state: Default::default(),
+            thread_local_storage,
         });
 
         let new_thread_id = self.threads.len() - 1;
 
+        log!(
+            "Created guest worker thread {} for bundle={} routine={:?} arg={:?} stack={:#x}..={:#x} tls={:#x}",
+            new_thread_id,
+            self.bundle.bundle_identifier(),
+            start_routine,
+            user_data,
+            stack_alloc.to_bits(),
+            stack_high_addr - 1,
+            thread_local_storage.to_bits()
+        );
         log_dbg!("Created new thread {} with stack {:#x}–{:#x}, will execute function {:?} with data {:?}", new_thread_id, stack_alloc.to_bits(), (stack_high_addr - 1), start_routine, user_data);
 
         new_thread_id
@@ -1414,28 +1468,102 @@ impl Environment {
         &mut self.threads[self.current_thread].thread_local_framework_state
     }
 
+    /// Return the guest TLS/static-base pointer for a thread.
+    pub fn thread_local_storage(&self, thread: ThreadId) -> MutVoidPtr {
+        self.threads
+            .get(thread)
+            .map(|thread| thread.thread_local_storage)
+            .unwrap_or_default()
+    }
+
     /// Put the current thread to sleep for some duration, running other threads
     /// in the meantime as appropriate. Functions that call sleep right before
     /// they return back to the main run loop ([Environment::run]) should set
     /// `tail_call`.
     pub fn sleep(&mut self, duration: Duration) {
+        if duration == Duration::ZERO {
+            log_sampled!(
+                1024,
+                "Thread {} requested a zero-duration sleep; pacing cooperative yield at 1ms.",
+                self.current_thread
+            );
+            let until = self
+                .guest_clock
+                .now()
+                .checked_add(Duration::from_millis(1))
+                .unwrap();
+            self.yield_thread(ThreadBlock::Sleeping(until));
+            return;
+        }
+
         log_dbg!(
             "Thread {} is going to sleep for {:?}.",
             self.current_thread,
             duration
         );
-        let until = Instant::now().checked_add(duration).unwrap();
+        let until = self.guest_clock.now().checked_add(duration).unwrap();
         self.yield_thread(ThreadBlock::Sleeping(until));
     }
 
+    #[allow(dead_code)]
     /// Guest-requested sleep. Keep its deadline in game time so changing
     /// speed also affects waits already in progress. Host pacing uses sleep().
     pub fn sleep_guest(&mut self, duration: Duration) {
         let until = self.guest_clock.now().checked_add(duration).unwrap();
-        self.yield_thread(ThreadBlock::GuestSleeping(until));
+        self.yield_thread(ThreadBlock::Sleeping(until));
     }
 
-    #[allow(dead_code)]
+    /// Request that active guest execution returns through its host boundary.
+    ///
+    /// Linked libc functions use this when an `exit`/`abort` cannot be safely
+    /// unwound. The request is observed by the CPU loop after the host function
+    /// returns, so no guest instruction after a `noreturn` call is executed.
+    pub(crate) fn request_guest_termination(&mut self) {
+        self.guest_termination_requested = true;
+    }
+
+    /// Whether a linked guest termination function has requested session end.
+    pub(crate) fn is_guest_termination_requested(&self) -> bool {
+        self.guest_termination_requested
+    }
+
+    /// Remember that Unity's mandatory serialized player archive is unavailable.
+    ///
+    /// This records both a missing VFS node and an unreadable/empty archive
+    /// entry. The archive is not optional: once Unity has reported this failure
+    /// it calls `exit(1)` after partially initializing global state. Treating
+    /// that exit as a recoverable DRM-style exit leads to use-after-null and
+    /// bogus multi-gigabyte allocations, as the engine's cleanup path was not
+    /// designed to return to the app.
+    pub(crate) fn note_missing_unity_player_archive(&mut self, path: &str) {
+        let is_player_archive = path
+            .rsplit_once('/')
+            .is_some_and(|(parent, file)| {
+                file.eq_ignore_ascii_case("data.unity3d")
+                    && parent
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|component| component.eq_ignore_ascii_case("Data"))
+            });
+        if !is_player_archive || self.missing_unity_player_archive.is_some() {
+            return;
+        }
+
+        self.missing_unity_player_archive = Some(path.to_owned());
+        log!(
+            "Required Unity player archive {:?} is unavailable from the mounted \
+             bundle. A following guest termination will return to the host instead \
+             of resuming a \
+             half-initialized Unity engine.",
+            path
+        );
+    }
+
+    /// The unavailable Unity player archive, if a resource probe found one.
+    pub(crate) fn missing_unity_player_archive(&self) -> Option<&str> {
+        self.missing_unity_player_archive.as_deref()
+    }
+
     pub fn suspend_thread(&mut self, thread: ThreadId) {
         match &mut self.threads[thread].blocked_by {
             ThreadBlock::Suspended(count, _) => {
@@ -1495,7 +1623,8 @@ impl Environment {
     /// Like all other thread blocking functions, this will suspend
     /// execution of the current host thread.
     pub fn block_on_mutex(&mut self, mutex_id: MutexId) {
-        log_dbg!(
+        log_sampled!(
+            1024,
             "Thread {} blocking on mutex #{}.",
             self.current_thread,
             mutex_id
@@ -1526,6 +1655,11 @@ impl Environment {
         let mut host_sem = (*host_sem_rc).borrow_mut();
 
         if host_sem.value > 0 {
+            log_dbg!(
+                "sem_decrement: semaphore {:?} is now {}",
+                sem,
+                host_sem.value
+            );
             host_sem.value -= 1;
             return true;
         }
@@ -1537,6 +1671,11 @@ impl Environment {
             );
             return false;
         }
+        log_dbg!(
+            "Thread {} is blocking on semaphore {:?}",
+            self.current_thread,
+            sem
+        );
         host_sem.waiting.insert(self.current_thread);
         std::mem::drop(host_sem);
         // The scheduler will decrement the semaphore value when it unblocks.
@@ -1632,12 +1771,7 @@ impl Environment {
                     std::panic::resume_unwind(e);
                 }
             };
-            // As with the main app run loop, poll for events with SDL treating
-            // the current stack as the main stack; without this, event polling
-            // would be skipped for the rest of the picker session as soon as
-            // anything calls on_parent_stack_in_coroutine().
-            {
-                let window = self.window.as_mut().unwrap();
+            if let Some(window) = self.window.as_mut() {
                 window.on_main_stack = true;
                 window.poll_for_events(self.options.as_ref());
             }
@@ -1645,12 +1779,10 @@ impl Environment {
             match self.threads[0].blocked_by {
                 ThreadBlock::NotBlocked => {}
                 ThreadBlock::Sleeping(until) => {
-                    let duration = until.duration_since(Instant::now());
+                    let guest_duration = until.duration_since(self.guest_clock.now());
+                    let duration =
+                        guest_duration.div_f64(self.guest_clock.speed_multiplier());
                     std::thread::sleep(duration);
-                }
-                ThreadBlock::GuestSleeping(until) => {
-                    let due = self.guest_clock.host_deadline(until);
-                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
                 }
                 ref other => {
                     log!(
@@ -1669,73 +1801,27 @@ impl Environment {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
+        // A larger slice reduces host/coroutine transitions for normal JIT
+        // execution while keeping the conservative slice for ordinary mode.
+        let normal_execution_slice = if self.options.high_performance {
+            250_000
+        } else {
+            100_000
+        };
         loop {
+            if let Some(label) = self.guest_clock.poll_speed_request() {
+                log!("Guest clock speed set to {}.", label);
+            }
+            if self.main_thread_terminated {
+                log_no_panic!(
+                    "Main guest thread was terminated by the exception machinery; stopping the main run loop instead of re-entering corrupt state."
+                );
+                return;
+            }
             if stepping {
                 self.remaining_ticks = None;
             } else {
-                // 1,000,000 ticks is an arbitrary number. It needs to be
-                // reasonably large so we aren't jumping in and out of dynarmic
-                // or trying to poll for events too often. At the same time,
-                // very large values are bad for responsiveness.
-                //
-                // PERF: raised from 100,000 to 1,000,000: the per-batch costs
-                // (leaving/re-entering the JIT, coroutine switch, scheduler
-                // pass and one event-poll attempt) are amortised 10x better.
-                // This is responsiveness-safe because:
-                // - OS event polling has its own throttle in
-                //   Window::poll_for_events (roughly 120 Hz), independent of
-                //   batch size;
-                // - sleeping guest threads use absolute host deadlines, so the
-                //   scheduler still wakes them on time between batches;
-                // - in practice most batches end early anyway, when the guest
-                //   calls a host framework function (which happens many times
-                //   per frame: present, timers, audio, input, etc.), so the
-                //   larger cap mostly helps busy guest spin-loops, which is
-                //   exactly where the per-batch overhead used to matter.
-                //
-                // FRAME PACING: a thread still has to finish its current batch
-                // before the scheduler gets to wake any *sleeping* thread
-                // whose deadline arrived in the meantime, so with the large
-                // batch a pacing/timer/audio wake-up could land up to one
-                // batch (~a few ms at ~1M ticks) late. To keep
-                // millisecond-accurate deadlines (frame pacing, run-loop
-                // timers, audio callbacks) precise while retaining the
-                // overhead win in long busy stretches, fall back to the
-                // smaller batch whenever any thread has an imminent wake-up.
-                let imminent_wakeup = self.threads.iter().any(|thread| {
-                    let deadline = match thread.blocked_by {
-                        ThreadBlock::Sleeping(due) => Some(due),
-                        ThreadBlock::GuestSleeping(due) => Some(self.guest_clock.host_deadline(due)),
-                        _ => None,
-                    };
-                    deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
-                });
-                self.remaining_ticks = Some(if imminent_wakeup {
-                    100_000
-                } else {
-                    1_000_000
-                });
-            }
-            // RTCV-style game corruption: once per main-loop iteration, give the
-            // corruption engine a chance to mangle live guest memory. This is a
-            // no-op unless enabled via the `--corrupt*` options.
-            if self.corruptor.is_enabled() {
-                let mut corruptor = std::mem::take(&mut self.corruptor);
-                corruptor.tick(&mut self.mem);
-                self.corruptor = corruptor;
-            }
-            // Game trainer (Cheat Engine-style memory search/patch + on-screen
-            // UI). Disabled by default; skip it unless `--trainer` is enabled.
-            if self.trainer.enabled {
-                self.trainer.tick(
-                    &mut self.mem,
-                    Some(self.bundle.bundle_identifier()),
-                    &self.objc,
-                );
-            }
-            if let Some(speed) = crate::trainer_ui::take_speed_request() {
-                self.guest_clock.set_speed(speed);
-                crate::trainer_ui::publish_status(format!("GAME SPEED {}", speed.label()));
+                self.remaining_ticks = Some(normal_execution_slice);
             }
             let mut kill_current_thread = false;
             if let Some(w) = self.window.as_mut() {
@@ -1794,31 +1880,23 @@ impl Environment {
                     std::process::exit(-1)
                 };
                 self = env;
-                self.threads[self.current_thread].active = false;
                 let stack = self.threads[self.current_thread].stack.take().unwrap();
                 let stack: mem::MutVoidPtr = mem::Ptr::from_bits(*stack.start());
+                let thread_local_storage = self.threads[self.current_thread].thread_local_storage;
                 log_dbg!("Freeing thread {} stack {:?}", self.current_thread, stack);
                 self.mem.free(stack);
+                log_dbg!(
+                    "Freeing thread {} TLS {:?}",
+                    self.current_thread,
+                    thread_local_storage
+                );
+                self.mem.free(thread_local_storage);
                 None
             } else {
                 Some(curr_host_context)
             };
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
-            }
-
-            if kill_current_thread && self.guest_termination_requested {
-                echo!("Guest session ended through the controlled return-to-host path.");
-                return;
-            }
-            if self.guest_termination_requested {
-                // A host callback may have yielded before its linked-function
-                // dispatch reached the return-to-host check. Put this live
-                // context back so `Environment::drop` can unwind it safely,
-                // then stop before the scheduler resumes another guest thread.
-                self.threads[self.current_thread].host_context = old_context.take();
-                echo!("Guest session ended while returning from a host callback.");
-                return;
             }
 
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1830,6 +1908,21 @@ impl Environment {
                 // thread, lest every single callback call pay this cost.
                 if let Some(ref mut window) = self.window {
                     window.poll_for_events(&self.options);
+                }
+                // RTCV-style corruption engine (see --corrupt-game). Runs
+                // before the trainer so the trainer sees post-corruption
+                // memory; a no-op unless explicitly enabled.
+                if self.corruptor.is_enabled() {
+                    let mut corruptor = std::mem::take(&mut self.corruptor);
+                    corruptor.tick(&mut self.mem);
+                    self.corruptor = corruptor;
+                }
+                if !self.options.trainer_disabled {
+                    self.trainer.tick(
+                        &mut self.mem,
+                        Some(self.bundle.bundle_identifier()),
+                        &self.objc,
+                    );
                 }
                 let curr_thread_block = self.threads[self.current_thread].blocked_by.clone();
                 if stepping || matches!(curr_thread_block, ThreadBlock::WaitingForDebugger(_)) {
@@ -1865,11 +1958,20 @@ impl Environment {
                     } else {
                         None
                     };
-                    let will_step = self.gdb_server.as_deref_mut().unwrap().wait_for_debugger(
-                        reason.clone(),
-                        self.cpu.as_mut(),
-                        self.mem.as_mut(),
-                    );
+                    let mut gdb_server = self.gdb_server.take().unwrap();
+                    let will_step = gdb_server.wait_for_debugger(reason.clone(), &mut self);
+                    let resume_thread = gdb_server.take_resume_thread();
+                    self.gdb_server = Some(gdb_server);
+                    if let Some(resume_thread) = resume_thread {
+                        let can_resume_thread = resume_thread != self.current_thread
+                            && self
+                                .threads
+                                .get(resume_thread)
+                                .is_some_and(|thread| thread.active && !thread.is_blocked());
+                        if can_resume_thread {
+                            self.switch_thread(&mut old_context, resume_thread);
+                        }
+                    }
                     if will_step {
                         stepping = true;
                     }
@@ -1930,93 +2032,6 @@ impl Environment {
         }
     }
 
-    /// Request that active guest execution returns through its host boundary.
-    ///
-    /// Linked libc functions use this when an `exit`/`abort` cannot be safely
-    /// unwound. The request is observed by the CPU loop after the host function
-    /// returns, so no guest instruction after a `noreturn` call is executed.
-    pub(crate) fn request_guest_termination(&mut self) {
-        self.guest_termination_requested = true;
-    }
-
-    /// Whether a linked guest termination function has requested session end.
-    pub(crate) fn is_guest_termination_requested(&self) -> bool {
-        self.guest_termination_requested
-    }
-
-    /// Remember that Unity's mandatory serialized player archive is unavailable.
-    ///
-    /// This records both a missing VFS node and an unreadable/empty archive
-    /// entry. The archive is not optional: once Unity has reported this failure
-    /// it calls `exit(1)` after partially initializing global state. Treating
-    /// that exit as a recoverable DRM-style exit leads to use-after-null and
-    /// bogus multi-gigabyte allocations, as the engine's cleanup path was not
-    /// designed to return to the app.
-    pub(crate) fn note_missing_unity_player_archive(&mut self, path: &str) {
-        let is_player_archive = path.rsplit_once('/').is_some_and(|(parent, file)| {
-            file.eq_ignore_ascii_case("data.unity3d")
-                && parent
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|component| component.eq_ignore_ascii_case("Data"))
-        });
-        if !is_player_archive || self.missing_unity_player_archive.is_some() {
-            return;
-        }
-
-        self.missing_unity_player_archive = Some(path.to_owned());
-        log!(
-            "Required Unity player archive {:?} is unavailable from the mounted \
-             bundle. A following guest termination will return to the host instead \
-             of resuming a \
-             half-initialized Unity engine.",
-            path
-        );
-    }
-
-    /// The unavailable Unity player archive, if a resource probe found one.
-    pub(crate) fn missing_unity_player_archive(&self) -> Option<&str> {
-        self.missing_unity_player_archive.as_deref()
-    }
-
-    /// Preserve a deliberate guest-PC redirect across linked-stub dispatch.
-    pub(crate) fn note_guest_control_flow_redirect(&mut self) {
-        self.guest_control_flow_redirected = true;
-    }
-
-    /// Mark a synthetic frame installed for a host-to-guest call.
-    pub(crate) fn push_host_to_guest_stack_frame(
-        &mut self,
-        frame_pointer: u32,
-    ) -> (ThreadId, u32) {
-        let frame = (self.current_thread, frame_pointer);
-        self.host_to_guest_stack_frames.push(frame);
-        frame
-    }
-
-    /// Remove a synthetic frame after its host-to-guest call has returned.
-    pub(crate) fn pop_host_to_guest_stack_frame(&mut self, frame: (ThreadId, u32)) {
-        if let Some(index) = self
-            .host_to_guest_stack_frames
-            .iter()
-            .rposition(|&candidate| candidate == frame)
-        {
-            self.host_to_guest_stack_frames.remove(index);
-        } else {
-            log_no_panic!(
-                "Warning: synthetic host-to-guest frame {:?} was not tracked.",
-                frame
-            );
-        }
-    }
-
-    /// Whether the current frame is a synthetic host-to-guest call boundary.
-    pub(crate) fn is_host_to_guest_stack_frame(&self, frame_pointer: u32) -> bool {
-        self.host_to_guest_stack_frames
-            .iter()
-            .any(|&(thread, fp)| thread == self.current_thread && fp == frame_pointer)
-    }
-
     /// Run the emulator until the app returns control to the host. This is for
     /// host-to-guest function calls (see [abi::CallFromHost::call_from_host]).
     ///
@@ -2035,11 +2050,18 @@ impl Environment {
     fn switch_thread(&mut self, old_context: &mut Option<HostContext>, new_thread: ThreadId) {
         assert!(new_thread != self.current_thread);
         assert!(self.threads[new_thread].active);
-        log_dbg!(
-            "Switching thread: {} => {}",
-            self.current_thread,
-            new_thread
-        );
+        let old_thread = self.current_thread;
+        if self
+            .scheduler_watchdog
+            .record_switch(old_thread, new_thread)
+        {
+            log!(
+                "Warning: scheduler observed a hot alternating guest-thread burst ({} <=> {}). Both threads remain runnable; continuing with cooperative scheduling.",
+                old_thread,
+                new_thread
+            );
+        }
+        log_sampled!(1024, "Switching thread: {} => {}", old_thread, new_thread);
         let mut guest_ctx = self.threads[new_thread].guest_context.take().unwrap();
         self.cpu.swap_context(&mut guest_ctx);
         assert!(self.threads[self.current_thread].guest_context.is_none());
@@ -2086,6 +2108,39 @@ impl Environment {
             if matches!(error, cpu::CpuError::UndefinedInstruction) {
                 let pc = self.cpu.regs()[cpu::Cpu::PC];
                 let lr = self.cpu.regs()[cpu::Cpu::LR];
+
+                // A zero-filled fetch immediately above the Mach-O page-zero
+                // reservation is a null function-pointer call, not a real
+                // framework instruction. Return to the caller without sending
+                // it through the generic UDF workaround, which otherwise logs
+                // the event as a crash and may repeat it.
+                let null_code_limit = self.mem.null_segment_size().saturating_add(mem::PAGE_SIZE);
+                let fetched_instruction: u32 = self.mem.read(mem::ConstPtr::<u32>::from_bits(pc));
+                let invalid_code_address =
+                    (pc < 0x0001_0000 || pc >= u32::MAX - 0x0001_0000) && lr != 0;
+                if invalid_code_address {
+                    log_once_fmt!(
+                        "Recovered invalid-address UndefinedInstruction at {:#x}; returning to LR ({:#x})",
+                        pc,
+                        lr
+                    );
+                    self.cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
+                    self.udf_bypass_last = None;
+                    self.udf_bypass_count = 0;
+                    return;
+                }
+                if pc <= null_code_limit && fetched_instruction == 0 && lr != 0 {
+                    log_once_fmt!(
+                        "Recovered zero-filled low-address code fetch at {:#x}; returning to LR ({:#x})",
+                        pc,
+                        lr
+                    );
+                    self.cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
+                    self.udf_bypass_last = None;
+                    self.udf_bypass_count = 0;
+                    return;
+                }
+
                 // Potato Story Android hard fallback:
                 //
                 // The generic decoder did not match on-device, but Android
@@ -2262,9 +2317,25 @@ impl Environment {
                     }
                 }
 
+                // A repeated UDF exactly at the first instruction after the
+                // Mach-O page-zero reservation is the Android/Dynarmic low
+                // address trap seen by Minecraft, not a useful guest routine.
+                // Keep the existing compatibility return, but do not count it
+                // as a normal return-site loop or flood the log when callers
+                // reach the same trap with different LR values.
+                if pc == self.mem.null_segment_size() && lr != 0 {
+                    log_once_fmt!(
+                        "Recovered repeated low-address UndefinedInstruction at {:#x}; returning to caller LR values without per-call warning spam",
+                        pc
+                    );
+                    self.cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
+                    self.udf_bypass_last = None;
+                    self.udf_bypass_count = 0;
+                    return;
+                }
+
                 // Track repeated occurrences of the same bypass site.
-                const BYPASS_LIMIT: u32 = 256;
-                const LOG_RATE: u32 = 32;
+                const BYPASS_LIMIT: u32 = 32;
                 let key = (pc, lr);
                 let count = if self.udf_bypass_last == Some(key) {
                     self.udf_bypass_count = self.udf_bypass_count.saturating_add(1);
@@ -2274,109 +2345,43 @@ impl Environment {
                     self.udf_bypass_count = 1;
                     1
                 };
-                self.udf_bypass_total = self.udf_bypass_total.saturating_add(1);
-                let total = self.udf_bypass_total;
 
-                // Independently track how many times in a row we've faked a
-                // return to the SAME LR, ignoring the faulting PC. The `(pc,
-                // lr)` counter above resets to 1 whenever the faulting PC
-                // changes, so a guest that keeps calling through a bad/nil
-                // function pointer from a single call site — trapping at a
-                // handful of *different* garbage addresses but always
-                // returning to the same LR — never trips `BYPASS_LIMIT` and
-                // the emulator wedges forever.
-                //
-                // This is exactly the Rush Rally 2 startup hang: the faulting
-                // PC alternates between 0x4000 and 0x36c6ec30 while LR stays
-                // 0x2639a3, so the pair counter oscillates around 1 and the
-                // process spins until it's killed. Bounding the number of
-                // consecutive same-LR fake returns turns that infinite hang
-                // into a clean, actionable panic. We allow a larger budget
-                // here than `BYPASS_LIMIT` so genuinely recoverable cases
-                // (which do make forward progress and eventually settle on a
-                // stable LR) are unaffected.
-                const LR_BYPASS_LIMIT: u32 = 4096;
-                let lr_count = if self.udf_bypass_last_lr == Some(lr) {
-                    self.udf_bypass_lr_count = self.udf_bypass_lr_count.saturating_add(1);
-                    self.udf_bypass_lr_count
-                } else {
-                    self.udf_bypass_last_lr = Some(lr);
-                    self.udf_bypass_lr_count = 1;
-                    1
+                // The return address is often different on every call into a
+                // shared trap/abort site. Aggregate diagnostics by faulting PC
+                // so that the same UDF cannot fill the log with identical
+                // warnings. Powers of two retain useful evidence that the
+                // site is still active without printing every occurrence.
+                let site_count = {
+                    let count = self.udf_log_counts.entry(pc).or_insert(0);
+                    *count = count.saturating_add(1);
+                    *count
                 };
 
-                if lr_count >= LR_BYPASS_LIMIT {
-                    panic!(
-                        "UndefinedInstruction bypass faked a return to LR={:#x} \
-                         {} times in a row (most recent faulting PC {:#x}); \
-                         giving up to avoid hanging. The guest is repeatedly \
-                         calling through a bad/nil function pointer from a \
-                         single call site — usually a framework stub that \
-                         returned a bogus object the game then dereferences \
-                         as a function.",
-                        lr, lr_count, pc
-                    );
-                }
-
-                // Log the first sight of each new bypass site, but keyed on
-                // the *total* count so guests that cycle through many distinct
-                // (PC, LR) pairs stop flooding the log after LOG_RATE lines.
-                if total <= LOG_RATE && (count == 1 || count % LOG_RATE == 0) {
+                if site_count.is_power_of_two() {
                     log_no_panic!(
                         "Warning: Ignored UndefinedInstruction at {:#x}. \
                          Faking function return to LR ({:#x}) to bypass crash! \
                          cpsr={:#x} thumb={} instruction_len={} \
-                         (occurrence {} of at most {})",
+                         (fault-site occurrence {}; return path {} of at most {})",
                         pc,
                         lr,
                         self.cpu.cpsr(),
                         (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0,
                         instruction_len,
+                        site_count,
                         count,
                         BYPASS_LIMIT
-                    );
-                } else if total == LOG_RATE + 1 {
-                    log_no_panic!(
-                        "Warning: Ignored UndefinedInstruction bypass still active \
-                         ({} total so far); suppressing further per-site lines until \
-                         a new call site appears. Latest PC {:#x}, LR {:#x}.",
-                        total,
-                        pc,
-                        lr
                     );
                 }
 
                 if count >= BYPASS_LIMIT {
-                    // The same (PC, LR) pair has trapped BYPASS_LIMIT times.
-                    // Faking a return to LR clearly does not help — the caller
-                    // keeps re-entering the faulting site (usually a framework
-                    // stub that returned bogus data the guest re-calls into).
-                    // Rather than killing the whole emulator, degrade
-                    // gracefully: skip past the faulting instruction (treat
-                    // the UDF as a no-op) so execution continues in the
-                    // caller's body, and reset the counters so a later,
-                    // different loop still gets a fresh budget. A genuine
-                    // infinite hang is still bounded by LR_BYPASS_LIMIT
-                    // above and by the per-batch forward-progress reset in
-                    // `handle_cpu_state`.
-                    if count == BYPASS_LIMIT || count % (BYPASS_LIMIT * 4) == 0 {
-                        log_no_panic!(
-                            "Warning: UndefinedInstruction at {:#x} looped {} \
-                             times with LR={:#x}. Faking returns is not making \
-                             progress, so skipping the faulting instruction \
-                             instead. This usually means a framework stub \
-                             returned data the guest keeps re-trapping on.",
-                            pc,
-                            count,
-                            lr
-                        );
-                    }
-                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
-                    self.udf_bypass_last = None;
-                    self.udf_bypass_count = 0;
-                    self.udf_bypass_last_lr = None;
-                    self.udf_bypass_lr_count = 0;
-                    return;
+                    panic!(
+                        "UndefinedInstruction at {:#x} looped {} times with \
+                         LR={:#x}; giving up to avoid hanging. This usually \
+                         means a framework stub returned bogus data that the \
+                         guest keeps re-trapping on.",
+                        pc, count, lr
+                    );
                 }
 
                 // Pathological self-loop: when LR (with Thumb bit cleared)
@@ -2396,11 +2401,11 @@ impl Environment {
                         pc,
                         lr
                     );
-                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
+                    self.cpu.branch(GuestFunction::from_addr_with_thumb_bit(
+                        pc.wrapping_add(instruction_len),
+                    ));
                     self.udf_bypass_last = None;
                     self.udf_bypass_count = 0;
-                    self.udf_bypass_last_lr = None;
-                    self.udf_bypass_lr_count = 0;
                     return;
                 }
 
@@ -2442,18 +2447,7 @@ impl Environment {
     /// debugging) and decide what to do next.
     fn handle_cpu_state(&mut self, state: cpu::CpuState) -> ThreadNextAction {
         match state {
-            cpu::CpuState::Normal => {
-                // The CPU executed a full batch of instructions without
-                // trapping: real forward progress. Clear the same-LR bypass
-                // runaway counter so an earlier, since-recovered burst of
-                // fake returns can't accumulate toward a false-positive
-                // panic. (The genuine runaway loop never reaches this state:
-                // it produces back-to-back UndefinedInstruction errors with
-                // no Normal batch in between.)
-                self.udf_bypass_last_lr = None;
-                self.udf_bypass_lr_count = 0;
-                ThreadNextAction::Continue
-            }
+            cpu::CpuState::Normal => ThreadNextAction::Continue,
             cpu::CpuState::Svc(svc) => {
                 // The program counter is pointing at the
                 // instruction after the SVC, but we want the
@@ -2470,37 +2464,17 @@ impl Environment {
                     dyld::Dyld::SVC_LAZY_LINK
                     | dyld::Dyld::SVC_LAZY_LINK_RET_FLAG
                     | dyld::Dyld::SVC_LINKED_FUNCTIONS_BASE.. => {
-                        if let Some(f) = self.dyld.get_svc_handler(
+                        if let Some((symbol, f)) = self.dyld.get_svc_handler(
                             &self.bins,
                             &mut self.mem,
                             &mut self.cpu,
                             svc_pc,
                             svc,
                         ) {
-                            // Successfully dispatching a host/linked function
-                            // is real forward progress, so clear the same-LR
-                            // bypass runaway counter (see `debug_cpu_error`).
-                            self.udf_bypass_last_lr = None;
-                            self.udf_bypass_lr_count = 0;
+                            let previous_host_function = self.active_host_function.take();
+                            self.active_host_function = Some(symbol.clone());
                             f.call_from_guest(self);
-
-                            let guest_control_flow_redirected =
-                                std::mem::take(&mut self.guest_control_flow_redirected);
-                            if self.guest_termination_requested {
-                                log_dbg!(
-                                    "Guest termination requested on thread {}; \
-                                     returning through the host boundary.",
-                                    self.current_thread
-                                );
-                                return ThreadNextAction::ReturnToHost;
-                            }
-                            if guest_control_flow_redirected {
-                                log_dbg!(
-                                    "Linked host function redirected guest control flow; \
-                                     skipping normal stub return."
-                                );
-                                return ThreadNextAction::Continue;
-                            }
+                            self.active_host_function = previous_host_function;
 
                             // ORIGINAL LOGIC MERGED: Stack zeroing
                             if svc & dyld::Dyld::SVC_LAZY_LINK_RET_FLAG == 0 {
@@ -2524,6 +2498,47 @@ impl Environment {
                             }
                             ThreadNextAction::Continue
                         } else {
+                            // Resuming at `svc_pc` re-executes the SVC. For a
+                            // freshly-linked stub that is intentional (the
+                            // stub now contains real code), but if the same
+                            // PC keeps coming back it means the guest is
+                            // executing corrupt/stale code (Terraria 1.0:
+                            // 6.7M identical warnings, 694 MB log). Detect
+                            // the loop and terminate the guest thread.
+                            thread_local! {
+                                static RESUME_COUNT: RefCell<HashMap<u32, u32>> =
+                                    RefCell::new(HashMap::new());
+                            }
+                            let spins = RESUME_COUNT.with(|c| {
+                                let mut map = c.borrow_mut();
+                                let n = map.entry(svc_pc).or_insert(0);
+                                *n += 1;
+                                let result = *n;
+                                if result > 8 {
+                                    // Reset so a legitimately re-linked stub
+                                    // gets a fresh budget if we ever return.
+                                    map.remove(&svc_pc);
+                                }
+                                result
+                            });
+                            if spins > 8 {
+                                // log_once per PC: this fires repeatedly when
+                                // a corrupt guest keeps re-entering, and the
+                                // full message flooded logs (Terraria 1.0).
+                                thread_local! {
+                                    static SVC_STUCK_LOGGED: RefCell<std::collections::HashSet<u32>> =
+                                        RefCell::new(std::collections::HashSet::new());
+                                }
+                                SVC_STUCK_LOGGED.with(|set| {
+                                    if set.borrow_mut().insert(svc_pc) {
+                                        log_no_panic!(
+                                            "Guest thread {} is stuck re-executing unhandled SVC #{} at {:#x} (no handler, not a linkable stub); terminating the thread to prevent an infinite loop.",
+                                            self.current_thread, svc, svc_pc
+                                        );
+                                    }
+                                });
+                                return ThreadNextAction::ReturnToHost;
+                            }
                             self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
                             ThreadNextAction::Continue
                         }
@@ -2581,13 +2596,6 @@ impl Environment {
             );
             return;
         }
-        if self.guest_termination_requested {
-            log_dbg!(
-                "Guest termination is pending on thread {}; returning to host.",
-                initial_thread
-            );
-            return;
-        }
 
         loop {
             while self
@@ -2622,130 +2630,6 @@ impl Environment {
                     ring_i.wrapping_add(1),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-
-                // Asphalt 8 (com.gameloft.asphalt8) v1.1.0 compatibility hacks,
-                // ported from the touchHLE-XaView fork. The game deliberately
-                // calls abort() when its DRM/network checks fail, which looks
-                // like a silent emulator crash. These unwinds skip the checks.
-                if self
-                    .bundle
-                    .bundle_identifier()
-                    .starts_with("com.gameloft.asphalt8")
-                {
-                    let pc = self.cpu.regs()[Cpu::PC];
-                    // BypassAsphaltDRM: deep stack unwind past the license check
-                    if pc == 0x00600ac4 {
-                        log!(
-                            "WARNING: Bypassing Asphalt DRM via deep stack unwind at {:#010x}!",
-                            pc
-                        );
-                        let fp0 = self.cpu.regs()[7];
-                        let fp1: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
-                        let fp2: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp1));
-                        let target_lr: GuestUSize =
-                            self.mem.read(mem::ConstPtr::from_bits(fp2 + 4));
-                        self.cpu.regs_mut()[7] = fp2;
-                        self.cpu.regs_mut()[Cpu::SP] = fp1 + 8;
-                        self.cpu.regs_mut()[0] = 0;
-                        self.cpu
-                            .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
-                    }
-                    // RestoreConditionalUnwinds: network module deadlocks
-                    if (pc == 0x00c3296c || pc == 0x00c32bfc) && self.current_thread != 0 {
-                        let fp0 = self.cpu.regs()[7];
-                        let prev_fp: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
-                        let target_lr: GuestUSize =
-                            self.mem.read(mem::ConstPtr::from_bits(fp0 + 4));
-                        let current_lr = self.cpu.regs()[Cpu::LR];
-                        if (current_lr & 0xFFFF0000) == 0x005b0000
-                            || (target_lr & 0xFFFF0000) == 0x005b0000
-                        {
-                            log!(
-                                "WARNING: Asphalt network deadlock safely unwound at {:#010x}! LR: {:#010x}",
-                                pc,
-                                target_lr
-                            );
-                            self.cpu.regs_mut()[7] = prev_fp;
-                            self.cpu.regs_mut()[Cpu::SP] = fp0 + 8;
-                            self.cpu.regs_mut()[0] = 0;
-                            self.cpu
-                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
-                        }
-                    } else if (pc == 0x00c3375c || pc == 0x00c3376c) && self.current_thread != 0 {
-                        let fp0 = self.cpu.regs()[7];
-                        let fp1: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
-                        let prev_fp: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp1));
-                        let target_lr: GuestUSize =
-                            self.mem.read(mem::ConstPtr::from_bits(fp1 + 4));
-                        if (target_lr & 0xFFFF0000) == 0x005b0000 {
-                            log!(
-                                "WARNING: Asphalt deep unwind of infinite parser loop! LR: {:#010x}",
-                                target_lr
-                            );
-                            self.cpu.regs_mut()[7] = prev_fp;
-                            self.cpu.regs_mut()[Cpu::SP] = fp1 + 8;
-                            self.cpu.regs_mut()[0] = 0;
-                            self.cpu
-                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
-                        }
-                    } else if pc == 0x00c32b3c {
-                        // TargetedDoubleUnwind: smashed stack frame repair
-                        log!(
-                            "WARNING: Unwinding smashed Asphalt stack frame at {:#010x}! Thread: {}",
-                            pc,
-                            self.current_thread
-                        );
-                        let fp0 = self.cpu.regs()[7];
-                        let fp1: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
-                        if fp1 > fp0 && fp1.wrapping_sub(fp0) < 0x1000 {
-                            let saved_r4: GuestUSize =
-                                self.mem.read(mem::ConstPtr::from_bits(fp1 - 12));
-                            let saved_r5: GuestUSize =
-                                self.mem.read(mem::ConstPtr::from_bits(fp1 - 8));
-                            let saved_r6: GuestUSize =
-                                self.mem.read(mem::ConstPtr::from_bits(fp1 - 4));
-                            let saved_r7: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp1));
-                            let saved_lr: GuestUSize =
-                                self.mem.read(mem::ConstPtr::from_bits(fp1 + 4));
-                            self.cpu.regs_mut()[4] = saved_r4;
-                            self.cpu.regs_mut()[5] = saved_r5;
-                            self.cpu.regs_mut()[6] = saved_r6;
-                            self.cpu.regs_mut()[7] = saved_r7;
-                            self.cpu.regs_mut()[Cpu::SP] = fp1 + 8;
-                            self.cpu.regs_mut()[0] = 0;
-                            self.cpu
-                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(saved_lr | 1));
-                        } else {
-                            log!("FATAL: Asphalt stack chain corrupted beyond fp0!");
-                            self.cpu
-                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(
-                                    0x00a8a1bd | 1,
-                                ));
-                        }
-                    }
-                    // BypassAsphaltOverdriveDeadlocks
-                    let lr = self.cpu.regs()[Cpu::LR];
-                    if (pc == 0x009d7784 && (lr == 0x0039418f || lr == 0x0039419b))
-                        || (pc == 0x009d7464 && lr == 0x0078df65)
-                        || (pc == 0x009d8334 && lr == 0x001722e1)
-                    {
-                        log!(
-                            "WARNING: Unwinding Asphalt Overdrive deadlock at PC: {:#010x}, LR: {:#010x}",
-                            pc,
-                            lr
-                        );
-                        let fp0 = self.cpu.regs()[7];
-                        let prev_fp: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
-                        let target_lr: GuestUSize =
-                            self.mem.read(mem::ConstPtr::from_bits(fp0 + 4));
-                        self.cpu.regs_mut()[7] = prev_fp;
-                        self.cpu.regs_mut()[Cpu::SP] = fp0 + 8;
-                        self.cpu.regs_mut()[0] = 0;
-                        self.cpu
-                            .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
-                    }
-                }
-
                 match self.handle_cpu_state(state) {
                     ThreadNextAction::Continue => {}
                     ThreadNextAction::ReturnToHost => return,
@@ -2766,7 +2650,8 @@ impl Environment {
     /// condition is met.
     pub fn yield_thread(&mut self, thread_block: ThreadBlock) {
         assert!(!self.threads[self.current_thread].is_blocked());
-        log_dbg!(
+        log_sampled!(
+            1024,
             "Thread {} yielding on {:?}",
             self.current_thread,
             thread_block
@@ -2832,6 +2717,7 @@ impl Environment {
         loop {
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
+            let now = self.guest_clock.now();
             let mut next_awakening: Option<Instant> = None;
             for i in 0..self.threads.len() {
                 let thread_id = (self.current_thread + 1 + i) % self.threads.len();
@@ -2842,7 +2728,7 @@ impl Environment {
                 }
                 match candidate.blocked_by {
                     ThreadBlock::Sleeping(sleeping_until) => {
-                        if sleeping_until <= Instant::now() {
+                        if sleeping_until <= now {
                             log_dbg!("Thread {} finished sleeping.", thread_id);
                             candidate.blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
@@ -2852,14 +2738,6 @@ impl Environment {
                                 Some(other) => Some(other.min(sleeping_until)),
                             };
                         }
-                    }
-                    ThreadBlock::GuestSleeping(due) => {
-                        if due <= self.guest_clock.now() {
-                            candidate.blocked_by = ThreadBlock::NotBlocked;
-                            return thread_id;
-                        }
-                        let host_due = self.guest_clock.host_deadline(due);
-                        next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
                     ThreadBlock::Mutex(mutex_id) => {
                         if !self.mutex_state.mutex_is_locked(mutex_id) {
@@ -2971,7 +2849,11 @@ impl Environment {
                                 // Теперь эмулятор не упадет, а честно уснет до
                                 // этого момента.
                                 let remaining = deadline - time;
-                                let awakening = Instant::now() + remaining;
+                                let awakening = self
+                                    .guest_clock
+                                    .now()
+                                    .checked_add(remaining)
+                                    .unwrap();
                                 next_awakening = match next_awakening {
                                     None => Some(awakening),
                                     Some(other) => Some(other.min(awakening)),
@@ -2981,25 +2863,31 @@ impl Environment {
                         }
                     }
                     ThreadBlock::Joining(joinee_thread, ptr) => {
-                        if !self.threads[joinee_thread].active {
+                        let Some(joinee) = self.threads.get(joinee_thread) else {
+                            log!(
+                                "Warning: thread {} was joining missing thread {}; waking it with a null return value.",
+                                thread_id,
+                                joinee_thread
+                            );
+                            if !ptr.is_null() {
+                                self.mem.write(ptr, MutVoidPtr::null());
+                            }
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        };
+                        if !joinee.active {
                             log_dbg!(
                                 "Thread {} joining with now finished thread {}.",
                                 self.current_thread,
                                 joinee_thread
                             );
-                            // Write the return value, unless the pointer to
-                            // write to is null.
+                            // A thread can finish through a guest exception or
+                            // pthread_exit without producing a return value.
+                            // Joining it must not turn that situation into a
+                            // host panic or a permanent boot-image hang.
+                            let return_value = joinee.return_value.unwrap_or_default();
                             if !ptr.is_null() {
-                                if let Some(rv) = self.threads[joinee_thread].return_value {
-                                    self.mem.write(ptr, rv);
-                                } else {
-                                    log_dbg!(
-                                        "Thread {} joined thread {} which has no return value (pthread_exit?); writing NULL",
-                                        self.current_thread,
-                                        joinee_thread
-                                    );
-                                    self.mem.write(ptr, Ptr::null());
-                                }
+                                self.mem.write(ptr, return_value);
                             }
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
@@ -3013,13 +2901,22 @@ impl Environment {
                         // Original enforced assertion
                         assert!(cnt > 0);
                     }
+                    ThreadBlock::FileObjectLock(file_ptr) => {
+                        // FILE locks are no-ops (flockfile is single-threaded
+                        // by convention here), so a thread parked on one is
+                        // always runnable.
+                        let _ = file_ptr;
+                        self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                        return thread_id;
+                    }
                 }
             }
 
             // All suitable threads are blocked and at least one is asleep.
             // Sleep until one of them wakes up.
             if let Some(next_awakening) = next_awakening {
-                let duration = next_awakening.duration_since(Instant::now());
+                let guest_duration = next_awakening.duration_since(self.guest_clock.now());
+                let duration = guest_duration.div_f64(self.guest_clock.speed_multiplier());
                 log_dbg!("All threads blocked/asleep, sleeping for {:?}.", duration);
                 std::thread::sleep(duration);
                 // Try again, there should be some thread awake now (or
@@ -3046,7 +2943,30 @@ impl Environment {
                     continue;
                 }
                 DEADLOCK_GRACE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-                panic!("No active threads, program has deadlocked!");
+                // Deadlock recovery: a guest thread can die or wedge while
+                // holding a mutex that other threads (often the app's own
+                // crash handler) are blocked on. Instead of killing the
+                // whole app, force-release the wedged mutexes and give the
+                // waiters a chance to proceed. Only if this keeps happening
+                // do we give up with a panic.
+                static DEADLOCK_FORCE_RELEASES: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let force_releases =
+                    DEADLOCK_FORCE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let released = self.mutex_state.force_release_deadlocked_mutexes();
+                if released.is_empty() || force_releases >= 24 {
+                    // Give the guest crash handler generous room to finish
+                    // its dump-writing loop (Man of Steel's Breakpad handler
+                    // retries for a while) before giving up.
+                    panic!("No active threads, program has deadlocked!");
+                }
+                for (mutex_id, owner) in &released {
+                    log!(
+                        "Deadlock recovery: force-released mutex #{} (was owned by thread {}); unblocking waiters.",
+                        mutex_id,
+                        owner
+                    );
+                }
             }
         }
     }
@@ -3094,35 +3014,25 @@ impl Environment {
         // the coroutine boundary so it's ok.
         unsafe impl Send for WindowWrapper<'_> {}
 
-        const NO_WINDOW_MSG: &str =
-            "on_parent_stack_in_coroutine() was called while touchHLE is running in \
-             headless mode (no window). This function is only for code paths that \
-             need a real window (e.g. OpenGL ES, text input, dialogs); headless-safe \
-             callers must check env.window.is_none() first and skip the window-only \
-             work instead of routing through here.";
-
         if !self.yielder.is_null() {
             unsafe {
                 let yielder = self.yielder.as_ref().unwrap();
                 let wrapped = WindowWrapper {
-                    window: self.window.as_mut().expect(NO_WINDOW_MSG),
+                    window: self.window.as_mut().unwrap(),
                 };
                 let res = yielder.on_parent_stack(|| {
                     let wrapped = wrapped;
                     wrapped.window.on_main_stack = true;
                     f(wrapped.window, self.options.as_mut())
                 });
-                self.window.as_mut().expect(NO_WINDOW_MSG).on_main_stack = false;
+                self.window.as_mut().unwrap().on_main_stack = false;
                 res
             }
         } else {
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
             }
-            f(
-                self.window.as_mut().expect(NO_WINDOW_MSG),
-                self.options.as_mut(),
-            )
+            f(self.window.as_mut().unwrap(), self.options.as_mut())
         }
     }
 }
@@ -3170,9 +3080,29 @@ impl Drop for Environment {
 
 #[cfg(test)]
 mod dylib_sorting_tests {
+    use super::*;
     use std::collections::HashSet;
 
-    use super::*;
+    #[test]
+    fn scheduler_watchdog_ignores_non_alternating_switches() {
+        let mut watchdog = SchedulerWatchdog::default();
+        for _ in 0..1024 {
+            assert!(!watchdog.record_switch(0, 1));
+            assert!(!watchdog.record_switch(1, 2));
+        }
+    }
+
+    #[test]
+    fn scheduler_watchdog_detects_hot_alternation() {
+        let mut watchdog = SchedulerWatchdog::default();
+        let mut warned = false;
+        for _ in 0..1025 {
+            warned |= watchdog.record_switch(0, 1);
+            warned |= watchdog.record_switch(1, 0);
+        }
+        assert!(warned);
+    }
+
     fn create_dylib_graph(bin_configs: &[(&str, &[&str])]) -> Vec<BinaryDependencyNode> {
         bin_configs
             .iter()
@@ -3318,45 +3248,6 @@ mod dylib_sorting_tests {
         assert!(
             result.is_err(),
             "Sort should detect self-dependency as a cycle and return an error"
-        );
-    }
-
-    #[test]
-    fn test_transitive_dependencies_and_aliases_are_loaded_once() {
-        let roots = vec![
-            "/usr/lib/libstdc++.6.dylib".to_owned(),
-            "/usr/lib/libstdc++.6.0.9.dylib".to_owned(),
-        ];
-        let mut visited = Vec::new();
-        let loaded = load_transitive_dependencies(&roots, |path| {
-            visited.push(path.to_owned());
-            let dependencies = match path {
-                "/usr/lib/libstdc++.6.dylib" | "/usr/lib/libstdc++.6.0.9.dylib" => {
-                    Some(vec!["/usr/lib/libgcc_s.1.dylib".to_owned()])
-                }
-                "/usr/lib/libgcc_s.1.dylib" => {
-                    Some(vec!["/usr/lib/libSystem.B.dylib".to_owned()])
-                }
-                _ => None,
-            };
-            Ok(dependencies.map(|dependencies| (path.to_owned(), dependencies)))
-        })
-        .unwrap();
-
-        assert_eq!(
-            loaded,
-            vec![
-                "/usr/lib/libstdc++.6.dylib".to_owned(),
-                "/usr/lib/libgcc_s.1.dylib".to_owned(),
-            ]
-        );
-        assert_eq!(
-            visited,
-            vec![
-                "/usr/lib/libstdc++.6.dylib".to_owned(),
-                "/usr/lib/libgcc_s.1.dylib".to_owned(),
-                "/usr/lib/libSystem.B.dylib".to_owned(),
-            ]
         );
     }
 }

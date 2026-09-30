@@ -125,11 +125,7 @@ static CRC32_TABLE: LazyLock<[u32; 256]> = LazyLock::new(|| {
     for (index, entry) in table.iter_mut().enumerate() {
         let mut value = index as u32;
         for _ in 0..8 {
-            value = if value & 1 != 0 {
-                0xedb8_8320 ^ (value >> 1)
-            } else {
-                value >> 1
-            };
+            value = if value & 1 != 0 { 0xedb8_8320 ^ (value >> 1) } else { value >> 1 };
         }
         *entry = value;
     }
@@ -168,14 +164,10 @@ fn write_cm_time_at(
     flags: u32,
     epoch: i64,
 ) -> Result<(), String> {
-    mem.write_u64(pointer, value as u64)
-        .map_err(str::to_owned)?;
-    mem.write_u32(pointer.saturating_add(8), timescale as u32)
-        .map_err(str::to_owned)?;
-    mem.write_u32(pointer.saturating_add(12), flags)
-        .map_err(str::to_owned)?;
-    mem.write_u64(pointer.saturating_add(16), epoch as u64)
-        .map_err(str::to_owned)
+    mem.write_u64(pointer, value as u64).map_err(str::to_owned)?;
+    mem.write_u32(pointer.saturating_add(8), timescale as u32).map_err(str::to_owned)?;
+    mem.write_u32(pointer.saturating_add(12), flags).map_err(str::to_owned)?;
+    mem.write_u64(pointer.saturating_add(16), epoch as u64).map_err(str::to_owned)
 }
 
 /// CMTime struct returns come back through the x8 indirect-result slot.
@@ -217,7 +209,10 @@ fn lcm_timescale(a: i32, b: i32) -> i64 {
 /// Best-effort stack argument reader: AArch64 AAPCS passes the 9th+ argument
 /// on the stack above SP. The dynarmic context does not expose SP, so this
 /// reads the caller-provided shadow register slot if the address is mapped.
-fn stack_arg(context: &touchHLE_DynarmicA64Context, index: u64) -> Option<u64> {
+fn stack_arg(
+    context: &touchHLE_DynarmicA64Context,
+    index: u64,
+) -> Option<u64> {
     let slot = context.regs.get((9 + index) as usize).copied()?;
     if slot == 0 {
         None
@@ -1364,8 +1359,7 @@ pub(super) fn dispatch(
         }
         StubKind::ZlibVersion => {
             let version = mem.alloc_zeroed(8).map_err(str::to_owned)?;
-            mem.write_bytes(version, b"1.2.11\0")
-                .map_err(str::to_owned)?;
+            mem.write_bytes(version, b"1.2.11\0").map_err(str::to_owned)?;
             super::return_value(context, version);
         }
         StubKind::Crc32 => {
@@ -1440,7 +1434,10 @@ pub(super) fn dispatch(
             // encoding string.
             let types_pointer = objc_field(mem, method, 0);
             let encoding = c_string(mem, types_pointer).unwrap_or_default();
-            super::return_value(context, u64::from(objc_encoding_argument_count(&encoding)));
+            super::return_value(
+                context,
+                u64::from(objc_encoding_argument_count(&encoding)),
+            );
         }
         StubKind::ObjectSetClass => {
             let object = context.regs[0];
@@ -1526,14 +1523,7 @@ pub(super) fn dispatch(
             } else {
                 scaled_a + scaled_b
             };
-            write_cm_time(
-                context,
-                mem,
-                value,
-                timescale as i32,
-                0x1,
-                a.epoch.max(b.epoch),
-            )?;
+            write_cm_time(context, mem, value, timescale as i32, 0x1, a.epoch.max(b.epoch))?;
         }
         StubKind::CMTimeCompare => {
             let a = read_cm_time(mem, context.regs[0]);
@@ -1565,14 +1555,7 @@ pub(super) fn dispatch(
             let duration = read_cm_time(mem, context.regs[1]);
             let out = context.regs[8];
             if out != 0 && mem.allocation_size(out).is_some() {
-                write_cm_time_at(
-                    mem,
-                    out,
-                    start.value,
-                    start.timescale,
-                    start.flags,
-                    start.epoch,
-                )?;
+                write_cm_time_at(mem, out, start.value, start.timescale, start.flags, start.epoch)?;
                 write_cm_time_at(
                     mem,
                     out + 24,
@@ -1699,8 +1682,7 @@ pub(super) fn dispatch(
             let description = mem.alloc_zeroed(128).map_err(str::to_owned)?;
             if asbd_pointer != 0 && mem.allocation_size(asbd_pointer).is_some() {
                 if let Ok(bytes) = mem.read_bytes(asbd_pointer, 40) {
-                    mem.write_bytes(description, &bytes)
-                        .map_err(str::to_owned)?;
+                    mem.write_bytes(description, &bytes).map_err(str::to_owned)?;
                 }
             }
             if layout_size != 0 && context.regs[3] != 0 {
@@ -1736,12 +1718,358 @@ pub(super) fn dispatch(
             // hard abort here would take down the whole process.
             super::return_value(context, 0);
         }
-        StubKind::CMSampleBufferGetDataIsReady => {
-            let ready = mem
-                .read_u32(context.regs[0].saturating_add(24))
+        StubKind::GxxPersonality => {
+            // _Unwind_Reason_Code: 0 == _URC_OK (no handler found is safer
+            // than claiming one exists).
+            super::return_value(context, 0);
+        }
+        StubKind::OperatorDeleteNothrow => {
+            // operator delete(void*, const std::nothrow_t&) — no-op.
+        }
+        StubKind::ZlibVersion => {
+            let pointer = mem.alloc_zeroed(8).map_err(str::to_owned)?;
+            mem.write_bytes(pointer, b"1.2.11").map_err(str::to_owned)?;
+            mem.write_u8(pointer + 6, 0).map_err(str::to_owned)?;
+            super::return_value(context, pointer);
+        }
+        StubKind::Crc32 => {
+            let crc = context.regs[0] as u32;
+            let buffer = context.regs[1];
+            let length = context.regs[2];
+            let mut value = crc ^ 0xffff_ffff;
+            for index in 0..length.min(64 * 1024 * 1024) {
+                let byte = match mem.read_u8(buffer.saturating_add(index)) {
+                    Ok(byte) => byte,
+                    Err(_) => break,
+                };
+                value = CRC32_TABLE[((value ^ u32::from(byte)) & 0xff) as usize]
+                    ^ (value >> 8);
+            }
+            super::return_value(context, u64::from(value ^ 0xffff_ffff));
+        }
+        StubKind::ZlibUncompress => {
+            let dest = context.regs[0];
+            let dest_len_pointer = context.regs[1];
+            let source = context.regs[2];
+            let source_len = context.regs[3];
+            let dest_len = mem
+                .read_u64(dest_len_pointer)
+                .map(|value| value.min(64 * 1024 * 1024))
                 .unwrap_or(0);
+            let compressed = mem
+                .read_bytes(source, source_len.min(64 * 1024 * 1024))
+                .map_err(str::to_owned)?;
+            let mut output = vec![0u8; dest_len as usize];
+            let mut decompress = flate2::Decompress::new(true);
+            let status = decompress.decompress(&compressed, &mut output, flate2::FlushDecompress::Finish);
+            let written = dest_len as usize - decompress.total_out() as usize;
+            let _ = written;
+            match status {
+                Ok(_) if decompress.total_out() <= dest_len => {
+                    mem.write_bytes(dest, &output[..decompress.total_out() as usize])
+                        .map_err(str::to_owned)?;
+                    mem.write_u64(dest_len_pointer, decompress.total_out())
+                        .map_err(str::to_owned)?;
+                    super::return_value(context, 0);
+                }
+                _ => super::return_value(context, (-5i32) as u64),
+            }
+        }
+        StubKind::ZlibInit => super::return_value(context, 0),
+        StubKind::GzOpen => {
+            // No guest filesystem translation here; hand out a valid handle
+            // backed by an empty stream so gzread reports EOF instead of
+            // crashing on a NULL dereference.
+            let handle = mem.alloc_zeroed(64).map_err(str::to_owned)?;
+            super::return_value(context, handle);
+        }
+        StubKind::GzRead => {
+            if context.regs[0] == 0 {
+                super::return_value(context, (-1i32) as u64);
+            } else {
+                // Writing through gzread is rare (Geometry Dash writes logs);
+                // report success without touching the buffer.
+                super::return_value(context, context.regs[2]);
+            }
+        }
+        StubKind::GzClose => super::return_value(context, 0),
+        StubKind::SemTimedwait => super::return_value(context, 0),
+        StubKind::SetIOPolicy => super::return_value(context, 0),
+        StubKind::Dup2 => super::return_value(context, context.regs[1]),
+        StubKind::Execl => super::return_value(context, (-1i32) as u64),
+        StubKind::Socketpair => super::return_value(context, (-1i32) as u64),
+        StubKind::TcGetSetAttr => {
+            if context.regs[1] != 0 {
+                let _ = mem.write_bytes(context.regs[1], &vec![0u8; 64]);
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::MethodGetNumberOfArguments => {
+            let encoding = c_string(mem, context.regs[0]).unwrap_or_default();
+            super::return_value(
+                context,
+                u64::from(objc_encoding_argument_count(&encoding)),
+            );
+        }
+        StubKind::ObjectSetClass => {
+            let receiver = context.regs[0];
+            let class = context.regs[1];
+            let old_class = mem.read_u64(receiver).unwrap_or(0);
+            if receiver != 0 && class != 0 {
+                mem.write_u64(receiver, class).map_err(str::to_owned)?;
+            }
+            super::return_value(context, old_class);
+        }
+        StubKind::Basename => {
+            let path = c_string(mem, context.regs[0]).unwrap_or_default();
+            let base = match path.iter().rposition(|byte| *byte == b'/') {
+                Some(index) => path[index + 1..].to_vec(),
+                None => path.clone(),
+            };
+            let base = if base.is_empty() { path } else { base };
+            let pointer = mem.alloc_zeroed(base.len() as u64 + 1).map_err(str::to_owned)?;
+            mem.write_bytes(pointer, &base).map_err(str::to_owned)?;
+            mem.write_u8(pointer + base.len() as u64, 0).map_err(str::to_owned)?;
+            super::return_value(context, pointer);
+        }
+        StubKind::AUGraphGetNodeCount => {
+            if context.regs[1] != 0 {
+                mem.write_u32(context.regs[1], 0).map_err(str::to_owned)?;
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::AudioQueueDeviceGetCurrentTime => {
+            // AudioTimeStamp {mSampleTime, mHostTime, mRateScalar,
+            // mWordClockTime, mFlags}: report sample time valid with a
+            // monotonically increasing fake sample clock.
+            let out = context.regs[1];
+            if out != 0 {
+                let ticks = GUEST_SAMPLE_CLOCK.fetch_add(1024, Ordering::Relaxed);
+                mem.write_u64(out, u64::from(ticks)).map_err(str::to_owned)?;
+                mem.write_u64(out + 8, 0).map_err(str::to_owned)?;
+                mem.write_u64(out + 16, 0).map_err(str::to_owned)?;
+                mem.write_u64(out + 24, 0).map_err(str::to_owned)?;
+                mem.write_u32(out + 32, 1).map_err(str::to_owned)?;
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::AudioQueueOfflineRender => {
+            let buffer_list = context.regs[2];
+            if buffer_list != 0 {
+                let count = mem.read_u32(buffer_list).unwrap_or(0).min(8);
+                for index in 0..u64::from(count) {
+                    let buffer = buffer_list + 4 + index * 16;
+                    let size = mem.read_u32(buffer + 4).unwrap_or(0);
+                    let data = mem.read_u64(buffer + 8).unwrap_or(0);
+                    if data != 0 && size > 0 {
+                        let _ = mem.write_bytes(data, &vec![0u8; size as usize]);
+                    }
+                }
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::CMSampleBufferCreate | StubKind::CMSampleBufferCreateCopyWithNewTiming => {
+            // Layout maintained by these stubs:
+            //   +0   i64  presentationTimeStamp.value
+            //   +8   i32  presentationTimeStamp.timescale
+            //   +12  u32  presentationTimeStamp.flags
+            //   +16  i64  presentationTimeStamp.epoch
+            //   +24  u32  dataReady
+            //   +32  u64  formatDescription
+            //   +40  u64  dataBuffer
+            //   +48  u32  dataBufferByteSize (audio path)
+            let sample = mem.alloc_zeroed(64).map_err(str::to_owned)?;
+            if let Some(timing) = stack_arg(context, 0) {
+                if timing != 0 && mem.allocation_size(timing).is_some() {
+                    for offset in 0..24u64 {
+                        let byte = mem.read_u8(timing + offset).unwrap_or(0);
+                        mem.write_u8(sample + offset, byte).map_err(str::to_owned)?;
+                    }
+                }
+            }
+            let format_description = if kind == StubKind::CMSampleBufferCreateCopyWithNewTiming {
+                copy_sample_format_description(mem, context.regs[0])
+            } else {
+                context.regs[5]
+            };
+            mem.write_u32(sample + 24, 1).map_err(str::to_owned)?;
+            mem.write_u64(sample + 32, format_description).map_err(str::to_owned)?;
+            let data_buffer = if kind == StubKind::CMSampleBufferCreateCopyWithNewTiming {
+                0
+            } else {
+                context.regs[1]
+            };
+            mem.write_u64(sample + 40, data_buffer).map_err(str::to_owned)?;
+            // OSStatus return; sBufferOut is the 11th argument. The generic
+            // runtime keeps stack arguments in the shadow slots used by
+            // `stack_arg`; prefer a non-null x8 (common in wrapper builds).
+            let out = context.regs[8];
+            if out != 0 && mem.allocation_size(out).is_some() {
+                mem.write_u64(out, sample).map_err(str::to_owned)?;
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::CMSampleBufferGetFormatDescription => {
+            super::return_value(context, mem.read_u64(context.regs[0].saturating_add(32)).unwrap_or(0));
+        }
+        StubKind::CMSampleBufferGetPresentationTimeStamp => {
+            let sample = context.regs[0];
+            let value = mem.read_u64(sample).unwrap_or(0) as i64;
+            let timescale = mem.read_u32(sample.saturating_add(8)).unwrap_or(0) as i32;
+            let flags = mem.read_u32(sample.saturating_add(12)).unwrap_or(0);
+            let epoch = mem.read_u64(sample.saturating_add(16)).unwrap_or(0);
+            write_cm_time(context, mem, value, timescale, flags, epoch as i64)?;
+        }
+        StubKind::CMSampleBufferGetSampleTimingInfo => {
+            let sample = context.regs[0];
+            let out = context.regs[1];
+            if out != 0 {
+                for offset in 0..24u64 {
+                    let byte = mem.read_u8(sample + offset).unwrap_or(0);
+                    mem.write_u8(out + offset, byte).map_err(str::to_owned)?;
+                }
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::CMSampleBufferSetDataBufferFromAudioBufferList => {
+            let sample = context.regs[0];
+            if sample != 0 && mem.allocation_size(sample).is_some() {
+                // AudioBufferList {mNumberBuffers, [AudioBuffer; n]}; stash the
+                // first buffer's byte size so GetDataBuffer users see a sane
+                // length.
+                let byte_size = mem.read_u32(context.regs[1].saturating_add(8)).unwrap_or(0);
+                mem.write_u32(sample + 48, byte_size).map_err(str::to_owned)?;
+                mem.write_u32(sample + 24, 1).map_err(str::to_owned)?;
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::CMSampleBufferSetDataReady => {
+            let sample = context.regs[0];
+            if sample != 0 && mem.allocation_size(sample).is_some() {
+                mem.write_u32(sample + 24, 1).map_err(str::to_owned)?;
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::CMSampleBufferGetDataIsReady => {
+            let ready = mem.read_u32(context.regs[0].saturating_add(24)).unwrap_or(0);
             super::return_value(context, u64::from(ready != 0));
         }
+        StubKind::CMAudioFormatDescriptionCreate => {
+            // Layout: +0 AudioStreamBasicDescription (40 bytes),
+            //         +64 AudioChannelLayout (first 12 bytes if provided).
+            let description = mem.alloc_zeroed(128).map_err(str::to_owned)?;
+            let asbd = context.regs[1];
+            if asbd != 0 && mem.allocation_size(asbd).is_some() {
+                for offset in 0..40u64 {
+                    let byte = mem.read_u8(asbd + offset).unwrap_or(0);
+                    mem.write_u8(description + offset, byte).map_err(str::to_owned)?;
+                }
+            }
+            let layout = context.regs[3];
+            if layout != 0 && mem.allocation_size(layout).is_some() {
+                for offset in 0..12u64 {
+                    let byte = mem.read_u8(layout + offset).unwrap_or(0);
+                    mem.write_u8(description + 64 + offset, byte).map_err(str::to_owned)?;
+                }
+            }
+            let out = context.regs[8];
+            if out != 0 && mem.allocation_size(out).is_some() {
+                mem.write_u64(out, description).map_err(str::to_owned)?;
+            }
+            super::return_value(context, 0);
+        }
+        StubKind::CMAudioFormatDescriptionGetStreamBasicDescription => {
+            super::return_value(context, context.regs[0].saturating_add(0));
+        }
+        StubKind::CMAudioFormatDescriptionGetChannelLayout => {
+            super::return_value(context, context.regs[0].saturating_add(64));
+        }
+        StubKind::CMTimeAdd | StubKind::CMTimeSubtract | StubKind::CMTimeCompare => {
+            let (a, b) = (context.regs[0], context.regs[1]);
+            let time_a = read_cm_time(mem, a);
+            let time_b = read_cm_time(mem, b);
+            if kind == StubKind::CMTimeCompare {
+                let left = cm_time_seconds(&time_a);
+                let right = cm_time_seconds(&time_b);
+                let ordering: i64 = if (left - right).abs() < 1e-9 {
+                    0
+                } else if left < right {
+                    -1
+                } else {
+                    1
+                };
+                super::return_value(context, ordering as u64);
+                return Ok(true);
+            }
+            let scale = lcm_timescale(time_a.timescale, time_b.timescale);
+            let scale_a = i64::from(time_a.timescale.max(1));
+            let scale_b = i64::from(time_b.timescale.max(1));
+            let scaled_a = (time_a.value / scale_a) * scale
+                + (time_a.value % scale_a) * (scale / scale_a);
+            let scaled_b = (time_b.value / scale_b) * scale
+                + (time_b.value % scale_b) * (scale / scale_b);
+            let combined = if kind == StubKind::CMTimeAdd {
+                scaled_a.checked_add(scaled_b)
+            } else {
+                scaled_a.checked_sub(scaled_b)
+            }
+            .unwrap_or_else(|| if scaled_a > scaled_b { i64::MAX } else { i64::MIN });
+            let out_value = combined.checked_div_euclid(scale).unwrap_or(0);
+            let out = context.regs[8];
+            if out != 0 && mem.allocation_size(out).is_some() {
+                write_cm_time_at(mem, out, out_value, scale as i32, 1, 0)?;
+            }
+            super::return_value(context, out);
+        }
+        StubKind::CMTimeConvertScale => {
+            let time = read_cm_time(mem, context.regs[0]);
+            let new_scale = context.regs[1] as i32;
+            let out_value = if new_scale > 0 {
+                (time.value / i64::from(time.timescale.max(1))) * i64::from(new_scale)
+            } else {
+                0
+            };
+            let out = context.regs[8];
+            if out != 0 && mem.allocation_size(out).is_some() {
+                write_cm_time_at(mem, out, out_value, new_scale, 1, 0)?;
+            }
+            super::return_value(context, out);
+        }
+        StubKind::CMTimeCopyDescription => {
+            let time = read_cm_time(mem, context.regs[1]);
+            let text = format!(
+                "CMTime {{{}/{:.3} flags={:#x} epoch={}}}",
+                time.value,
+                cm_time_seconds(&time),
+                time.flags,
+                time.epoch
+            );
+            let bytes = text.into_bytes();
+            let object = super::objc_object(mem, A64_KIND_STRING)?;
+            replace_string(mem, object, &bytes)?;
+            super::return_value(context, object);
+        }
+        StubKind::CMTimeRangeMake => {
+            let start = read_cm_time(mem, context.regs[0]);
+            let duration = read_cm_time(mem, context.regs[1]);
+            let out = context.regs[8];
+            if out != 0 && mem.allocation_size(out).is_some() {
+                write_cm_time_at(mem, out, start.value, start.timescale, start.flags, start.epoch)?;
+                write_cm_time_at(mem, out + 24, duration.value, duration.timescale, duration.flags, duration.epoch)?;
+            }
+            super::return_value(context, out);
+        }
+        StubKind::CMTimeRangeContainsTime => {
+            let range = context.regs[0];
+            let time = read_cm_time(mem, context.regs[1]);
+            let start = read_cm_time(mem, range);
+            let duration = read_cm_time(mem, range.saturating_add(24));
+            let start_seconds = cm_time_seconds(&start);
+            let contains = cm_time_seconds(&time) >= start_seconds
+                && cm_time_seconds(&time) < start_seconds + cm_time_seconds(&duration);
+            super::return_value(context, u64::from(contains));
+        }
+        StubKind::CVMetalTextureGetTexture => super::return_value(context, 0),
     }
     Ok(true)
 }

@@ -11,7 +11,7 @@ use super::ns_enumerator::{fast_enumeration_helper, NSFastEnumerationState};
 use super::NSUInteger;
 use crate::abi::{CallFromHost, DotDotDot, GuestFunction};
 use crate::environment::Environment;
-use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstVoidPtr, ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr, SEL,
@@ -126,92 +126,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
-// Apple: "Returns a Boolean value that indicates whether a given set is
-// equal to the receiving set." Two sets are equal when they have the same
-// number of members and every member of one is a member of the other.
-- (bool)isEqualToSet:(id)other { // NSSet*
-    if this == other {
-        return true;
-    }
-    if other == nil {
-        return false;
-    }
-    let count: NSUInteger = msg![env; this count];
-    let other_count: NSUInteger = msg![env; other count];
-    if count != other_count {
-        return false;
-    }
-    let objects: id = msg![env; this allObjects];
-    let count: NSUInteger = msg![env; objects count];
-    for i in 0..count {
-        let object: id = msg![env; objects objectAtIndex:i];
-        let contains: bool = msg![env; other containsObject:object];
-        if !contains {
-            return false;
-        }
-    }
-    true
-}
-
-// Apple: "Returns a Boolean value that indicates whether a given set shares
-// at least one object with the receiving set."
-- (bool)intersectsSet:(id)other { // NSSet*
-    if other == nil {
-        return false;
-    }
-    let objects: id = msg![env; this allObjects];
-    let count: NSUInteger = msg![env; objects count];
-    for i in 0..count {
-        let object: id = msg![env; objects objectAtIndex:i];
-        let contains: bool = msg![env; other containsObject:object];
-        if contains {
-            return true;
-        }
-    }
-    false
-}
-
-// Apple: "Returns a Boolean value that indicates whether every object in
-// the receiving set is also present in another given set."
-- (bool)isSubsetOfSet:(id)other { // NSSet*
-    if other == nil {
-        return false;
-    }
-    let objects: id = msg![env; this allObjects];
-    let count: NSUInteger = msg![env; objects count];
-    for i in 0..count {
-        let object: id = msg![env; objects objectAtIndex:i];
-        let contains: bool = msg![env; other containsObject:object];
-        if !contains {
-            return false;
-        }
-    }
-    true
-}
-
-// Apple: "Returns a new set containing the objects of the receiving set and
-// a given set." The result is always an immutable, autoreleased set; the
-// receiver and the other set are not modified.
-- (id)setByAddingObjectsFromSet:(id)other { // NSSet*
-    let new: id = msg_class![env; NSSet alloc];
-    if new == nil {
-        return nil;
-    }
-    env.objc.borrow_mut::<SetHostObject>(new).dict = set_union(env, this, other);
-    autorelease(env, new)
-}
-
-// Apple: "Returns a new set containing the objects of the receiving set and
-// a given array." See setByAddingObjectsFromSet: for mutability rules.
-- (id)setByAddingObjectsFromArray:(id)other { // NSArray*
-    let new: id = msg_class![env; NSSet alloc];
-    if new == nil {
-        return nil;
-    }
-    env.objc.borrow_mut::<SetHostObject>(new).dict = set_union(env, this, other);
-    autorelease(env, new)
-}
-
 // Apple: "Sends a message specified by a given selector to each object in
 // the set." (NSSet makeObjectsPerformSelector:). The order in which the
 // objects receive the message is not defined.
@@ -246,15 +160,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         count as i32
 }
 
-// Apple's
-// <https://developer.apple.com/documentation/foundation/nsset/1408301-enumerateobjectsusingblock>:
-// iterates the set and, for each element, calls the supplied
-// `void (^)(id obj, BOOL *stop)` block. Note the signature differs from
-// NSArray's: a set is unordered, so there is NO index argument (the block
-// is 2-argument here vs. 3-argument for NSArray). Writing `*stop = YES;`
-// inside the block ends the enumeration early. Enumeration order for a set
-// is undefined, so we walk a snapshot taken via -allObjects, which also
-// keeps us safe if the block mutates the set mid-iteration.
+// Apple's enumerateObjectsUsingBlock: iterates the set and, for each
+// element, calls the supplied `void (^)(id obj, BOOL *stop)` block. Note the
+// signature differs from NSArray's: a set is unordered, so there is NO index
+// argument. Writing `*stop = YES;` inside the block ends the enumeration
+// early. We walk a snapshot from -allObjects so a mutating block is safe.
 - (())enumerateObjectsUsingBlock:(MutVoidPtr)block {
     if block.is_null() {
         return;
@@ -270,10 +180,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     let invoke = GuestFunction::from_addr_with_thumb_bit(invoke_addr);
-    let block_arg: crate::mem::ConstVoidPtr = block.cast_const();
-    // `BOOL` on iOS is one byte. We allocate a 4-byte slot because the
-    // ARMv7 ABI passes small values widened to a word, matching the
-    // NSArray implementation.
+    let block_arg: ConstVoidPtr = block.cast_const();
+    // `BOOL` on iOS is one byte; allocate a 4-byte slot because the ARMv7
+    // ABI passes small values widened to a word (matches NSArray impl).
     let stop_ptr: MutPtr<u8> = env.mem.alloc(4).cast();
     env.mem.write(stop_ptr, 0u8);
 
@@ -282,7 +191,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let mut i: NSUInteger = 0;
     while i < count {
         let obj: id = msg![env; objects objectAtIndex:i];
-        <GuestFunction as CallFromHost<(), (crate::mem::ConstVoidPtr, id, MutPtr<u8>)>>::call_from_host(
+        <GuestFunction as CallFromHost<(), (ConstVoidPtr, id, MutPtr<u8>)>>::call_from_host(
             &invoke, env, (block_arg, obj, stop_ptr),
         );
         if env.mem.read(stop_ptr) != 0 {
@@ -419,6 +328,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
+// TODO: more init methods, etc
+
+// TODO: accessors
 - (NSUInteger)count {
     env.objc.borrow_mut::<SetHostObject>(this).dict.count
 }
@@ -548,6 +460,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
+// TODO: init methods etc
+
 - (NSUInteger)count {
     env.objc.borrow_mut::<SetHostObject>(this).dict.count
 }
@@ -590,11 +504,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state
                                   objects:(MutPtr<id>)stackbuf
                                     count:(NSUInteger)len {
-    // Apple raises NSGenericException when the set is mutated during
-    // enumeration. We deliberately tolerate it instead: batches come from a
-    // snapshot (allObjects), so an exception would only break games whose
-    // (buggy) enumeration loops we would otherwise survive. We assume that
-    // the order in which objects are reported is consistent between calls!
+    // TODO: check that set wasn't mutated!
+    // We assume that order in which objects are reported is consistent
+    // between calls!
     let objects: id = msg![env; this allObjects];
     let count: NSUInteger = msg![env; objects count];
     fast_enumeration_helper(env, this, |env, idx| {
@@ -606,35 +518,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }, state, stackbuf, len)
 }
 
-// Apple: "Adds to the receiving set each object contained in a given set
-// that is not already a member." (NSMutableSet addObjectsFromSet:). Tolerates
-// nil like addObjectsFromArray: below.
-- (())addObjectsFromSet:(id)other { // NSSet *
-    if other == nil {
-        return;
-    }
-    let enumerator: id = msg![env; other objectEnumerator];
-    loop {
-        let next: id = msg![env; enumerator nextObject];
-        if next == nil {
-            break;
-        }
-        () = msg![env; this addObject:next];
-    }
-}
-
-// Apple: "Removes from the receiving set each object that is present in a
-// given array."
-- (())removeObjectsInArray:(id)other { // NSArray *
-    if other == nil {
-        return;
-    }
-    let count: NSUInteger = msg![env; other count];
-    for i in 0..count {
-        let object: id = msg![env; other objectAtIndex:i];
-        () = msg![env; this removeObject:object];
-    }
-}
+// TODO: more mutation methods
 
 - (())addObject:(id)object {
     let null: id = msg_class![env; NSNull null];
@@ -744,11 +628,6 @@ fn set_from_objects(env: &mut Environment, first_obj: id, args: DotDotDot) -> Di
     let null: id = msg_class![env; NSNull null];
 
     let mut dict = <DictionaryHostObject as Default>::default();
-    // A nil first object (e.g. an empty nil-terminated C list) yields an
-    // empty set; never insert nil as a dictionary key.
-    if first_obj == nil {
-        return dict;
-    }
     dict.insert(env, first_obj, null, /* copy_key: */ false);
     let mut varargs = args.start();
     loop {
@@ -774,23 +653,6 @@ fn set_from_array(env: &mut Environment, array: id) -> DictionaryHostObject {
     let count: NSUInteger = msg![env; array count];
     for i in 0..count {
         let object: id = msg![env; array objectAtIndex:i];
-        dict.insert(env, object, null, /* copy_key: */ false);
-    }
-    dict
-}
-
-/// Build a [DictionaryHostObject] containing the objects of `set` plus the
-/// objects of `other` (which may be an NSSet or an NSArray, or nil). Shared
-/// by `setByAddingObjectsFromSet:`/`setByAddingObjectsFromArray:`.
-fn set_union(env: &mut Environment, set: id, other: id) -> DictionaryHostObject {
-    let mut dict = set_from_set(env, set, false);
-    if other == nil {
-        return dict;
-    }
-    let null: id = msg_class![env; NSNull null];
-    let count: NSUInteger = msg![env; other count];
-    for i in 0..count {
-        let object: id = msg![env; other objectAtIndex:i];
         dict.insert(env, object, null, /* copy_key: */ false);
     }
     dict

@@ -71,9 +71,34 @@ impl ResourceFile {
             #[cfg(not(target_os = "android"))]
             file: {
                 let base_path = get_macos_bundled_resources_path();
-                // When not in a bundle, look in the current directory.
-                let path = base_path.as_deref().unwrap_or(Path::new(".")).join(path);
-                std::fs::File::open(path).map_err(|e| e.to_string())?
+                let current_dir = base_path
+                    .as_deref()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let executable_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(Path::to_path_buf));
+                let mut candidates = vec![
+                    current_dir.join(path),
+                    current_dir.join("res").join(path),
+                    current_dir.join("resources").join(path),
+                ];
+                if let Some(executable_dir) = executable_dir {
+                    candidates.push(executable_dir.join(path));
+                    candidates.push(executable_dir.join("res").join(path));
+                    candidates.push(executable_dir.join("resources").join(path));
+                }
+                let mut opened = None;
+                for candidate in candidates {
+                    match std::fs::File::open(&candidate) {
+                        Ok(file) => {
+                            opened = Some(file);
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                opened.ok_or_else(|| format!("resource not found: {path}"))?
             },
         })
     }
@@ -101,9 +126,12 @@ pub const USER_OPTIONS_FILE: &str = "touchHLE_options.txt";
 /// Names of files the user can put a wallpaper image (for the app picker) in.
 #[allow(unused)]
 pub const WALLPAPER_FILES: &[&str] = &[
+    "MetalHLE_v7_wallpaper.png",
     "MetalHLE_wallpaper.png",
-    "MetalHLE_wallpaper.jpg",
-    "MetalHLE_wallpaper.jpeg",
+    "MetalHLE_ios26_wallpaper.png",
+    "touchHLE_wallpaper.png",
+    "touchHLE_wallpaper.jpg",
+    "touchHLE_wallpaper.jpeg",
 ];
 
 /// Name of the directory where touchHLE will store sandboxed app data, e.g.
@@ -162,7 +190,7 @@ pub fn url_for_opening_user_data_dir() -> Result<String, String> {
         // See DocumentsProvider.kt, app/build.gradle and AndroidManifest.xml
         let brand = crate::branding();
         Ok(format!(
-            "content://org.touchhle.android{}{}.provider/root/root",
+            "content://org.metalhle.android{}{}.provider/root/root",
             if brand.is_empty() { "" } else { "." },
             brand.to_lowercase()
         ))
@@ -183,16 +211,27 @@ pub fn url_for_opening_user_data_dir() -> Result<String, String> {
     }
 }
 
+pub fn url_for_opening_custom_driver() -> Result<String, String> {
+    let drivers_dir = user_data_base_path().join("touchHLE_custom_drivers");
+    std::fs::create_dir_all(&drivers_dir)
+        .map_err(|e| format!("Can't create custom-driver directory: {e}"))?;
+    if std::env::consts::OS == "android" {
+        Ok("touchhle://custom-driver".to_string())
+    } else {
+        let path = drivers_dir
+            .canonicalize()
+            .map_err(|e| format!("Can't canonicalize custom-driver directory: {e}"))?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| "Custom-driver directory path is not UTF-8".to_string())?;
+        Ok(format!("file://{path}"))
+    }
+}
+
 pub fn url_for_opening_apps_dir() -> Result<String, String> {
     let apps_dir = user_data_base_path().join(APPS_DIR);
     if std::env::consts::OS == "android" {
-        let brand = crate::branding();
-        Ok(format!(
-            "content://org.touchhle.android{}{}.provider/root/root/{}",
-            if brand.is_empty() { "" } else { "." },
-            brand.to_lowercase(),
-            APPS_DIR
-        ))
+        Ok("touchhle://game-folder".to_string())
     } else {
         let path = apps_dir
             .canonicalize()
@@ -209,23 +248,6 @@ pub fn url_for_opening_apps_dir() -> Result<String, String> {
     }
 }
 
-/// Remove the legacy on-disk PVRTC decode cache directory. The PVRTC decode
-/// cache was removed (both the in-memory tier and this on-disk tier) because
-/// decoded RGBA8 entries used a lot of host memory and disk space.
-pub fn remove_legacy_pvrtc_disk_cache() {
-    let dir = user_data_base_path().join("touchHLE_pvrtc_cache");
-    if dir.exists() {
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => log!("Removed legacy PVRTC disk cache directory {}", dir.display()),
-            Err(e) => log!(
-                "Warning: couldn't remove legacy PVRTC disk cache {}: {}",
-                dir.display(),
-                e
-            ),
-        }
-    }
-}
-
 /// Only meaningful on certain OSes: create the user data directory if it
 /// doesn't exist, and populate it with templates or README files. (On other
 /// platforms these are simply bundled with touchHLE in a ZIP file.)
@@ -236,25 +258,6 @@ pub fn prepopulate_user_data_dir() {
     let base_path = user_data_base_path();
     if base_path == Path::new(".") {
         return;
-    }
-
-    let has_user_wallpaper = WALLPAPER_FILES
-        .iter()
-        .any(|name| base_path.join(name).is_file());
-    if !has_user_wallpaper {
-        match ResourceFile::open(WALLPAPER_FILES[0]) {
-            Ok(mut resource) => {
-                let mut image = Vec::new();
-                match resource.get().read_to_end(&mut image) {
-                    Ok(_) => match std::fs::write(base_path.join(WALLPAPER_FILES[0]), image) {
-                        Ok(()) => log!("Created default wallpaper"),
-                        Err(e) => log!("Warning: Couldn't create default wallpaper: {}", e),
-                    },
-                    Err(e) => log!("Warning: Couldn't read default wallpaper: {}", e),
-                }
-            }
-            Err(e) => log!("Warning: Couldn't open default wallpaper: {}", e),
-        }
     }
 
     let apps_dir = base_path.join(APPS_DIR);
@@ -310,22 +313,5 @@ pub fn prepopulate_user_data_dir() {
     let options_help = base_path.join("OPTIONS_HELP.txt");
     if !options_help.is_file() {
         create_file(&options_help, crate::options::OPTIONS_HELP);
-    }
-}
-
-pub fn url_for_opening_custom_driver() -> Result<String, String> {
-    let drivers_dir = user_data_base_path().join("touchHLE_custom_drivers");
-    std::fs::create_dir_all(&drivers_dir)
-        .map_err(|e| format!("Can't create custom-driver directory: {e}"))?;
-    if std::env::consts::OS == "android" {
-        Ok("touchhle://custom-driver".to_string())
-    } else {
-        let path = drivers_dir
-            .canonicalize()
-            .map_err(|e| format!("Can't canonicalize custom-driver directory: {e}"))?;
-        let path = path
-            .to_str()
-            .ok_or_else(|| "Custom-driver directory path is not UTF-8".to_string())?;
-        Ok(format!("file://{path}"))
     }
 }

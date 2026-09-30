@@ -10,7 +10,7 @@
 //! стороны гостевого приложения.
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::Environment;
 
 /// Псевдо-дескриптор для доступа к глобальной области видимости символов (main
@@ -38,6 +38,22 @@ fn is_known_library(path: &str) -> bool {
     crate::dyld::DYLIB_LIST
         .iter()
         .any(|dylib| dylib.path == path || dylib.aliases.contains(&path))
+}
+
+fn is_sqlite_library(path: &str) -> bool {
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    matches!(
+        basename,
+        "sqlite3"
+            | "sqlite3.dylib"
+            | "sqlite3.so"
+            | "sqlite3.so.0"
+            | "libsqlite3"
+            | "libsqlite3.dylib"
+            | "libsqlite3.so"
+            | "libsqlite3.so.0"
+            | "libsqlite3.so.3"
+    )
 }
 
 /// Реализация функции `dlopen` стандарта POSIX.
@@ -73,7 +89,7 @@ fn dlopen(env: &mut Environment, path: ConstPtr<u8>, _mode: i32) -> MutVoidPtr {
 
     // --- EKLENECEK KOD BAŞLANGICI ---
     // Mono'nun sqlite3 arayışını çökmeden atlatması için global scope (RTLD_DEFAULT) döndürüyoruz.
-    if path_str.contains("sqlite3") {
+    if is_sqlite_library(path_str) {
         return RTLD_DEFAULT;
     }
 
@@ -91,13 +107,23 @@ fn dlopen(env: &mut Environment, path: ConstPtr<u8>, _mode: i32) -> MutVoidPtr {
         return Ptr::null();
     }
 
-    // Временная архитектура: использование указателя на строку пути в памяти
-    // гостя как непрозрачного дескриптора.
-    // TODO: Разработать защищенную систему управления дескрипторами (Handle
-    // Allocator Table) на стороне хоста,
-    // чтобы предотвратить уязвимости Use-After-Free, когда приложение
-    // освобождает строку пути после вызова dlopen.
-    path.cast_mut().cast()
+    // The guest can release or overwrite its path string immediately after
+    // dlopen returns. Keep a private copy for the lifetime of the handle so
+    // later dlsym and dlclose calls never dereference guest-owned storage.
+    let Some(dylib) = crate::dyld::DYLIB_LIST
+        .iter()
+        .find(|dylib| dylib.path == path_str || dylib.aliases.contains(&path_str))
+    else {
+        return Ptr::null();
+    };
+    let handle = env.mem.alloc((dylib.path.len() + 1) as _);
+    let mut address = handle.to_bits();
+    for byte in dylib.path.as_bytes() {
+        env.mem.write(MutPtr::from_bits(address), *byte);
+        address += 1;
+    }
+    env.mem.write(MutPtr::from_bits(address), 0u8);
+    handle
 }
 
 /// Реализация функции `dlsym` стандарта POSIX.

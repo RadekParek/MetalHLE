@@ -15,17 +15,16 @@ pub const FUNCTIONS: FunctionExports = &[
 
 /// `int res_9_ninit(res_state)` — set up a resolver state. Report failure (0
 /// means "resolver state is valid but has no nameservers" per the API).
-fn res_9_ninit(env: &mut Environment, _state: MutVoidPtr) -> i32 {
-    // Zero the state so caller reads are deterministic.
+fn res_9_ninit(_env: &mut Environment, _state: MutVoidPtr) -> i32 {
     0
 }
 
 /// `void res_9_ndestroy(res_state)` — free a resolver state.
-fn res_9_ndestroy(env: &mut Environment, _state: MutVoidPtr) -> i32 {
+fn res_9_ndestroy(_env: &mut Environment, _state: MutVoidPtr) -> i32 {
     0
 }
 
 /// `void res_9_nclose(res_state)` — close sockets in a resolver state.
-fn res_9_nclose(env: &mut Environment, _state: MutVoidPtr) -> i32 {
+fn res_9_nclose(_env: &mut Environment, _state: MutVoidPtr) -> i32 {
     0
 }

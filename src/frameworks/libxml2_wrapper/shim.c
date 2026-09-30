@@ -265,13 +265,7 @@ const char *hxml_error_file(const xmlError *e) {
  * Rust bindings consistent and ensure the layout doesn't drift across versions.
  */
 
-/* ---------- Allocator function-pointer variables -> callable ABI. ------ */
-/* xmlFree and xmlMalloc are data symbols, not C functions. Keep the
- * indirection here so Rust also works with thread-local allocator macros. */
-void *hxml_malloc(size_t size) {
-    return xmlMalloc(size);
-}
-
+/* ---------- A tiny helper to free xmlChar* allocations safely. ---------- */
 void hxml_free(void *ptr) {
     if (ptr) xmlFree(ptr);
 }

@@ -23,12 +23,6 @@ struct UITabBarHostObject {
     delegate: id,
     bar_tint_color: id, // UIColor*
     tint_color: id,     // UIColor*
-    /// `UIImage*` set via `-setBackgroundImage:` (iOS 5+)
-    background_image: id,
-    /// `UIImage*` set via `-setShadowImage:` (iOS 5+)
-    shadow_image: id,
-    /// `UIImage*` set via `-setSelectionIndicatorImage:` (iOS 5+)
-    selection_indicator_image: id,
     translucent: bool,
 }
 impl HostObject for UITabBarHostObject {}
@@ -65,9 +59,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         delegate: nil,
         bar_tint_color: nil,
         tint_color: nil,
-        background_image: nil,
-        shadow_image: nil,
-        selection_indicator_image: nil,
         translucent: true,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
@@ -81,22 +72,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host = env.objc.borrow::<UITabBarHostObject>(this);
-    let (items, delegate, bar_tint_color, tint_color, background_image, shadow_image, selection_indicator_image) = (
-        host.items,
-        host.delegate,
-        host.bar_tint_color,
-        host.tint_color,
-        host.background_image,
-        host.shadow_image,
-        host.selection_indicator_image,
-    );
+    let (items, delegate, bar_tint_color, tint_color) =
+        (host.items, host.delegate, host.bar_tint_color, host.tint_color);
     release(env, items);
     release(env, delegate);
     release(env, bar_tint_color);
     release(env, tint_color);
-    release(env, background_image);
-    release(env, shadow_image);
-    release(env, selection_indicator_image);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
@@ -209,44 +190,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: Background / shadow image stubs
 
 - (id)backgroundImage { // UIImage*
-    env.objc.borrow::<UITabBarHostObject>(this).background_image
+    log!("TODO: [UITabBar backgroundImage] — returning nil");
+    nil
 }
 
-// Per Apple's documentation the setter is per-state (UIControlState); this
-// simplified bar stores one image and uses it for every state, which matches
-// how apps actually use it (a single background image for the whole bar).
-- (())setBackgroundImage:(id)image {
-    let old = env.objc.borrow::<UITabBarHostObject>(this).background_image;
-    release(env, old);
-    retain(env, image);
-    env.objc.borrow_mut::<UITabBarHostObject>(this).background_image = image;
+- (())setBackgroundImage:(id)_image {
+    log!("TODO: [UITabBar setBackgroundImage:] — ignored");
 }
 
 - (id)shadowImage { // UIImage*
-    env.objc.borrow::<UITabBarHostObject>(this).shadow_image
+    log!("TODO: [UITabBar shadowImage] — returning nil");
+    nil
 }
 
-- (())setShadowImage:(id)image {
-    let old = env.objc.borrow::<UITabBarHostObject>(this).shadow_image;
-    release(env, old);
-    retain(env, image);
-    env.objc.borrow_mut::<UITabBarHostObject>(this).shadow_image = image;
+- (())setShadowImage:(id)_image {
+    log!("TODO: [UITabBar setShadowImage:] — ignored");
 }
 
 - (id)selectionIndicatorImage { // UIImage*
-    env.objc.borrow::<UITabBarHostObject>(this).selection_indicator_image
+    log!("TODO: [UITabBar selectionIndicatorImage] — returning nil");
+    nil
 }
 
-- (())setSelectionIndicatorImage:(id)image {
-    let old = env
-        .objc
-        .borrow::<UITabBarHostObject>(this)
-        .selection_indicator_image;
-    release(env, old);
-    retain(env, image);
-    env.objc
-        .borrow_mut::<UITabBarHostObject>(this)
-        .selection_indicator_image = image;
+- (())setSelectionIndicatorImage:(id)_image {
+    log!("TODO: [UITabBar setSelectionIndicatorImage:] — ignored");
 }
 
 // MARK: Custom items editing

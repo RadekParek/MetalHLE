@@ -27,7 +27,7 @@
 
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::posix_io::stat::{gid_t, uid_t};
-use crate::mem::{GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead};
+use crate::mem::{GuestUSize, MutPtr, Ptr, SafeRead};
 use crate::Environment;
 
 /// Layout of `struct passwd` on 32-bit iOS: seven 4-byte fields.
@@ -68,8 +68,29 @@ fn getpwuid_r(
 ) -> i32 {
     const ERANGE: i32 = 34;
 
-    if pwd.is_null() || result.is_null() {
+    if pwd.is_null() || buf.is_null() || result.is_null() {
         return crate::libc::errno::EINVAL;
+    }
+    if env
+        .mem
+        .get_bytes_fallible_mut(
+            pwd.cast_const().cast(),
+            std::mem::size_of::<passwd_t>() as GuestUSize,
+        )
+        .is_none()
+        || env
+            .mem
+            .get_bytes_fallible_mut(
+                result.cast_const().cast(),
+                std::mem::size_of::<MutPtr<passwd_t>>() as GuestUSize,
+            )
+            .is_none()
+        || env
+            .mem
+            .get_bytes_fallible_mut(buf.cast_const().cast(), buflen)
+            .is_none()
+    {
+        return crate::libc::errno::EFAULT;
     }
     // The emulator exposes exactly one user; anything else is "not found".
     if uid != 501 {
@@ -78,7 +99,6 @@ fn getpwuid_r(
     }
 
     let strings = &MOBILE_USER;
-    let mut needed: GuestUSize = 0;
     let pieces = [
         strings.name,
         strings.passwd,
@@ -86,9 +106,21 @@ fn getpwuid_r(
         strings.dir,
         strings.shell,
     ];
+    let mut needed: GuestUSize = 0;
     for piece in pieces {
-        needed += piece.len() as GuestUSize + 1;
+        let Some(address) = buf.to_bits().checked_add(needed) else {
+            return ERANGE;
+        };
+        let padding = (4 - address % 4) % 4;
+        let Some(offset) = needed.checked_add(padding) else {
+            return ERANGE;
+        };
+        let Some(end) = offset.checked_add(piece.len() as GuestUSize + 1) else {
+            return ERANGE;
+        };
+        needed = end;
     }
+    env.mem.write(result, Ptr::null());
     if buflen < needed {
         log!(
             "getpwuid_r: buffer of {} bytes too small ({} needed), returning ERANGE",
@@ -101,17 +133,16 @@ fn getpwuid_r(
     // Copy strings into `buf`, recording 4-byte-aligned pointers.
     let mut cursor = buf;
     let mut string_ptr = |env: &mut Environment, s: &str| -> MutPtr<u8> {
+        let rem = cursor.to_bits() % 4;
+        if rem != 0 {
+            cursor = cursor + (4 - rem);
+        }
         let ptr = cursor;
         for (i, b) in s.bytes().enumerate() {
             env.mem.write(ptr + i as GuestUSize, b);
         }
         env.mem.write(ptr + s.len() as GuestUSize, b'\0');
         cursor = ptr + (s.len() as GuestUSize) + 1;
-        // keep next string 4-byte aligned
-        let rem = cursor.to_bits() % 4;
-        if rem != 0 {
-            cursor = cursor + (4 - rem);
-        }
         ptr
     };
 

@@ -26,34 +26,34 @@
 
 #[macro_use]
 mod log;
-mod licenses;
 mod a64_abi;
-mod abi;
 mod android_media;
-mod android_web_view;
+mod env_flags;
+mod abi;
 mod arm64_runtime;
 mod audio;
 mod bundle;
-mod corrupt;
 mod cpu;
-mod crash_handler;
 mod debug;
+mod corrupt;
 mod dyld;
-mod env_flags;
 mod environment;
 mod environment64;
+mod crash_handler;
 mod fastmap;
-pub mod font;
+mod font;
 mod frameworks;
+mod guest_clock;
 mod fs;
 mod gdb;
 mod gles;
-mod guest_clock;
 mod image;
 mod libc;
+mod licenses;
 mod mach_o;
 mod mach_o64;
 mod matrix;
+mod media_capture;
 mod mem;
 mod mem64;
 mod objc;
@@ -81,6 +81,13 @@ use std::path::PathBuf;
 // implementations), a workload that mimalloc handles measurably faster than
 // the platform malloc — in particular on Android, where every allocation
 // additionally goes through Scudo hardening.
+//
+// ANDROID EXCEPTION: allocator swaps inside a running ART process (JIT worker
+// threads, signal handlers, fork-within-signal diagnostics) were implicated
+// in native SIGSEGVs on GLES2 games (BioShock/Geometry Dash/Terraria) that
+// never faulted with the platform allocator. Android keeps the default
+// Scudo-hardened allocator; desktop platforms get mimalloc.
+#[cfg(not(target_os = "android"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -108,6 +115,19 @@ pub extern "C" fn SDL_main(
         } else {
             echo_no_panic!("Panic: {}", payload);
         }
+        crate::gles::forensics_state::report_ring_on_crash(payload);
+        // Persist a crash banner to the on-disk log (touchHLE_log.txt) and
+        // flush, so the file always ends with the reason the process died
+        // instead of being cut off by buffered-but-unwritten lines.
+        crate::log::append_log_line("=======================================================");
+        crate::log::append_log_line("=== CRASH: the emulator terminated unexpectedly ===");
+        if let Some(location) = info.location() {
+            crate::log::append_log_line(&format!("At: {} (line {})", location, location.line()));
+        }
+        crate::log::append_log_line(&format!("Reason: {payload}"));
+        crate::log::append_log_line("=======================================================");
+        crate::dyld::echo_missing_api_summary();
+        crate::log::flush_log_file();
     }));
     // Empty args: brings up app picker.
     match main([String::new()].into_iter()) {
@@ -119,7 +139,7 @@ pub extern "C" fn SDL_main(
 
 const USAGE: &str = "\
 Usage:
-    touchHLE [PATH] [OPTIONS]
+    metalhle [PATH] [OPTIONS]
 
 PATH should be a path to a .app bundle or .ipa file.
 
@@ -129,59 +149,91 @@ Special options:
     --help
         Display this help text.
 
+    --copyright
+        Display copyright, authorship and license information.
+
     --info
         Print basic information about the app bundle without running the app.
 ";
+fn detect_engine_and_enable_diagnostics(
+    bundle: &bundle::Bundle,
+    fs: &fs::Fs,
+    app_id: &str,
+    options: &mut options::Options,
+) {
+    let display_name = bundle.display_name().to_ascii_lowercase();
+    let bundle_name = bundle.bundle_name().to_ascii_lowercase();
+    let identifier = app_id.to_ascii_lowercase();
+    let unity_markers = [
+        "unity",
+        "unityframework",
+        "data/data.unity3d",
+        "globalgamemanagers",
+    ];
+    let unreal_markers = ["unreal", "ue3", "ue4", "ue5", "epicgames", "cooked"];
+    let has_unity_files = fs.is_file(&bundle.bundle_path().join("Data/data.unity3d"))
+        || fs.is_file(&bundle.bundle_path().join("Data/globalgamemanagers"))
+        || fs.is_file(&bundle.bundle_path().join("UnityFramework"));
+    let has_unreal_files = fs.is_file(&bundle.bundle_path().join("UE3CommandLine.txt"))
+        || fs.is_dir(&bundle.bundle_path().join("CookedAssets"));
+    let is_unity = has_unity_files
+        || unity_markers.iter().any(|marker| {
+            identifier.contains(marker)
+                || display_name.contains(marker)
+                || bundle_name.contains(marker)
+        });
+    let is_unreal = has_unreal_files
+        || unreal_markers.iter().any(|marker| {
+            identifier.contains(marker)
+                || display_name.contains(marker)
+                || bundle_name.contains(marker)
+        });
+
+    let engine = if is_unity {
+        Some("Unity")
+    } else if is_unreal {
+        Some("Unreal")
+    } else {
+        None
+    };
+    if let Some(engine) = engine {
+        options.verbose_logging = true;
+        options.trace_gl_errors = true;
+        unsafe {
+            std::env::set_var("TOUCHHLE_ENGINE_KIND", engine);
+            std::env::set_var("TOUCHHLE_ENGINE_VERBOSE", "1");
+        }
+        log!(
+            "{} engine detected from bundle metadata/files; enabling verbose compatibility and GL diagnostics",
+            engine
+        );
+    } else {
+        unsafe {
+            std::env::remove_var("TOUCHHLE_ENGINE_KIND");
+            std::env::remove_var("TOUCHHLE_ENGINE_VERBOSE");
+        }
+    }
+}
+
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
 
-    // Headless CI boxes have no sound devices; when asked, point OpenAL
-    // Soft's wave writer at a capture file before any OpenAL call happens.
-    if std::env::var_os("TOUCHHLE_CAPTURE_AUDIO").is_some()
-        && std::env::var_os("ALSOFT_DRIVERS").is_none()
-    {
-        let path = std::env::var_os("TOUCHHLE_CAPTURE_AUDIO").unwrap();
-        let conf = std::env::temp_dir().join("touchhle-wave-capture.conf");
-        // openal-soft's wave backend only reads its output path from the
-        // config key `wave/file`; it does not honour an env override, so
-        // generate a minimal config file and point ALSOFT_CONF at it.
-        std::fs::write(
-            &conf,
-            format!("[wave]\nfile = {}\n", path.to_string_lossy()),
-        )
-        .ok();
-        // SAFETY: runs before any thread spawn or OpenAL call in this process.
-        unsafe {
-            std::env::set_var("ALSOFT_DRIVERS", "wave");
-            std::env::set_var("ALSOFT_CONF", &conf);
+    struct PerfReportGuard;
+    impl Drop for PerfReportGuard {
+        fn drop(&mut self) {
+            crate::perf::report();
         }
     }
-
-    #[cfg(target_os = "android")]
-    {
-        // PERF: raise the scheduling priority of the thread that runs the
-        // emulation loop. Android aggressively deprioritises background-ish
-        // app threads, which on big.LITTLE SoCs tends to keep the emulator on
-        // a little (efficiency) core and costs a large chunk of FPS. SDL's
-        // implementation of SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH)
-        // on Android/Linux raises the niceness of the calling thread and
-        // degrades gracefully (returns -1) if the OS disallows it — this is
-        // deliberately routed through SDL rather than libc::setpriority
-        // because the latter is not exposed for Android by the libc crate.
-        let rc = unsafe {
-            sdl2_sys::SDL_SetThreadPriority(sdl2_sys::SDL_ThreadPriority::SDL_THREAD_PRIORITY_HIGH)
-        };
-        if rc != 0 {
-            log!("Warning: failed to raise emulator thread priority; continuing with default priority.");
-        }
-    }
-
+    let _perf_report_guard = PerfReportGuard;
+    crate::perf::configure_from_environment();
+    crate::perf::reset();
     echo!(
-        "MetalHLE 2.0 {}{}{}",
+        "MetalHLE 2.0 {}{}{} git_sha={}",
         branding(),
         if branding().is_empty() { "" } else { " " },
         VERSION,
+        touchHLE_version::GIT_SHA,
     );
     if GITHUB_RUN_ID.is_some() && !branding().is_empty() {
         echo!(
@@ -197,9 +249,8 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
 
     {
         let base_path = paths::user_data_base_path();
-        log!("Base path for MetalHLE files: {}", base_path.display());
+        log!("Base path for MetalHLE 2.0 files: {}", base_path.display());
         paths::prepopulate_user_data_dir();
-        paths::remove_legacy_pvrtc_disk_cache();
     }
 
     let _ = args.next().unwrap(); // skip argv[0]
@@ -217,6 +268,9 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         } else if arg == "--help" {
             echo!("{}", USAGE);
             echo!("{}", options::OPTIONS_HELP);
+            return Ok(());
+        } else if arg == "--copyright" {
+            echo!("{}", licenses::get_text());
             return Ok(());
         } else if arg == "--info" {
             just_info = true;
@@ -246,8 +300,13 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         let mut options = options::Options::default();
         // Apply command-line options only (no app-specific options apply)
         for option_arg in &option_args {
-            let parse_result = options.parse_argument(option_arg);
-            assert!(parse_result == Ok(true));
+            match options.parse_argument(option_arg) {
+                Ok(true) => (),
+                Ok(false) => log!("Warning: ignoring unknown option {option_arg:?}"),
+                Err(error) => {
+                    log!("Warning: ignoring invalid option {option_arg:?}: {error}")
+                }
+            }
         }
         if options.headless {
             return Err(
@@ -282,16 +341,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     };
 
     let app_id = bundle.bundle_identifier();
-
-    // Gangstar Rio is landscape-only. Keep UIScreen's point and pixel axes
-    // aligned with the active orientation; portrait axes leave its EAGL scene
-    // occupying only a small portion of the display.
-    if app_id == "com.gameloft.gangstar3"
-        && std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_none()
-    {
-        unsafe {
-            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
-        }
+    if matches!(
+        app_id,
+        "com.rovio.gold" | "com.rovio.angrybirdstransformers"
+    ) {
+        options.network_access = true;
     }
 
     // ULTRAHLE_MINIONJUMP_SCREEN_BEGIN
@@ -318,18 +372,26 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         std::env::remove_var("TOUCHHLE_FORCE_LANDSCAPE_VIEWPORT");
         std::env::remove_var("TOUCHHLE_FORCE_LANDSCAPE_RENDERBUFFER");
         std::env::remove_var("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS");
+        std::env::remove_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE");
         std::env::remove_var("TOUCHHLE_TOUCH_MODE");
-        // NOTE: do not force a portrait->landscape touch remap on
-        // com.robtop.geometryjump (Geometry Dash) anymore. Its cocos2d-x view
-        // is mounted as a UIViewController's view, so UIWindow's landscape
-        // autorotation already makes locationInView: return coordinates in the
-        // game's own landscape space; the extra "right" remap rotated those
-        // already-correct coordinates a second time and taps activated the
-        // wrong buttons (press high -> settings, press low -> level menu).
-        std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_X_OFFSET");
-        std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_Y_OFFSET");
         std::env::remove_var("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT");
+        // NOTE: do not force a portrait->landscape touch remap on
+        // com.robtop.geometryjump (Geometry Dash). Its cocos2d-x view is
+        // mounted as a UIViewController's view, so UIWindow's landscape
+        // autorotation already makes locationInView: return coordinates in
+        // the game's own landscape space; an extra "right" remap rotated
+        // those already-correct coordinates a second time and taps activated
+        // the wrong buttons (press high -> settings, press low -> level menu).
+        std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_X_OFFSET");
+
+        if app_id == "com.robtop.geometryjump" && cfg!(target_os = "android") {
+            std::env::set_var("TOUCHHLE_FORCE_LANDSCAPE_RENDERBUFFER", "1");
+            std::env::set_var("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS", "1");
+            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
+        }
+
+        std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_Y_OFFSET");
         std::env::remove_var("TOUCHHLE_POTATO_ANDROID_THUMB2_COMPAT");
     }
 
@@ -368,6 +430,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         "- Minimum OS version: {}",
         minimum_os_version.as_deref().unwrap_or("(not specified)")
     );
+    crate::dyld::note_missing_api_min_os_version(minimum_os_version.as_deref());
     echo!(
         "- Required device capabilities: {}",
         if !required_device_capabilities.is_empty() {
@@ -411,13 +474,10 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         };
         let major: u32 = major_str.parse().unwrap_or(0);
         let minor: u32 = minor_str.parse().unwrap_or(0);
-        // Apps targeting up to iOS 9.0 attempt to run silently. Only warn
-        // when the deployment target is beyond iOS 9, where breakage from
-        // missing post-iOS-9 APIs becomes the rule rather than the exception.
+        // Newer deployment targets can use APIs that are not implemented yet.
         if major > 9 || (major == 9 && minor > 0) {
             echo!(
-                "Warning: app requires OS version {}. touchHLE currently aims \
-                 for iOS 2.x–9.0; newer APIs may be missing.",
+                "Warning: app requires OS version {}. touchHLE compatibility is partial across iOS generations; APIs outside the implemented coverage may be missing.",
                 version
             );
         }
@@ -425,8 +485,36 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
 
     if required_device_capabilities.contains(&"opengles-3") {
         echo!(
-            "Warning: app requires OpenGL ES 3.0+ support. MetalHLE now routes EAGL OpenGL ES 3 contexts to its GLES 3 backend."
+            "Warning: app requires OpenGL ES 3.0+ support. MetalHLE 1.0 now routes EAGL OpenGL ES 3 contexts to its GLES 3 backend."
         );
+    }
+
+    // Report how each declared capability is honoured, and flip the runtime
+    // switches the capability maps onto (e.g. a game requiring `gyroscope`
+    // expects CoreMotion's isGyroAvailable to answer YES even without a host
+    // sensor — the data path then serves stationary values).
+    if !required_device_capabilities.is_empty() {
+        for capability in &required_device_capabilities {
+            crate::frameworks::core_motion::note_declared_device_capability(capability);
+            let honoured = match *capability {
+                "opengles-1" => Some("OpenGL ES 1.1 backend (default)"),
+                "opengles-2" => Some("OpenGL ES 2.0 backend"),
+                "opengles-3" => Some("OpenGL ES 3.x backend"),
+                "armv6" | "armv7" | "arm64" => Some("native CPU architecture"),
+                "accelerometer" => Some("CoreMotion accelerometer (host SDL sensor or mouse-driven virtual sensor)"),
+                "gyroscope" => Some("CoreMotion gyroscope (host SDL sensor when present, stationary fallback otherwise)"),
+                "magnetometer" => Some("CoreMotion magnetometer (synthetic Earth-field model)"),
+                "location-services" => Some("CoreLocation (reported available)"),
+                "gamekit" => Some("GameKit framework (stubbed online services)"),
+                "microphone" => Some("AudioSession microphone (host audio input where available)"),
+                "opengles-aep" | "metal" | "arkit" => None,
+                _ => None,
+            };
+            match honoured {
+                Some(detail) => echo!("- Required capability '{}': provided ({})", capability, detail),
+                None => echo!("- Required capability '{}': not provided (app must tolerate its absence)", capability),
+            }
+        }
     }
 
     if just_info {
@@ -472,6 +560,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     let user_options_path = paths::user_data_base_path().join(paths::USER_OPTIONS_FILE);
     match std::fs::File::open(&user_options_path) {
         Ok(file) => apply_options(file, user_options_path.display(), &mut options, app_id)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
         Err(err) => echo!(
             "Warning: Could not open {}: {}",
             user_options_path.display(),
@@ -484,12 +573,51 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         match options.parse_argument(&option_arg) {
             Ok(true) => (),
             Ok(false) => log!("Warning: ignoring unknown option {option_arg:?}"),
-            Err(error) => log!("Warning: ignoring invalid option {option_arg:?}: {error}"),
+            Err(error) => {
+                log!("Warning: ignoring invalid option {option_arg:?}: {error}")
+            }
         }
     }
+    detect_engine_and_enable_diagnostics(&bundle, &fs, app_id, &mut options);
 
-    // Detect the executable's architecture so ARM64 slices are routed to the
-    // dedicated 64-bit environment instead of the 32-bit loader.
+    if options.network_access {
+        log!("Network access: enabled by settings");
+    } else {
+        log!("Network access: disabled by settings (guest network requests will fail until enabled with --network-access)");
+    }
+
+    if options.fps_limit.is_none() {
+        if let Some(refresh_rate) = window::host_refresh_rate() {
+            options.fps_limit = Some(refresh_rate);
+            log!(
+                "Using host display refresh rate for frame pacing: {:.2} Hz",
+                refresh_rate
+            );
+        }
+    }
+    let display_rate = options.fps_limit.unwrap_or(60.0);
+    crate::log::set_file_logging(options.log_file);
+    crate::log::set_verbose_logging(options.verbose_logging);
+    crate::media_capture::log_native_capture_status();
+    if options.core_audio {
+        unsafe {
+            std::env::set_var("TOUCHHLE_CORE_AUDIO", "1");
+        }
+        log!("Core audio option enabled for this launch");
+    } else {
+        unsafe {
+            std::env::remove_var("TOUCHHLE_CORE_AUDIO");
+        }
+    }
+    crate::gles::configure_translator_tracing(options.trace_gl_errors, options.verbose_logging);
+    crate::gles::configure_shader_compatibility_fixes(options.shader_compatibility_fixes);
+    unsafe {
+        std::env::set_var(
+            "TOUCHHLE_AUDIO_BACKEND",
+            options.audio_backend.driver_name(),
+        );
+    }
+
     let architecture = {
         let executable_bytes = fs
             .read(bundle.executable_path())
@@ -505,13 +633,36 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         "Selected executable architecture: {}",
         mach_o::architecture_name(architecture)
     );
-    if architecture == mach_o::MachOArchitecture::Arm64 {
-        if options.force_32_bit {
-            return Err(
-                "--force-32-bit was requested, but this executable is ARM64-only and cannot run in the 32-bit ARM loader".to_string(),
-            );
-        }
+    let arm64_selected = architecture == mach_o::MachOArchitecture::Arm64 && !options.force_32_bit;
+    if arm64_selected {
+        options.high_performance = false;
+        options.force_max_clocks = false;
+        options.fast_memory = false;
+        options.direct_memory_access = false;
+        options.verbose_logging = true;
+        options.trace_gl_errors = true;
+        crate::log::set_verbose_logging(true);
+        crate::gles::configure_translator_tracing(true, true);
+        log!("ARM64 executable detected; disabling high-performance mode, maximum-clock hints, and direct memory access until the ARM64 path is ready");
+        log!("ARM64 executable detected; enabling verbose logging and OpenGL error tracing automatically");
+    }
+    options.apply_power_profile(display_rate);
+    window::configure_host_performance(
+        options.high_performance,
+        options.force_max_clocks,
+        options.affinity.as_deref(),
+    );
+    crate::gles::present::set_onscreen_hud_architecture(mach_o::architecture_name(architecture));
+    if options.llvmpipe_fallback && crate::gles::llvmpipe_fallback_available() {
+        options.prefer_gles2_context = true;
+        log!("LLVMPipe fallback libraries detected; ARM32 GLES1 apps will use the GLES2 translator on LLVMPipe");
+    }
+
+    if arm64_selected {
         return environment64::run(bundle, fs, options, app_args.unwrap_or_default());
+    }
+    if architecture == mach_o::MachOArchitecture::Arm64 {
+        return Err("--force-32-bit was requested, but this executable is ARM64-only and cannot run in the 32-bit ARM loader".to_string());
     }
     if options.force_64_bit {
         return Err(
@@ -558,6 +709,8 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
                 "guest application terminated unexpectedly".to_string()
             };
             echo!("Guest application stopped: {}", message);
+            crate::dyld::echo_missing_api_summary();
+            crate::log::flush_log_file();
             Err(message)
         }
     }

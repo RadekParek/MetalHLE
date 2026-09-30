@@ -21,7 +21,7 @@ use crate::objc::{
 use crate::Environment;
 use std::collections::HashMap;
 
-const CACHE_SIZE: usize = 60;
+const CACHE_SIZE: usize = 128;
 
 #[derive(Default)]
 pub struct State {
@@ -101,7 +101,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         log!("UIImage imageNamed: {:?} not found in bundle", name_str);
     }
 
-    if State::get(env).cached_images.len() > CACHE_SIZE {
+    if State::get(env).cached_images.len() >= CACHE_SIZE {
         let cache = std::mem::take(&mut State::get_mut(env).cached_images);
         for (_, img) in cache {
             release(env, img);
@@ -216,11 +216,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGSize)size {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
-    // An image created via bare -alloc/-init has no CGImage; Apple returns
-    // a zero size rather than crashing.
-    if image.is_null() {
-        return CGSize { width: 0.0, height: 0.0 };
-    }
     let (width, height) = cg_image::borrow_image(&env.objc, image).dimensions();
     CGSize {
         width: width as _,
@@ -268,8 +263,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
-    // Drawing a nil image is a no-op, not a crash.
-    if image == nil { return; }
     let rect = CGRect {
         origin: point,
         size: CGSize {
@@ -289,8 +282,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     // частей (nine-patch)
     // и отрисовывать через CGContextDrawImage кусками. Пока рисуем целиком.
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
-    // Drawing a nil image is a no-op, not a crash.
-    if image == nil { return; }
     CGContextDrawImage(env, context, rect, image);
 }
 
@@ -303,8 +294,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
-    // Drawing a nil image is a no-op, not a crash.
-    if image == nil { return; }
     CGContextDrawImage(env, context, rect, image);
 }
 
@@ -312,8 +301,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
-    // Drawing a nil image is a no-op, not a crash.
-    if image == nil { return; }
     let rect = CGRect {
         origin: point,
         size: CGSize {

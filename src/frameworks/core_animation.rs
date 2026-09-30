@@ -24,6 +24,8 @@ mod animation;
 mod composition;
 
 pub use composition::recomposite_if_necessary;
+pub use composition::guest_owns_default_framebuffer;
+pub use composition::set_guest_owns_default_framebuffer;
 
 use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
 use crate::dyld::{export_c_func, FunctionExports};
@@ -31,6 +33,7 @@ use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_graphics::CGFloat;
 use crate::mem::SafeRead;
 use crate::Environment;
+use std::time::Instant;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     // Core Animation is considered its own framework, but it technically lives
@@ -65,15 +68,16 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 pub struct State {
     ca_media_timing_function: ca_media_timing_function::State,
     ca_transaction: ca_transaction::State,
-    composition: composition::State,
     gradients: ca_gradient_layer::State,
+    composition: composition::State,
 }
 
-// Use the same virtual monotonic clock as mach_absolute_time(), but return
-// seconds rather than nanoseconds. Both clocks remain continuous when the
-// user changes game speed.
+// This function should call mach_absolute_time() and convert the result into
+// seconds. Since in our implementation, mach_absolute_time() returns, in
+// nanoseconds, Instant::now, we can just do the same in seconds and save
+// the calls to the guest functions.
 pub fn CACurrentMediaTime(env: &mut Environment) -> CFTimeInterval {
-    env.guest_clock.now()
+    Instant::now()
         .duration_since(env.startup_time)
         .as_secs_f64()
 }

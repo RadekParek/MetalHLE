@@ -148,18 +148,13 @@ fn CFBundleCreate(
 }
 
 fn CFBundleCreateBundlesFromDirectory(
-    env: &mut Environment,
+    _env: &mut Environment,
     _allocator: CFTypeRef,
     _directory_url: CFURLRef,
     _bundle_type: CFStringRef,
 ) -> CFArrayRef {
-    // Scanning a directory for nested bundles is not implemented. On iOS a
-    // directory without bundles yields an empty array and callers iterate
-    // the result unconditionally, so return an empty array instead of nil
-    // to keep that iteration safe.
-    log_dbg!("CFBundleCreateBundlesFromDirectory: scan not implemented, returning empty array");
-    let empty: CFArrayRef = msg_class![env; NSArray array];
-    empty
+    log!("TODO: CFBundleCreateBundlesFromDirectory — returning nil");
+    nil
 }
 
 // =========================================================================
@@ -513,8 +508,7 @@ pub fn CFBundleCopyBundleLocalizations(env: &mut Environment, bundle: CFBundleRe
         .unwrap_or(&env.bundle)
         .bundle_localizations()
         .iter()
-        // A corrupt plist must not panic the host; skip non-string entries.
-        .filter_map(|value| value.as_string().map(|s| s.to_string()))
+        .map(|value| value.as_string().unwrap().to_string())
         .collect::<Vec<String>>();
 
     let guest_bundle_localizations = bundle_localizations
@@ -617,14 +611,11 @@ fn CFBundlePreflightExecutable(
 }
 
 fn CFBundleLoadExecutable(_env: &mut Environment, bundle: CFBundleRef) -> bool {
-    // The app binary is always "loaded"; other bundles have no code we could
-    // load, but reporting success matches CFBundleIsExecutableLoaded above
-    // and keeps callers out of their error-handling paths.
-    log_dbg!(
-        "CFBundleLoadExecutable({:?}) -> true (pretend success)",
+    log!(
+        "TODO: CFBundleLoadExecutable({:?}) — returning false",
         bundle
     );
-    true
+    false
 }
 
 fn CFBundleLoadExecutableAndReturnError(
@@ -636,8 +627,7 @@ fn CFBundleLoadExecutableAndReturnError(
 }
 
 fn CFBundleUnloadExecutable(_env: &mut Environment, bundle: CFBundleRef) {
-    // There is no code to unload; treat as a successful no-op.
-    log_dbg!("CFBundleUnloadExecutable({:?}) -> ignored", bundle);
+    log!("TODO: CFBundleUnloadExecutable({:?}) — ignored", bundle);
 }
 
 // =========================================================================
@@ -653,25 +643,12 @@ fn CFBundleGetFunctionPointerForName(
         return nil;
     }
     let name = ns_string::to_rust_string(env, function_name);
-    // Resolve the symbol through dyld the same way `dlsym` does. Mach-O C
-    // symbols are prefixed with an underscore.
-    let mangled = format!("_{}", name);
-    match env
-        .dyld
-        .create_proc_address(&mut env.mem, &mut env.cpu, &mangled)
-    {
-        Ok(function) => MutVoidPtr::from_bits(function.addr_with_thumb_bit()).cast(),
-        Err(_) => {
-            // Unknown symbols legitimately return NULL (the documented
-            // failure result), so keep this quiet.
-            log_dbg!(
-                "CFBundleGetFunctionPointerForName({:?}, \"{}\") -> NULL (no host implementation)",
-                bundle,
-                name
-            );
-            nil
-        }
-    }
+    log!(
+        "TODO: CFBundleGetFunctionPointerForName({:?}, \"{}\") — returning NULL",
+        bundle,
+        name
+    );
+    nil
 }
 
 fn CFBundleGetFunctionPointersForNames(
@@ -684,11 +661,14 @@ fn CFBundleGetFunctionPointersForNames(
         return;
     }
     let count: NSUInteger = msg![env; function_names count];
-    let ftbl_ptr: crate::mem::MutPtr<MutVoidPtr> = ftbl.cast();
+    log!(
+        "CFBundleGetFunctionPointersForNames({:?}, count={}) — writing NULL for all",
+        bundle,
+        count
+    );
+    let null_ptr: crate::mem::MutPtr<MutVoidPtr> = ftbl.cast();
     for i in 0..count {
-        let name: CFStringRef = msg![env; function_names objectAtIndex:i];
-        let resolved = CFBundleGetFunctionPointerForName(env, bundle, name);
-        env.mem.write(ftbl_ptr + i, resolved.cast());
+        env.mem.write(null_ptr + i, crate::mem::Ptr::null());
     }
 }
 
@@ -701,10 +681,8 @@ fn CFBundleGetDataPointerForName(
         return nil;
     }
     let name = ns_string::to_rust_string(env, symbol_name);
-    // Host data constants cannot be resolved to guest pointers (they are
-    // materialised lazily by the linker), so NULL is all we can return.
-    log_dbg!(
-        "CFBundleGetDataPointerForName({:?}, \"{}\") -> NULL (not supported)",
+    log!(
+        "TODO: CFBundleGetDataPointerForName({:?}, \"{}\") — returning NULL",
         bundle,
         name
     );
@@ -721,7 +699,7 @@ fn CFBundleGetDataPointersForNames(
         return;
     }
     let count: NSUInteger = msg![env; symbol_names count];
-    log_dbg!(
+    log!(
         "CFBundleGetDataPointersForNames({:?}, count={}) — writing NULL for all",
         bundle,
         count

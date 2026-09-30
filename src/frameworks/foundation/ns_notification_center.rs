@@ -13,7 +13,6 @@ use crate::objc::{
     id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr, SEL,
 };
-use crate::Environment;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -39,32 +38,9 @@ struct Observer {
     block: id,
 }
 
-/// A CF-style observer registered via `CFNotificationCenterAddObserver`
-/// (see `frameworks::core_foundation::cf_notification_center`).
-///
-/// On iOS the local CF notification center is the same object as this
-/// class's default center, so CF observers are stored alongside the
-/// selector/block ones and are dispatched from `-postNotification:` too.
-///
-/// Per CF semantics neither `observer` nor `object` is retained, and no
-/// selector is involved: delivery invokes `callback` directly.
-#[derive(Clone)]
-pub struct CfObserver {
-    /// The `const void *observer` value the guest registered (usually an
-    /// id, but CF allows any pointer; opaque to us).
-    pub observer: id,
-    /// `CFNotificationCallback`.
-    pub callback: GuestFunction,
-    /// Notification name to observe; `None` means "any name".
-    pub name: Option<Cow<'static, str>>,
-    /// Object filter; `nil` means "any object".
-    pub object: id,
-}
-
 #[derive(Default)]
 struct NSNotificationCenterHostObject {
     observers: HashMap<Cow<'static, str>, Vec<Observer>>,
-    cf_observers: Vec<CfObserver>,
 }
 impl HostObject for NSNotificationCenterHostObject {}
 
@@ -77,7 +53,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(NSNotificationCenterHostObject {
         observers: HashMap::new(),
-        cf_observers: Vec::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -296,11 +271,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Collect observers matching this notification: those registered for
     // exactly this name plus those registered with `name = nil` (stored
-    // under the empty-string key), as well as CFNotificationCenter
-    // observers (whose `None` name means "any name"). Both flavours are
-    // filtered by the `object` predicate inside their dispatch loops
-    // below.
-    let (observers, cf_observers): (Vec<Observer>, Vec<CfObserver>) = {
+    // under the empty-string key). Both buckets are filtered by the
+    // `object` predicate inside the dispatch loop below.
+    let observers: Vec<Observer> = {
         let host_obj = env.objc.borrow::<NSNotificationCenterHostObject>(this);
         let mut merged: Vec<Observer> = Vec::new();
         if let Some(named) = host_obj.observers.get(&name) {
@@ -312,18 +285,9 @@ pub const CLASSES: ClassExports = objc_classes! {
                 merged.extend(any_name.iter().cloned());
             }
         }
-        let cf: Vec<CfObserver> = host_obj
-            .cf_observers
-            .iter()
-            .filter(|cf| match &cf.name {
-                None => true,
-                Some(cf_name) => cf_name == &name,
-            })
-            .cloned()
-            .collect();
-        (merged, cf)
+        merged
     };
-    if observers.is_empty() && cf_observers.is_empty() {
+    if observers.is_empty() {
         return;
     }
     for Observer { observer, selector, object, block } in observers {
@@ -377,33 +341,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         let _: () = msg_send(env, (observer, selector, notification));
         release(env, observer);
     }
-
-    // CFNotificationCenter observers registered via
-    // CFNotificationCenterAddObserver. The CFNotificationCallback
-    // signature is:
-    //   void (*)(CFNotificationCenterRef center, void *observer,
-    //            CFStringRef name, const void *object,
-    //            CFDictionaryRef userInfo)
-    if !cf_observers.is_empty() {
-        let user_info: id = msg![env; notification userInfo];
-        for CfObserver { observer, callback, name: _, object } in cf_observers {
-            // The object argument is a filter for which notification
-            // sources the observer is interested in.
-            if object != nil && notification_poster != object {
-                continue;
-            }
-            log_dbg!(
-                "Notification {:?} observed, invoking CF callback {:?} (observer {:?})",
-                notification,
-                callback,
-                observer
-            );
-            let _: () = callback.call_from_host(
-                env,
-                (this, observer, name_id, notification_poster, user_info),
-            );
-        }
-    }
 }
 - (())postNotificationName:(NSNotificationName)name
                     object:(id)object {
@@ -442,38 +379,4 @@ fn remove_observers_internal(
             i += 1;
         }
     }
-}
-
-/// Register a CF-style observer on `center`. Called from
-/// `crate::frameworks::core_foundation::cf_notification_center`.
-/// `center` must not be nil (the caller guards against that).
-pub fn add_cf_observer(env: &mut Environment, center: id, cf_observer: CfObserver) {
-    let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(center);
-    host_obj.cf_observers.push(cf_observer);
-}
-
-/// Remove CF-style observers matching `observer`, `name` and `object` from
-/// `center` (see `CFNotificationCenterRemoveObserver`). Per CF semantics
-/// nothing was retained at registration time, so there is nothing to
-/// release here either.
-pub fn remove_cf_observer(
-    env: &mut Environment,
-    center: id,
-    observer: id,
-    name: Option<Cow<'static, str>>,
-    object: id,
-) {
-    let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(center);
-    host_obj.cf_observers.retain(|cf| {
-        !(cf.observer == observer
-            && cf.name == name
-            && (object == nil || object == cf.object))
-    });
-}
-
-/// Remove every CF-style observer registered for `observer` from `center`
-/// (see `CFNotificationCenterRemoveEveryObserver`).
-pub fn remove_every_cf_observer(env: &mut Environment, center: id, observer: id) {
-    let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(center);
-    host_obj.cf_observers.retain(|cf| cf.observer != observer);
 }

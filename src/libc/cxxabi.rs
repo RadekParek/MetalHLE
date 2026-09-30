@@ -81,202 +81,73 @@ fn __cxa_guard_abort(env: &mut Environment, guard: MutPtr<u8>) {
     env.mem.write(guard, 0);
 }
 
-// === Best-effort frame-pointer recovery ===
+// === SjLj exception bypass ===
 //
 // touchHLE has no real C++ unwinder. Implementing one means parsing
 // .gcc_except_table LSDAs, walking the SjLj jmpbuf chain and dispatching
 // to the right `catch` clause. That's a multi-week project.
 //
-// A number of guest termination paths can still be made survivable by
-// pretending that the current function returned an error. We find its saved
-// return address through the ARM frame-pointer chain, restore the caller's
-// SP/FP/LR, clear R0 and branch to that address. This deliberately skips
-// destructors and may leave local state inconsistent, but is preferable to
-// letting an expected guest-side failure terminate the host emulator.
+// Instead, when a guest exception is thrown we walk the ARM frame-pointer
+// chain looking for a return address that lives inside the user code
+// segment (below 0x10000000 — guest binaries always load there; the
+// system dylibs are mapped at >= 0x38000000). When we find one, we treat
+// that frame as if it caught the exception: restore SP and FP for that
+// frame, set R0=0 (the "no exception in flight" return) and branch to
+// LR. Effectively we make the throwing function return to the first
+// app-level frame above it.
 //
-// This helper is shared with `stdlib`'s `abort`/`exit` handling. Keep it
-// conservative: every frame record must be in the current thread's recorded
-// stack, the chain must move toward older frames, the continuation must be in
-// the main executable, and we must not cross a host-call/thread-exit
-// trampoline.
+// This is wrong in the strict sense — destructors of automatic objects
+// in skipped frames don't run and the caller's local state may be inconsistent
+// — but it lets games that
+// throw recoverable errors (parse failures, missing assets, etc.) keep
+// running instead of crashing on a NULL-page indirect call.
 
-const MAX_FRAME_POINTER_UNWIND: usize = 64;
+const APP_CODE_LIMIT: u32 = 0x1000_0000;
 
-/// Return the post-return SP for a readable ARM frame record at `fp`.
-///
-/// A normal ARM EABI frame record has the previous FP at `[fp]` and the saved
-/// LR at `[fp + 4]`. `fp + 8` is the caller's SP. The caller's SP may be one
-/// byte past a secondary stack's inclusive upper bound, so it is checked
-/// separately from the two readable words.
-fn frame_record_caller_sp(
-    stack_range: &std::ops::RangeInclusive<u32>,
-    fp: u32,
-) -> Option<u32> {
-    if fp == 0 || !fp.is_multiple_of(4) {
-        return None;
-    }
-
-    let saved_lr = fp.checked_add(4)?;
-    let caller_sp = fp.checked_add(8)?;
-    if !stack_range.contains(&fp) || !stack_range.contains(&saved_lr) {
-        return None;
-    }
-    if stack_range
-        .end()
-        .checked_add(1)
-        .is_some_and(|stack_end_after| caller_sp > stack_end_after)
-    {
-        return None;
-    }
-    Some(caller_sp)
-}
-
-fn address_is_in_image(env: &Environment, address: u32) -> bool {
-    let address = address & !1;
-    address != 0
-        && env
-            .bins
-            .iter()
-            .any(|image| (image.text_base..image.last_segment_end).contains(&address))
-}
-
-#[cfg(test)]
-mod frame_record_tests {
-    use super::frame_record_caller_sp;
-
-    #[test]
-    fn accepts_a_complete_record_and_a_caller_sp_at_stack_end() {
-        let stack = 0x1000u32..=0x10ff;
-        assert_eq!(frame_record_caller_sp(&stack, 0x1000), Some(0x1008));
-        assert_eq!(frame_record_caller_sp(&stack, 0x10f8), Some(0x1100));
-    }
-
-    #[test]
-    fn rejects_incomplete_misaligned_and_overflowing_records() {
-        let stack = 0x1000u32..=0x10ff;
-        assert_eq!(frame_record_caller_sp(&stack, 0x0ffc), None);
-        assert_eq!(frame_record_caller_sp(&stack, 0x1002), None);
-        assert_eq!(frame_record_caller_sp(&stack, 0x10fc), None);
-
-        let top_of_address_space = 0xfff0_0000u32..=u32::MAX;
-        assert_eq!(
-            frame_record_caller_sp(&top_of_address_space, 0xffff_fffc),
-            None
-        );
-    }
-}
-
-fn address_is_in_main_executable(env: &Environment, address: u32) -> bool {
-    let address = address & !1;
-    address != 0
-        && env
-            .bins
-            .first()
-            .is_some_and(|image| (image.text_base..image.last_segment_end).contains(&address))
-}
-
-/// Best-effort non-local return to an app frame.
-///
-/// On success this updates the guest CPU state and returns the selected app
-/// continuation. Returning `None` leaves the CPU untouched. Callers can then
-/// use their normal, controlled guest-failure path instead of terminating the
-/// host process.
-pub(crate) fn unwind_to_app_frame(env: &mut Environment) -> Option<GuestFunction> {
-    let Some(stack_range) = env
+pub(crate) fn unwind_to_app_frame(env: &mut Environment) -> bool {
+    // The thread's stack typically lives at the top of the 4 GiB guest
+    // address space (e.g. SP ≈ 0xffffee40). Use the recorded stack range
+    // when available — otherwise fall back to "any non-zero, non-all-ones
+    // address that's 4-byte aligned".
+    let stack_range = env
         .threads
         .get(env.current_thread)
-        .and_then(|thread| thread.stack.clone())
-    else {
-        log!(
-            "Warning: cannot recover guest control flow on thread {}: no stack range.",
-            env.current_thread
-        );
-        return None;
-    };
+        .and_then(|t| t.stack.clone());
 
+    let mut fp = env.cpu.regs()[FRAME_POINTER];
     let return_to_host = env.dyld.return_to_host_routine().addr_with_thumb_bit();
     let thread_exit = env.dyld.thread_exit_routine().addr_with_thumb_bit();
-    let mut fp = env.cpu.regs()[FRAME_POINTER];
 
-    for _ in 0..MAX_FRAME_POINTER_UNWIND {
-        // `GuestFunction::call_from_host` makes a diagnostic frame on the
-        // guest stack. Its saved LR is the interrupted guest LR rather than
-        // the return-to-host sentinel, so track it explicitly instead of
-        // accidentally resuming across a suspended host callback.
-        if env.is_host_to_guest_stack_frame(fp) {
+    for _ in 0..64 {
+        if fp == 0 || fp == 0xffff_ffff || (fp & 3) != 0 {
             break;
         }
-        let Some(caller_sp) = frame_record_caller_sp(&stack_range, fp) else {
-            break;
-        };
-        let previous_fp: u32 = env.mem.read(ConstPtr::<u32>::from_bits(fp));
-        let saved_lr: u32 = env.mem.read(ConstPtr::<u32>::from_bits(fp + 4));
-
-        // These sentinels are the boundary of a host-to-guest call or a guest
-        // thread. Do not inspect older frames once one is reached: doing so
-        // could resume a host callback with an unrelated guest stack.
-        if saved_lr == return_to_host || saved_lr == thread_exit {
-            break;
+        if let Some(ref r) = stack_range {
+            if !r.contains(&fp) {
+                break;
+            }
         }
-
-        // ARM's descending stack makes older frame records higher in memory.
-        // Check the next record before trusting it as the caller's FP; this
-        // prevents cycles, backwards chains and arbitrary memory reads.
-        let previous_frame_is_valid = previous_fp == 0
-            || (previous_fp > fp
-                && !env.is_host_to_guest_stack_frame(previous_fp)
-                && frame_record_caller_sp(&stack_range, previous_fp).is_some());
-        if !previous_frame_is_valid {
-            break;
-        }
-
-        if address_is_in_main_executable(env, saved_lr) {
-            // Returning from the selected frame later needs the selected
-            // caller's LR, not the LR left behind by the host-function stub.
-            // If that value cannot be validated, use thread-exit as the safe
-            // terminal continuation rather than branching back into the
-            // aborted frame.
-            let caller_lr = if previous_fp == 0 {
-                thread_exit
-            } else {
-                let candidate: u32 = env.mem.read(ConstPtr::<u32>::from_bits(previous_fp + 4));
-                if candidate == return_to_host
-                    || candidate == thread_exit
-                    || address_is_in_image(env, candidate)
-                {
-                    candidate
-                } else {
-                    thread_exit
-                }
-            };
-
-            let continuation = GuestFunction::from_addr_with_thumb_bit(saved_lr);
+        let prev_fp: u32 = env.mem.read(ConstPtr::<u32>::from_bits(fp));
+        let lr: u32 = env.mem.read(ConstPtr::<u32>::from_bits(fp + 4));
+        let lr_no_thumb = lr & !1;
+        // Skip frames where LR is one of touchHLE's host trampoline
+        // sentinels (return-to-host / thread-exit). Those mark the
+        // boundary between host and guest code; unwinding past them
+        // would dump us back into the wrong place.
+        let is_host_trampoline = lr == return_to_host || lr == thread_exit;
+        if !is_host_trampoline && lr_no_thumb > 0 && lr_no_thumb < APP_CODE_LIMIT {
             let regs = env.cpu.regs_mut();
-            regs[FRAME_POINTER] = previous_fp;
-            regs[Cpu::SP] = caller_sp;
-            regs[Cpu::LR] = caller_lr;
+            regs[FRAME_POINTER] = prev_fp;
+            regs[Cpu::SP] = fp + 8;
             regs[0] = 0;
-            env.cpu.branch(continuation);
-            env.note_guest_control_flow_redirect();
-            return Some(continuation);
+            env.cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
+            return true;
         }
-
-        if previous_fp == 0 {
-            break;
-        }
-        fp = previous_fp;
+        fp = prev_fp;
     }
-
-    None
+    false
 }
 
-// === Exception-loop detection (shared) ===
-//
-// touchHLE's exception "bypass" can return control to a caller that
-// immediately re-throws (classic example: `operator new` in a loop that
-// keeps getting NULL from a refused huge `malloc`, throwing `bad_alloc`
-// every iteration — see P. Harvest, which spins on malloc(0x4420000c)).
-// Both the Itanium (`__cxa_throw`) and the SjLj (`_Unwind_SjLj_*`) entry
 // points funnel through here so neither can hang the emulator forever.
 //
 // Returns the number of consecutive throws that share the same `key`.
@@ -303,27 +174,49 @@ fn note_exception_throw(key: &str) -> u32 {
 // We allocate the requested storage prefixed by a fake __cxa_exception
 // header, so that pointer arithmetic in the app's exception-handling
 // code (ABI offsets, exception_class field, etc.) lands inside live
-// memory. We never actually free the storage — exceptions are extremely
-// rare and the leak is bounded.
+// memory. The compatibility unwinder bypasses guest catch frames, so release
+// the storage when the throw is handled to avoid a retry loop exhausting the
+// guest heap.
 
 const CXA_EXCEPTION_HEADER_SIZE: GuestUSize = 0x60;
 
 fn __cxa_allocate_exception(env: &mut Environment, thrown_size: GuestUSize) -> MutVoidPtr {
-    let block: MutVoidPtr = env.mem.alloc(CXA_EXCEPTION_HEADER_SIZE + thrown_size);
+    let Some(total_size) = CXA_EXCEPTION_HEADER_SIZE.checked_add(thrown_size) else {
+        log!(
+            "Warning: __cxa_allocate_exception size overflow for {:#x} bytes; returning NULL",
+            thrown_size
+        );
+        return MutVoidPtr::null();
+    };
+    let block: MutVoidPtr = env.mem.alloc(total_size);
+    if block.is_null() {
+        log_once_fmt!(
+            "Warning: __cxa_allocate_exception could not allocate {:#x} bytes; returning NULL; repeated failures are suppressed",
+            total_size
+        );
+        return MutVoidPtr::null();
+    }
     Ptr::from_bits(block.to_bits() + CXA_EXCEPTION_HEADER_SIZE)
 }
 
-fn __cxa_free_exception(_env: &mut Environment, _thrown: MutVoidPtr) {
-    // Leak — see comment above.
+fn free_exception_storage(env: &mut Environment, thrown: MutVoidPtr) {
+    let Some(base) = thrown.to_bits().checked_sub(CXA_EXCEPTION_HEADER_SIZE) else {
+        return;
+    };
+    if env.mem.is_known_allocation(base) {
+        env.mem.free(Ptr::from_bits(base));
+    }
+}
+
+fn __cxa_free_exception(env: &mut Environment, thrown: MutVoidPtr) {
+    free_exception_storage(env, thrown);
 }
 
 fn __cxa_decrement_exception_refcount(_env: &mut Environment, _exception: MutVoidPtr) {}
 
-fn __cxa_increment_exception_refcount(_env: &mut Environment, _exception: MutVoidPtr) {
-    // The exception object is intentionally retained by the emulator.
-}
+fn __cxa_increment_exception_refcount(_env: &mut Environment, _exception: MutVoidPtr) {}
 
-fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dtor: GuestFunction) {
+fn __cxa_throw(env: &mut Environment, exc: MutVoidPtr, tinfo: ConstVoidPtr, _dtor: GuestFunction) {
     // Itanium type_info layout (32-bit):
     //   +0  vptr
     //   +4  const char *name
@@ -341,6 +234,8 @@ fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dt
     } else {
         "(null type_info)".to_owned()
     };
+
+    free_exception_storage(env, exc);
 
     // Throw-rate limiter: if the app enters an exception loop (e.g. because
     // our SjLj bypass returns it to a `while (true) new X;` path that throws
@@ -370,7 +265,7 @@ fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dt
         return;
     }
 
-    if unwind_to_app_frame(env).is_none() {
+    if !unwind_to_app_frame(env) {
         log!(
             "Warning: Could not unwind past C++ exception ({}); no app-level \
              frame on the stack. Returning to caller; guest will likely abort.",
@@ -380,8 +275,8 @@ fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dt
 }
 
 fn __cxa_rethrow(env: &mut Environment) {
-    log!("__cxa_rethrow — bypassing");
-    if unwind_to_app_frame(env).is_none() {
+    log_once!("__cxa_rethrow — bypassing; repeated calls are suppressed");
+    if !unwind_to_app_frame(env) {
         log!(
             "Warning: Could not unwind past __cxa_rethrow; no app-level frame. \
              Returning to caller; guest will likely abort."
@@ -401,7 +296,7 @@ fn __cxa_end_catch(_env: &mut Environment) {}
 
 fn __cxa_pure_virtual(env: &mut Environment) {
     log!("Pure virtual function called — vtable slot was NULL. Bypassing.");
-    if unwind_to_app_frame(env).is_none() {
+    if !unwind_to_app_frame(env) {
         log!(
             "Warning: Pure virtual function called and no recoverable frame; \
              returning to caller. Guest will likely abort."
@@ -422,7 +317,7 @@ fn __cxa_uncaught_exception(_env: &mut Environment) -> bool {
 
 fn __cxa_call_unexpected(env: &mut Environment, _exc: MutVoidPtr) {
     log!("__cxa_call_unexpected — bypassing");
-    if unwind_to_app_frame(env).is_none() {
+    if !unwind_to_app_frame(env) {
         log!(
             "Warning: __cxa_call_unexpected with no recoverable frame; \
              returning to caller. Guest will likely abort."
@@ -442,10 +337,9 @@ fn __cxa_call_unexpected(env: &mut Environment, _exc: MutVoidPtr) {
 /// Returns the casted pointer on success, or NULL on failure (the cast
 /// does not apply / a `dynamic_cast<T*>` should evaluate to nullptr).
 ///
-/// The guest libstdc++ implementation dispatches through Itanium `type_info`
-/// vtables, which may be stubbed by the linker. This host implementation
-/// reads the guest RTTI records and uses vtable-kind metadata registered by
-/// dyld so casts can succeed without calling those vtable methods.
+/// The emulator parses the guest's bounded Itanium RTTI hierarchy to support
+/// public upcasts, downcasts, and cross-casts. Malformed or excessive RTTI is
+/// treated as a failed cast rather than a host crash.
 const MAX_RTTI_SUBOBJECTS: usize = 4096;
 const MAX_RTTI_BASES: u32 = 512;
 const MAX_RTTI_DEPTH: u8 = 64;
@@ -500,25 +394,9 @@ fn rtti_types_equal(env: &Environment, left: u32, right: u32) -> bool {
 fn rtti_typeinfo_kind(
     env: &Environment,
     type_info: u32,
-    trace: bool,
 ) -> Option<crate::dyld::CxxAbiTypeInfoKind> {
-    let Some(vtable) = read_guest_u32(env, type_info) else {
-        if trace {
-            log!(
-                "__dynamic_cast RTTI node has unreadable vtable: type_info={type_info:#010x} name={:?}",
-                rtti_type_name(env, type_info)
-            );
-        }
-        return None;
-    };
-    let kind = env.dyld.cxxabi_typeinfo_kind(vtable);
-    if trace {
-        log!(
-            "RTTI node type_info={type_info:#010x} name={:?} vtable={vtable:#010x} kind={kind:?}",
-            rtti_type_name(env, type_info)
-        );
-    }
-    kind
+    let vtable = read_guest_u32(env, type_info)?;
+    env.dyld.cxxabi_typeinfo_kind(vtable)
 }
 
 fn rtti_base_object_address(env: &Environment, derived: u32, offset_flags: u32) -> Option<u32> {
@@ -564,7 +442,6 @@ fn rtti_subobjects(
     env: &Environment,
     dynamic_type: u32,
     dynamic_object: u32,
-    trace: bool,
 ) -> Option<Vec<RttiSubobject>> {
     use crate::dyld::CxxAbiTypeInfoKind;
 
@@ -579,7 +456,7 @@ fn rtti_subobjects(
     let mut index = 0;
     while index < nodes.len() {
         let node = nodes[index];
-        match rtti_typeinfo_kind(env, node.type_info, trace)? {
+        match rtti_typeinfo_kind(env, node.type_info)? {
             CxxAbiTypeInfoKind::Class => {}
             CxxAbiTypeInfoKind::SingleInheritance => {
                 let base_type = read_guest_u32(env, node.type_info.checked_add(8)?)?;
@@ -597,8 +474,7 @@ fn rtti_subobjects(
                         .checked_add(base_index.checked_mul(8)?)?;
                     let base_type = read_guest_u32(env, entry)?;
                     let offset_flags = read_guest_u32(env, entry.checked_add(4)?)?;
-                    let base_object =
-                        rtti_base_object_address(env, node.object, offset_flags)?;
+                    let base_object = rtti_base_object_address(env, node.object, offset_flags)?;
                     push_rtti_subobject(
                         &mut nodes,
                         base_type,
@@ -707,8 +583,7 @@ fn __dynamic_cast(
     dst_type: ConstVoidPtr,
     src2dst_offset: i32,
 ) -> ConstVoidPtr {
-    static TRACE_COUNTER: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static TRACE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let trace = std::env::var_os("TOUCHHLE_TRACE_DYNAMIC_CAST").is_some()
         && TRACE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64;
     if trace {
@@ -768,19 +643,19 @@ fn __dynamic_cast(
             .map_or(Ptr::null(), ConstVoidPtr::from_bits);
     }
 
-    let Some(nodes) = rtti_subobjects(env, dynamic_type, dynamic_object, trace) else {
+    let Some(nodes) = rtti_subobjects(env, dynamic_type, dynamic_object) else {
         if trace {
-            log!("__dynamic_cast hierarchy decode failed for {:#010x}", dynamic_type);
+            log!(
+                "__dynamic_cast hierarchy decode failed for {:#010x}",
+                dynamic_type
+            );
         }
         return Ptr::null();
     };
-    let result = rtti_cast_from_subobjects(
-        &nodes,
-        src_type,
-        src.to_bits(),
-        dst_type,
-        |left, right| rtti_types_equal(env, left, right),
-    );
+    let result =
+        rtti_cast_from_subobjects(&nodes, src_type, src.to_bits(), dst_type, |left, right| {
+            rtti_types_equal(env, left, right)
+        });
     if trace {
         let hierarchy: Vec<_> = nodes
             .iter()
@@ -839,7 +714,7 @@ fn _Unwind_SjLj_RaiseException(env: &mut Environment, _exc: MutVoidPtr) -> i32 {
         // _URC_FATAL_PHASE1_ERROR
         return 3;
     }
-    if unwind_to_app_frame(env).is_none() {
+    if !unwind_to_app_frame(env) {
         log!(
             "Warning: _Unwind_SjLj_RaiseException with no recoverable frame; \
              returning _URC_FATAL_PHASE1_ERROR to caller."
@@ -852,24 +727,23 @@ fn _Unwind_SjLj_RaiseException(env: &mut Environment, _exc: MutVoidPtr) -> i32 {
 
 #[allow(non_snake_case)]
 fn _Unwind_SjLj_Resume(env: &mut Environment, _exc: MutVoidPtr) {
-    log!("_Unwind_SjLj_Resume — bypassing");
-    if unwind_to_app_frame(env).is_none() {
+    log_once!("_Unwind_SjLj_Resume — bypassing; repeated resume calls are suppressed");
+    if !unwind_to_app_frame(env) {
         log!(
-            "Warning: _Unwind_SjLj_Resume with no recoverable frame; returning \
-             to caller. Guest will likely abort."
+            "Warning: _Unwind_SjLj_Resume with no recoverable frame; \
+             returning to caller. Guest will likely abort."
         );
     }
 }
 
 #[allow(non_snake_case)]
 fn _Unwind_SjLj_Resume_or_Rethrow(env: &mut Environment, _exc: MutVoidPtr) -> i32 {
-    log!("_Unwind_SjLj_Resume_or_Rethrow — bypassing");
-    if unwind_to_app_frame(env).is_none() {
+    log_once!("_Unwind_SjLj_Resume_or_Rethrow — bypassing; repeated calls are suppressed");
+    if !unwind_to_app_frame(env) {
         log!(
             "Warning: _Unwind_SjLj_Resume_or_Rethrow with no recoverable frame; \
              returning _URC_FATAL_PHASE2_ERROR."
         );
-        // _URC_FATAL_PHASE2_ERROR
         return 2;
     }
     0

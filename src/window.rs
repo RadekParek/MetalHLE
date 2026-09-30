@@ -12,29 +12,78 @@
 //! window system interaction in general, because it is assumed only one window
 //! will be needed for the runtime of the app.
 
-mod geometry;
-
 use crate::gles::present::present_frame;
+use crate::gles::wgpu::WgpuPresentation;
 use crate::gles::{
     create_gles1_ctx_no_parent_stack, create_gles1_gles3_translator_ctx_no_parent_stack,
-    create_gles1_translator_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext,
-    LoggingGLESContext, GLES,
+    create_gles1_translator_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack,
+    create_gles3_ctx_no_parent_stack,
+    create_host_gles1_ctx_no_parent_stack, GLESContext, GLES,
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
-use crate::options::Options;
+use crate::options::{Options, RenderRotation};
 use crate::Environment;
 use sdl2::mouse::MouseButton;
-use sdl2::pixels::PixelFormatEnum;
+use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::surface::Surface;
+use sdl2::video::SwapInterval;
 use sdl2_sys::SDL_PowerState;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
-use std::num::NonZeroU32;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
+
+pub(crate) fn calculate_letterboxed_viewport(
+    game_width: u32,
+    game_height: u32,
+    drawable_width: u32,
+    drawable_height: u32,
+) -> (u32, u32, u32, u32) {
+    if game_width == 0 || game_height == 0 || drawable_width == 0 || drawable_height == 0 {
+        return (0, 0, drawable_width, drawable_height);
+    }
+    let game_aspect = game_width as f64 / game_height as f64;
+    let drawable_aspect = drawable_width as f64 / drawable_height as f64;
+    let (width, height) = if game_aspect < drawable_aspect {
+        (
+            (drawable_height as f64 * game_aspect).round() as u32,
+            drawable_height,
+        )
+    } else {
+        (
+            drawable_width,
+            (drawable_width as f64 / game_aspect).round() as u32,
+        )
+    };
+    (
+        (drawable_width - width) / 2,
+        (drawable_height - height) / 2,
+        width,
+        height,
+    )
+}
+
+#[derive(Default)]
+struct FrameGenerationState {
+    previous: Option<Vec<u8>>,
+    width: u32,
+    height: u32,
+    last_frame_at: Option<Instant>,
+    /// Consecutive frames whose interpolation+present cost overran the
+    /// frame budget. Sustained overruns disable frame generation for the
+    /// rest of the session so it can never make a game lag.
+    cost_overruns: u32,
+    adaptive_disabled: bool,
+}
+
+/// Interpolation (plus the present that carries it) must fit inside this
+/// slice of the frame budget; anything above it is pure added latency.
+const FRAME_GENERATION_BUDGET: Duration = Duration::from_millis(10);
+/// Sustained overruns before frame generation is disabled automatically.
+const FRAME_GENERATION_OVERRUN_LIMIT: u32 = 20;
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -47,11 +96,51 @@ pub enum DeviceFamily {
     iPhone5,
     iPhone5c,
     iPhone5s,
+    iPhone6,
+    iPhone6Plus,
+    iPhone6s,
+    iPhone6sPlus,
+    iPhoneSE,
+    iPhone7,
+    iPhone7Plus,
+    iPhone8,
+    iPhone8Plus,
+    iPhoneX,
+    iPhoneSE2,
+    iPhoneSE3,
+    iPhone11,
+    iPhone11Pro,
+    iPhone11ProMax,
+    iPhone12Mini,
+    iPhone12,
+    iPhone12Pro,
+    iPhone12ProMax,
+    iPhone13Mini,
+    iPhone13,
+    iPhone13Pro,
+    iPhone13ProMax,
+    iPhone14,
+    iPhone14Plus,
+    iPhone14Pro,
+    iPhone14ProMax,
+    iPhone15,
+    iPhone15Plus,
+    iPhone15Pro,
+    iPhone15ProMax,
+    iPhone16,
+    iPhone16Plus,
+    iPhone16Pro,
+    iPhone16ProMax,
+    iPhone16e,
+    iPhone17,
+    iPhone17Pro,
+    iPhone17ProMax,
     iPad,
     iPad2,
     iPad3,
     iPad4,
     iPad5,
+    iPadAir,
     iPadMini,
     iPadMini2,
     iPadMini3,
@@ -77,11 +166,51 @@ impl DeviceFamily {
             DeviceFamily::iPhone5 => "iPhone 5",
             DeviceFamily::iPhone5c => "iPhone 5c",
             DeviceFamily::iPhone5s => "iPhone 5s",
+            DeviceFamily::iPhone6 => "iPhone 6",
+            DeviceFamily::iPhone6Plus => "iPhone 6 Plus",
+            DeviceFamily::iPhone6s => "iPhone 6s",
+            DeviceFamily::iPhone6sPlus => "iPhone 6s Plus",
+            DeviceFamily::iPhoneSE => "iPhone SE",
+            DeviceFamily::iPhone7 => "iPhone 7",
+            DeviceFamily::iPhone7Plus => "iPhone 7 Plus",
+            DeviceFamily::iPhone8 => "iPhone 8",
+            DeviceFamily::iPhone8Plus => "iPhone 8 Plus",
+            DeviceFamily::iPhoneX => "iPhone X",
+            DeviceFamily::iPhoneSE2 => "iPhone SE (2nd generation)",
+            DeviceFamily::iPhoneSE3 => "iPhone SE (3rd generation)",
+            DeviceFamily::iPhone11 => "iPhone 11",
+            DeviceFamily::iPhone11Pro => "iPhone 11 Pro",
+            DeviceFamily::iPhone11ProMax => "iPhone 11 Pro Max",
+            DeviceFamily::iPhone12Mini => "iPhone 12 mini",
+            DeviceFamily::iPhone12 => "iPhone 12",
+            DeviceFamily::iPhone12Pro => "iPhone 12 Pro",
+            DeviceFamily::iPhone12ProMax => "iPhone 12 Pro Max",
+            DeviceFamily::iPhone13Mini => "iPhone 13 mini",
+            DeviceFamily::iPhone13 => "iPhone 13",
+            DeviceFamily::iPhone13Pro => "iPhone 13 Pro",
+            DeviceFamily::iPhone13ProMax => "iPhone 13 Pro Max",
+            DeviceFamily::iPhone14 => "iPhone 14",
+            DeviceFamily::iPhone14Plus => "iPhone 14 Plus",
+            DeviceFamily::iPhone14Pro => "iPhone 14 Pro",
+            DeviceFamily::iPhone14ProMax => "iPhone 14 Pro Max",
+            DeviceFamily::iPhone15 => "iPhone 15",
+            DeviceFamily::iPhone15Plus => "iPhone 15 Plus",
+            DeviceFamily::iPhone15Pro => "iPhone 15 Pro",
+            DeviceFamily::iPhone15ProMax => "iPhone 15 Pro Max",
+            DeviceFamily::iPhone16 => "iPhone 16",
+            DeviceFamily::iPhone16Plus => "iPhone 16 Plus",
+            DeviceFamily::iPhone16Pro => "iPhone 16 Pro",
+            DeviceFamily::iPhone16ProMax => "iPhone 16 Pro Max",
+            DeviceFamily::iPhone16e => "iPhone 16e",
+            DeviceFamily::iPhone17 => "iPhone 17",
+            DeviceFamily::iPhone17Pro => "iPhone 17 Pro",
+            DeviceFamily::iPhone17ProMax => "iPhone 17 Pro Max",
             DeviceFamily::iPad => "iPad",
             DeviceFamily::iPad2 => "iPad 2",
             DeviceFamily::iPad3 => "iPad 3",
             DeviceFamily::iPad4 => "iPad 4",
             DeviceFamily::iPad5 => "iPad 5",
+            DeviceFamily::iPadAir => "iPad Air",
             DeviceFamily::iPadMini => "iPad mini",
             DeviceFamily::iPadMini2 => "iPad mini 2",
             DeviceFamily::iPadMini3 => "iPad mini 3",
@@ -101,6 +230,7 @@ impl DeviceFamily {
                 | DeviceFamily::iPad3
                 | DeviceFamily::iPad4
                 | DeviceFamily::iPad5
+                | DeviceFamily::iPadAir
                 | DeviceFamily::iPadMini
                 | DeviceFamily::iPadMini2
                 | DeviceFamily::iPadMini3
@@ -111,6 +241,46 @@ impl DeviceFamily {
         matches!(
             self,
             DeviceFamily::iPhone5s
+                | DeviceFamily::iPhone6
+                | DeviceFamily::iPhone6Plus
+                | DeviceFamily::iPhone6s
+                | DeviceFamily::iPhone6sPlus
+                | DeviceFamily::iPhoneSE
+                | DeviceFamily::iPhone7
+                | DeviceFamily::iPhone7Plus
+                | DeviceFamily::iPhone8
+                | DeviceFamily::iPhone8Plus
+                | DeviceFamily::iPhoneX
+                | DeviceFamily::iPhoneSE2
+                | DeviceFamily::iPhoneSE3
+                | DeviceFamily::iPhone11
+                | DeviceFamily::iPhone11Pro
+                | DeviceFamily::iPhone11ProMax
+                | DeviceFamily::iPhone12Mini
+                | DeviceFamily::iPhone12
+                | DeviceFamily::iPhone12Pro
+                | DeviceFamily::iPhone12ProMax
+                | DeviceFamily::iPhone13Mini
+                | DeviceFamily::iPhone13
+                | DeviceFamily::iPhone13Pro
+                | DeviceFamily::iPhone13ProMax
+                | DeviceFamily::iPhone14
+                | DeviceFamily::iPhone14Plus
+                | DeviceFamily::iPhone14Pro
+                | DeviceFamily::iPhone14ProMax
+                | DeviceFamily::iPhone15
+                | DeviceFamily::iPhone15Plus
+                | DeviceFamily::iPhone15Pro
+                | DeviceFamily::iPhone15ProMax
+                | DeviceFamily::iPhone16
+                | DeviceFamily::iPhone16Plus
+                | DeviceFamily::iPhone16Pro
+                | DeviceFamily::iPhone16ProMax
+                | DeviceFamily::iPhone16e
+                | DeviceFamily::iPhone17
+                | DeviceFamily::iPhone17Pro
+                | DeviceFamily::iPhone17ProMax
+                | DeviceFamily::iPadAir
                 | DeviceFamily::iPad5
                 | DeviceFamily::iPadMini2
                 | DeviceFamily::iPadMini3
@@ -119,7 +289,7 @@ impl DeviceFamily {
 
     pub fn oldest_arm64_for_class(is_ipad: bool) -> Self {
         if is_ipad {
-            Self::iPadMini2
+            Self::iPadAir
         } else {
             Self::iPhone5s
         }
@@ -139,7 +309,10 @@ impl DeviceFamily {
     pub fn is_phone_568(&self) -> bool {
         matches!(
             self,
-            DeviceFamily::iPhone5 | DeviceFamily::iPhone5c | DeviceFamily::iPodTouch5
+            DeviceFamily::iPhone5
+                | DeviceFamily::iPhone5c
+                | DeviceFamily::iPhone5s
+                | DeviceFamily::iPodTouch5
         )
     }
 
@@ -150,12 +323,51 @@ impl DeviceFamily {
                 | DeviceFamily::iPhone4s
                 | DeviceFamily::iPhone5
                 | DeviceFamily::iPhone5c
-                | DeviceFamily::iPhone5s
+                | DeviceFamily::iPhone6
+                | DeviceFamily::iPhone6s
+                | DeviceFamily::iPhone7
+                | DeviceFamily::iPhone8
+                | DeviceFamily::iPhone6Plus
+                | DeviceFamily::iPhone6sPlus
+                | DeviceFamily::iPhone7Plus
+                | DeviceFamily::iPhone8Plus
+                | DeviceFamily::iPhoneSE
+                | DeviceFamily::iPhoneX
+                | DeviceFamily::iPhoneSE2
+                | DeviceFamily::iPhoneSE3
+                | DeviceFamily::iPhone11
+                | DeviceFamily::iPhone11Pro
+                | DeviceFamily::iPhone11ProMax
+                | DeviceFamily::iPhone12Mini
+                | DeviceFamily::iPhone12
+                | DeviceFamily::iPhone12Pro
+                | DeviceFamily::iPhone12ProMax
+                | DeviceFamily::iPhone13Mini
+                | DeviceFamily::iPhone13
+                | DeviceFamily::iPhone13Pro
+                | DeviceFamily::iPhone13ProMax
+                | DeviceFamily::iPhone14
+                | DeviceFamily::iPhone14Plus
+                | DeviceFamily::iPhone14Pro
+                | DeviceFamily::iPhone14ProMax
+                | DeviceFamily::iPhone15
+                | DeviceFamily::iPhone15Plus
+                | DeviceFamily::iPhone15Pro
+                | DeviceFamily::iPhone15ProMax
+                | DeviceFamily::iPhone16
+                | DeviceFamily::iPhone16Plus
+                | DeviceFamily::iPhone16Pro
+                | DeviceFamily::iPhone16ProMax
+                | DeviceFamily::iPhone16e
+                | DeviceFamily::iPhone17
+                | DeviceFamily::iPhone17Pro
+                | DeviceFamily::iPhone17ProMax
                 | DeviceFamily::iPodTouch4
                 | DeviceFamily::iPodTouch5
                 | DeviceFamily::iPad3
                 | DeviceFamily::iPad4
                 | DeviceFamily::iPad5
+                | DeviceFamily::iPadAir
                 | DeviceFamily::iPadMini2
                 | DeviceFamily::iPadMini3
         )
@@ -163,21 +375,84 @@ impl DeviceFamily {
 
     /// Portrait (width, height) in logical points.
     pub fn portrait_size(&self) -> (u32, u32) {
-        if self.is_ipad() {
-            (768, 1024)
-        } else if self.is_phone_568() {
-            (320, 568)
-        } else {
-            (320, 480)
+        match self {
+            DeviceFamily::iPhone6
+            | DeviceFamily::iPhone6s
+            | DeviceFamily::iPhone7
+            | DeviceFamily::iPhone8 => (375, 667),
+            DeviceFamily::iPhone6Plus
+            | DeviceFamily::iPhone6sPlus
+            | DeviceFamily::iPhone7Plus
+            | DeviceFamily::iPhone8Plus => (414, 736),
+            DeviceFamily::iPhoneX => (375, 812),
+            DeviceFamily::iPhoneSE2 | DeviceFamily::iPhoneSE3 => (375, 667),
+            DeviceFamily::iPhone11 | DeviceFamily::iPhone12 | DeviceFamily::iPhone13 => (390, 844),
+            DeviceFamily::iPhone11Pro | DeviceFamily::iPhone12Pro | DeviceFamily::iPhone13Pro => {
+                (375, 812)
+            }
+            DeviceFamily::iPhone11ProMax
+            | DeviceFamily::iPhone12ProMax
+            | DeviceFamily::iPhone13ProMax => (414, 896),
+            DeviceFamily::iPhone14
+            | DeviceFamily::iPhone15
+            | DeviceFamily::iPhone16
+            | DeviceFamily::iPhone17 => (390, 844),
+            DeviceFamily::iPhone14Plus
+            | DeviceFamily::iPhone15Plus
+            | DeviceFamily::iPhone16Plus => (428, 926),
+            DeviceFamily::iPhone14Pro
+            | DeviceFamily::iPhone15Pro
+            | DeviceFamily::iPhone16Pro
+            | DeviceFamily::iPhone17Pro => (393, 852),
+            DeviceFamily::iPhone14ProMax
+            | DeviceFamily::iPhone15ProMax
+            | DeviceFamily::iPhone16ProMax
+            | DeviceFamily::iPhone17ProMax => (430, 932),
+            DeviceFamily::iPhone16e => (390, 844),
+            _ if self.is_ipad() => (768, 1024),
+            _ if self.is_phone_568() => (320, 568),
+            _ => (320, 480),
         }
     }
 
     /// UIScreen.scale — retina multiplier.
     pub fn scale_factor(&self) -> f32 {
-        if self.is_retina() {
-            2.0
-        } else {
-            1.0
+        match self {
+            DeviceFamily::iPhone6Plus
+            | DeviceFamily::iPhone6sPlus
+            | DeviceFamily::iPhone7Plus
+            | DeviceFamily::iPhone8Plus
+            | DeviceFamily::iPhoneX => 3.0,
+            DeviceFamily::iPhoneSE2 | DeviceFamily::iPhoneSE3 => 2.0,
+            DeviceFamily::iPhone11
+            | DeviceFamily::iPhone11Pro
+            | DeviceFamily::iPhone11ProMax
+            | DeviceFamily::iPhone12Mini
+            | DeviceFamily::iPhone12
+            | DeviceFamily::iPhone12Pro
+            | DeviceFamily::iPhone12ProMax
+            | DeviceFamily::iPhone13Mini
+            | DeviceFamily::iPhone13
+            | DeviceFamily::iPhone13Pro
+            | DeviceFamily::iPhone13ProMax => 3.0,
+            DeviceFamily::iPhone14
+            | DeviceFamily::iPhone14Plus
+            | DeviceFamily::iPhone14Pro
+            | DeviceFamily::iPhone14ProMax
+            | DeviceFamily::iPhone15
+            | DeviceFamily::iPhone15Plus
+            | DeviceFamily::iPhone15Pro
+            | DeviceFamily::iPhone15ProMax
+            | DeviceFamily::iPhone16
+            | DeviceFamily::iPhone16Plus
+            | DeviceFamily::iPhone16Pro
+            | DeviceFamily::iPhone16ProMax
+            | DeviceFamily::iPhone16e
+            | DeviceFamily::iPhone17
+            | DeviceFamily::iPhone17Pro
+            | DeviceFamily::iPhone17ProMax => 3.0,
+            _ if self.is_retina() => 2.0,
+            _ => 1.0,
         }
     }
 
@@ -192,11 +467,51 @@ impl DeviceFamily {
             DeviceFamily::iPhone5 => "iPhone5,1",
             DeviceFamily::iPhone5c => "iPhone5,3",
             DeviceFamily::iPhone5s => "iPhone6,1",
+            DeviceFamily::iPhone6 => "iPhone7,2",
+            DeviceFamily::iPhone6Plus => "iPhone7,1",
+            DeviceFamily::iPhone6s => "iPhone8,1",
+            DeviceFamily::iPhone6sPlus => "iPhone8,2",
+            DeviceFamily::iPhoneSE => "iPhone8,4",
+            DeviceFamily::iPhone7 => "iPhone9,1",
+            DeviceFamily::iPhone7Plus => "iPhone9,2",
+            DeviceFamily::iPhone8 => "iPhone10,1",
+            DeviceFamily::iPhone8Plus => "iPhone10,2",
+            DeviceFamily::iPhoneX => "iPhone10,3",
+            DeviceFamily::iPhoneSE2 => "iPhone12,8",
+            DeviceFamily::iPhoneSE3 => "iPhone14,6",
+            DeviceFamily::iPhone11 => "iPhone12,1",
+            DeviceFamily::iPhone11Pro => "iPhone12,3",
+            DeviceFamily::iPhone11ProMax => "iPhone12,5",
+            DeviceFamily::iPhone12Mini => "iPhone13,1",
+            DeviceFamily::iPhone12 => "iPhone13,2",
+            DeviceFamily::iPhone12Pro => "iPhone13,3",
+            DeviceFamily::iPhone12ProMax => "iPhone13,4",
+            DeviceFamily::iPhone13Mini => "iPhone14,4",
+            DeviceFamily::iPhone13 => "iPhone14,5",
+            DeviceFamily::iPhone13Pro => "iPhone14,2",
+            DeviceFamily::iPhone13ProMax => "iPhone14,3",
+            DeviceFamily::iPhone14 => "iPhone14,7",
+            DeviceFamily::iPhone14Plus => "iPhone14,8",
+            DeviceFamily::iPhone14Pro => "iPhone15,2",
+            DeviceFamily::iPhone14ProMax => "iPhone15,3",
+            DeviceFamily::iPhone15 => "iPhone15,4",
+            DeviceFamily::iPhone15Plus => "iPhone15,5",
+            DeviceFamily::iPhone15Pro => "iPhone16,1",
+            DeviceFamily::iPhone15ProMax => "iPhone16,2",
+            DeviceFamily::iPhone16 => "iPhone17,3",
+            DeviceFamily::iPhone16Plus => "iPhone17,4",
+            DeviceFamily::iPhone16Pro => "iPhone17,1",
+            DeviceFamily::iPhone16ProMax => "iPhone17,2",
+            DeviceFamily::iPhone16e => "iPhone17,5",
+            DeviceFamily::iPhone17 => "iPhone18,3",
+            DeviceFamily::iPhone17Pro => "iPhone18,1",
+            DeviceFamily::iPhone17ProMax => "iPhone18,2",
             DeviceFamily::iPad => "iPad1,1",
             DeviceFamily::iPad2 => "iPad2,1",
             DeviceFamily::iPad3 => "iPad3,1",
             DeviceFamily::iPad4 => "iPad3,4",
             DeviceFamily::iPad5 => "iPad6,11",
+            DeviceFamily::iPadAir => "iPad4,1",
             DeviceFamily::iPadMini => "iPad2,5",
             DeviceFamily::iPadMini2 => "iPad4,4",
             DeviceFamily::iPadMini3 => "iPad4,7",
@@ -244,12 +559,56 @@ impl DeviceFamily {
             | DeviceFamily::iPad3
             | DeviceFamily::iPad4
             | DeviceFamily::iPadMini
-            | DeviceFamily::iPodTouch5 => 512 * MIB,
+            | DeviceFamily::iPodTouch5
+            | DeviceFamily::iPhone6
+            | DeviceFamily::iPhone6s
+            | DeviceFamily::iPhoneSE
+            | DeviceFamily::iPhone7
+            | DeviceFamily::iPhone8
+            | DeviceFamily::iPhoneSE2
+            | DeviceFamily::iPhoneSE3
+            | DeviceFamily::iPhone11
+            | DeviceFamily::iPhone12Mini
+            | DeviceFamily::iPhone12
+            | DeviceFamily::iPhone13Mini
+            | DeviceFamily::iPhone13 => 512 * MIB,
             // iPad 5 (2017) and the Retina iPad minis shipped with 1 GiB. We
             // intentionally cap this at 1 GiB even though the address space is
             // 4 GiB, leaving headroom for the guest heap, stacks and mapped
             // libraries.
-            DeviceFamily::iPad5 | DeviceFamily::iPadMini2 | DeviceFamily::iPadMini3 => 1024 * MIB,
+            DeviceFamily::iPhone6Plus
+            | DeviceFamily::iPhone6sPlus
+            | DeviceFamily::iPhone7Plus
+            | DeviceFamily::iPhone8Plus
+            | DeviceFamily::iPhoneX
+            | DeviceFamily::iPad5
+            | DeviceFamily::iPadAir
+            | DeviceFamily::iPadMini2
+            | DeviceFamily::iPadMini3 => 1024 * MIB,
+            // iPhone 11 Pro / 11 Pro Max / 12 Pro / 12 Pro Max / 13 Pro / 13 Pro Max
+            // also shipped with 1 GiB.
+            DeviceFamily::iPhone11Pro
+            | DeviceFamily::iPhone11ProMax
+            | DeviceFamily::iPhone12Pro
+            | DeviceFamily::iPhone12ProMax
+            | DeviceFamily::iPhone13Pro
+            | DeviceFamily::iPhone13ProMax => 1024 * MIB,
+            DeviceFamily::iPhone14
+            | DeviceFamily::iPhone14Plus
+            | DeviceFamily::iPhone14Pro
+            | DeviceFamily::iPhone14ProMax
+            | DeviceFamily::iPhone15
+            | DeviceFamily::iPhone15Plus
+            | DeviceFamily::iPhone15Pro
+            | DeviceFamily::iPhone15ProMax
+            | DeviceFamily::iPhone16
+            | DeviceFamily::iPhone16Plus
+            | DeviceFamily::iPhone16Pro
+            | DeviceFamily::iPhone16ProMax
+            | DeviceFamily::iPhone16e
+            | DeviceFamily::iPhone17
+            | DeviceFamily::iPhone17Pro
+            | DeviceFamily::iPhone17ProMax => 4096 * MIB,
         }
     }
 
@@ -257,7 +616,7 @@ impl DeviceFamily {
     /// matches an arbitrary host screen of `(width, height)` physical pixels.
     pub fn pick_for_screen(width: u32, height: u32) -> DeviceFamily {
         if width == 0 || height == 0 {
-            return DeviceFamily::iPhone3GS;
+            return DeviceFamily::iPhone17ProMax;
         }
         let (short, long) = if width <= height {
             (width as f32, height as f32)
@@ -265,12 +624,19 @@ impl DeviceFamily {
             (height as f32, width as f32)
         };
         let host_ratio = short / long;
-        const CANDIDATES: [DeviceFamily; 5] = [
-            DeviceFamily::iPhone3GS,
-            DeviceFamily::iPhone4,
-            DeviceFamily::iPhone5,
-            DeviceFamily::iPad2,
-            DeviceFamily::iPad3,
+        const CANDIDATES: [DeviceFamily; 12] = [
+            DeviceFamily::iPhone17ProMax,
+            DeviceFamily::iPhone17Pro,
+            DeviceFamily::iPhone17,
+            DeviceFamily::iPhone16ProMax,
+            DeviceFamily::iPhone16Pro,
+            DeviceFamily::iPhone16,
+            DeviceFamily::iPhone15ProMax,
+            DeviceFamily::iPhone15Pro,
+            DeviceFamily::iPhone15,
+            DeviceFamily::iPhone14ProMax,
+            DeviceFamily::iPhone14Pro,
+            DeviceFamily::iPhone14,
         ];
         let mut best = DeviceFamily::iPhone3GS;
         let mut best_dist = f32::INFINITY;
@@ -298,11 +664,51 @@ impl DeviceFamily {
             DeviceFamily::iPhone5 => "iphone-5",
             DeviceFamily::iPhone5c => "iphone-5c",
             DeviceFamily::iPhone5s => "iphone-5s",
+            DeviceFamily::iPhone6 => "iphone-6",
+            DeviceFamily::iPhone6Plus => "iphone-6-plus",
+            DeviceFamily::iPhone6s => "iphone-6s",
+            DeviceFamily::iPhone6sPlus => "iphone-6s-plus",
+            DeviceFamily::iPhoneSE => "iphone-se",
+            DeviceFamily::iPhone7 => "iphone-7",
+            DeviceFamily::iPhone7Plus => "iphone-7-plus",
+            DeviceFamily::iPhone8 => "iphone-8",
+            DeviceFamily::iPhone8Plus => "iphone-8-plus",
+            DeviceFamily::iPhoneX => "iphone-x",
+            DeviceFamily::iPhoneSE2 => "iphone-se-2",
+            DeviceFamily::iPhoneSE3 => "iphone-se-3",
+            DeviceFamily::iPhone11 => "iphone-11",
+            DeviceFamily::iPhone11Pro => "iphone-11-pro",
+            DeviceFamily::iPhone11ProMax => "iphone-11-pro-max",
+            DeviceFamily::iPhone12Mini => "iphone-12-mini",
+            DeviceFamily::iPhone12 => "iphone-12",
+            DeviceFamily::iPhone12Pro => "iphone-12-pro",
+            DeviceFamily::iPhone12ProMax => "iphone-12-pro-max",
+            DeviceFamily::iPhone13Mini => "iphone-13-mini",
+            DeviceFamily::iPhone13 => "iphone-13",
+            DeviceFamily::iPhone13Pro => "iphone-13-pro",
+            DeviceFamily::iPhone13ProMax => "iphone-13-pro-max",
+            DeviceFamily::iPhone14 => "iphone-14",
+            DeviceFamily::iPhone14Plus => "iphone-14-plus",
+            DeviceFamily::iPhone14Pro => "iphone-14-pro",
+            DeviceFamily::iPhone14ProMax => "iphone-14-pro-max",
+            DeviceFamily::iPhone15 => "iphone-15",
+            DeviceFamily::iPhone15Plus => "iphone-15-plus",
+            DeviceFamily::iPhone15Pro => "iphone-15-pro",
+            DeviceFamily::iPhone15ProMax => "iphone-15-pro-max",
+            DeviceFamily::iPhone16 => "iphone-16",
+            DeviceFamily::iPhone16Plus => "iphone-16-plus",
+            DeviceFamily::iPhone16Pro => "iphone-16-pro",
+            DeviceFamily::iPhone16ProMax => "iphone-16-pro-max",
+            DeviceFamily::iPhone16e => "iphone-16e",
+            DeviceFamily::iPhone17 => "iphone-17",
+            DeviceFamily::iPhone17Pro => "iphone-17-pro",
+            DeviceFamily::iPhone17ProMax => "iphone-17-pro-max",
             DeviceFamily::iPad => "ipad-1",
             DeviceFamily::iPad2 => "ipad-2",
             DeviceFamily::iPad3 => "ipad-3",
             DeviceFamily::iPad4 => "ipad-4",
             DeviceFamily::iPad5 => "ipad-5",
+            DeviceFamily::iPadAir => "ipad-air",
             DeviceFamily::iPadMini => "ipad-mini",
             DeviceFamily::iPadMini2 => "ipad-mini-2",
             DeviceFamily::iPadMini3 => "ipad-mini-3",
@@ -325,11 +731,51 @@ impl DeviceFamily {
         DeviceFamily::iPhone5,
         DeviceFamily::iPhone5c,
         DeviceFamily::iPhone5s,
+        DeviceFamily::iPhone6,
+        DeviceFamily::iPhone6Plus,
+        DeviceFamily::iPhone6s,
+        DeviceFamily::iPhone6sPlus,
+        DeviceFamily::iPhoneSE,
+        DeviceFamily::iPhone7,
+        DeviceFamily::iPhone7Plus,
+        DeviceFamily::iPhone8,
+        DeviceFamily::iPhone8Plus,
+        DeviceFamily::iPhoneX,
+        DeviceFamily::iPhoneSE2,
+        DeviceFamily::iPhoneSE3,
+        DeviceFamily::iPhone11,
+        DeviceFamily::iPhone11Pro,
+        DeviceFamily::iPhone11ProMax,
+        DeviceFamily::iPhone12Mini,
+        DeviceFamily::iPhone12,
+        DeviceFamily::iPhone12Pro,
+        DeviceFamily::iPhone12ProMax,
+        DeviceFamily::iPhone13Mini,
+        DeviceFamily::iPhone13,
+        DeviceFamily::iPhone13Pro,
+        DeviceFamily::iPhone13ProMax,
+        DeviceFamily::iPhone14,
+        DeviceFamily::iPhone14Plus,
+        DeviceFamily::iPhone14Pro,
+        DeviceFamily::iPhone14ProMax,
+        DeviceFamily::iPhone15,
+        DeviceFamily::iPhone15Plus,
+        DeviceFamily::iPhone15Pro,
+        DeviceFamily::iPhone15ProMax,
+        DeviceFamily::iPhone16,
+        DeviceFamily::iPhone16Plus,
+        DeviceFamily::iPhone16Pro,
+        DeviceFamily::iPhone16ProMax,
+        DeviceFamily::iPhone16e,
+        DeviceFamily::iPhone17,
+        DeviceFamily::iPhone17Pro,
+        DeviceFamily::iPhone17ProMax,
         DeviceFamily::iPad,
         DeviceFamily::iPad2,
         DeviceFamily::iPad3,
         DeviceFamily::iPad4,
         DeviceFamily::iPad5,
+        DeviceFamily::iPadAir,
         DeviceFamily::iPadMini,
         DeviceFamily::iPadMini2,
         DeviceFamily::iPadMini3,
@@ -353,7 +799,9 @@ impl TryFrom<u64> for DeviceFamily {
 impl TryFrom<&str> for DeviceFamily {
     type Error = ();
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value.to_ascii_lowercase().as_str() {
+        let normalized = value.to_ascii_lowercase();
+        let compact = normalized.replace(['-', '_'], "");
+        match normalized.as_str() {
             "iphone" => Ok(DeviceFamily::iPhone3GS),
             "iphone-2g" | "iphone1,1" => Ok(DeviceFamily::iPhone),
             "iphone-3g" | "iphone1,2" => Ok(DeviceFamily::iPhone3G),
@@ -363,12 +811,52 @@ impl TryFrom<&str> for DeviceFamily {
             "iphone-5" | "iphone5,1" => Ok(DeviceFamily::iPhone5),
             "iphone-5c" | "iphone5,3" => Ok(DeviceFamily::iPhone5c),
             "iphone-5s" | "iphone6,1" => Ok(DeviceFamily::iPhone5s),
+            "iphone-6" | "iphone7,2" => Ok(DeviceFamily::iPhone6),
+            "iphone-6-plus" | "iphone7,1" => Ok(DeviceFamily::iPhone6Plus),
+            "iphone-6s" | "iphone8,1" => Ok(DeviceFamily::iPhone6s),
+            "iphone-6s-plus" | "iphone8,2" => Ok(DeviceFamily::iPhone6sPlus),
+            "iphone-se" | "iphone8,4" => Ok(DeviceFamily::iPhoneSE),
+            "iphone-7" | "iphone9,1" => Ok(DeviceFamily::iPhone7),
+            "iphone-7-plus" | "iphone9,2" => Ok(DeviceFamily::iPhone7Plus),
+            "iphone-8" | "iphone10,1" => Ok(DeviceFamily::iPhone8),
+            "iphone-8-plus" | "iphone10,2" => Ok(DeviceFamily::iPhone8Plus),
+            "iphone-x" | "iphone10,3" => Ok(DeviceFamily::iPhoneX),
+            "iphone-se-2" | "iphone12,8" => Ok(DeviceFamily::iPhoneSE2),
+            "iphone-se-3" | "iphone14,6" => Ok(DeviceFamily::iPhoneSE3),
+            "iphone-11" | "iphone12,1" => Ok(DeviceFamily::iPhone11),
+            "iphone-11-pro" | "iphone12,3" => Ok(DeviceFamily::iPhone11Pro),
+            "iphone-11-pro-max" | "iphone12,5" => Ok(DeviceFamily::iPhone11ProMax),
+            "iphone-12-mini" | "iphone13,1" => Ok(DeviceFamily::iPhone12Mini),
+            "iphone-12" | "iphone13,2" => Ok(DeviceFamily::iPhone12),
+            "iphone-12-pro" | "iphone13,3" => Ok(DeviceFamily::iPhone12Pro),
+            "iphone-12-pro-max" | "iphone13,4" => Ok(DeviceFamily::iPhone12ProMax),
+            "iphone-13-mini" | "iphone14,4" => Ok(DeviceFamily::iPhone13Mini),
+            "iphone-13" | "iphone14,5" => Ok(DeviceFamily::iPhone13),
+            "iphone-13-pro" | "iphone14,2" => Ok(DeviceFamily::iPhone13Pro),
+            "iphone-13-pro-max" | "iphone14,3" => Ok(DeviceFamily::iPhone13ProMax),
+            "iphone-14" | "iphone14,7" => Ok(DeviceFamily::iPhone14),
+            "iphone-14-plus" | "iphone14,8" => Ok(DeviceFamily::iPhone14Plus),
+            "iphone-14-pro" | "iphone15,2" => Ok(DeviceFamily::iPhone14Pro),
+            "iphone-14-pro-max" | "iphone15,3" => Ok(DeviceFamily::iPhone14ProMax),
+            "iphone-15" | "iphone15,4" => Ok(DeviceFamily::iPhone15),
+            "iphone-15-plus" | "iphone15,5" => Ok(DeviceFamily::iPhone15Plus),
+            "iphone-15-pro" | "iphone16,1" => Ok(DeviceFamily::iPhone15Pro),
+            "iphone-15-pro-max" | "iphone16,2" => Ok(DeviceFamily::iPhone15ProMax),
+            "iphone-16" | "iphone17,3" => Ok(DeviceFamily::iPhone16),
+            "iphone-16-plus" | "iphone17,4" => Ok(DeviceFamily::iPhone16Plus),
+            "iphone-16-pro" | "iphone17,1" => Ok(DeviceFamily::iPhone16Pro),
+            "iphone-16-pro-max" | "iphone17,2" => Ok(DeviceFamily::iPhone16ProMax),
+            "iphone-16e" | "iphone17,5" => Ok(DeviceFamily::iPhone16e),
+            "iphone-17" | "iphone18,3" => Ok(DeviceFamily::iPhone17),
+            "iphone-17-pro" | "iphone18,1" => Ok(DeviceFamily::iPhone17Pro),
+            "iphone-17-pro-max" | "iphone18,2" => Ok(DeviceFamily::iPhone17ProMax),
             "ipad" => Ok(DeviceFamily::iPad2),
             "ipad-1" | "ipad1,1" => Ok(DeviceFamily::iPad),
             "ipad-2" | "ipad2,1" => Ok(DeviceFamily::iPad2),
             "ipad-3" | "ipad3,1" => Ok(DeviceFamily::iPad3),
             "ipad-4" | "ipad3,4" => Ok(DeviceFamily::iPad4),
             "ipad-5" | "ipad6,11" => Ok(DeviceFamily::iPad5),
+            "ipad-air" | "ipad4,1" => Ok(DeviceFamily::iPadAir),
             "ipad-mini" | "ipad2,5" => Ok(DeviceFamily::iPadMini),
             "ipad-mini-2" | "ipad4,4" => Ok(DeviceFamily::iPadMini2),
             "ipad-mini-3" | "ipad4,7" => Ok(DeviceFamily::iPadMini3),
@@ -377,7 +865,11 @@ impl TryFrom<&str> for DeviceFamily {
             "ipod-touch-3" | "ipod3,1" => Ok(DeviceFamily::iPodTouch3),
             "ipod-touch-4" | "ipod4,1" => Ok(DeviceFamily::iPodTouch4),
             "ipod-touch-5" | "ipod5,1" => Ok(DeviceFamily::iPodTouch5),
-            _ => Err(()),
+            _ => Self::ALL_SELECTABLE
+                .iter()
+                .copied()
+                .find(|family| family.option_name().replace(['-', '_'], "") == compact)
+                .ok_or(()),
         }
     }
 }
@@ -400,22 +892,22 @@ fn normalize_portrait_size(size: (u32, u32)) -> (u32, u32) {
 fn size_for_orientation_from_size(
     size: (u32, u32),
     orientation: DeviceOrientation,
-    scale_hack: NonZeroU32,
+    scale_hack: f32,
 ) -> (u32, u32) {
     let (width, height) = size;
-    let scale_hack = scale_hack.get();
+    let scale = |value: u32| ((value as f32 * scale_hack).round() as u32).max(1);
     match orientation {
-        DeviceOrientation::Portrait => (width * scale_hack, height * scale_hack),
-        DeviceOrientation::PortraitUpsideDown => (width * scale_hack, height * scale_hack),
-        DeviceOrientation::LandscapeLeft => (height * scale_hack, width * scale_hack),
-        DeviceOrientation::LandscapeRight => (height * scale_hack, width * scale_hack),
+        DeviceOrientation::Portrait => (scale(width), scale(height)),
+        DeviceOrientation::PortraitUpsideDown => (scale(width), scale(height)),
+        DeviceOrientation::LandscapeLeft => (scale(height), scale(width)),
+        DeviceOrientation::LandscapeRight => (scale(height), scale(width)),
     }
 }
 
 fn size_for_orientation(
     family: DeviceFamily,
     orientation: DeviceOrientation,
-    scale_hack: NonZeroU32,
+    scale_hack: f32,
 ) -> (u32, u32) {
     size_for_orientation_from_size(family.portrait_size(), orientation, scale_hack)
 }
@@ -448,50 +940,6 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
             DeviceOrientation::LandscapeRight => "LandscapeLeft",
         },
     );
-}
-
-/// COMPAT: per-game accelerometer axis remap, applied to real-sensor data in
-/// the hardware path of [Window::get_acceleration].
-///
-/// The values delivered to the guest are always in the device's portrait
-/// frame (iOS semantics), which is correct for games that honour their
-/// declared interface orientation. Some games, however, hard-code their
-/// tilt math for one particular way of holding the phone — or the host
-/// device reports sensors in a natural-orientation frame some games don't
-/// expect (e.g. tablets) — and then steering/camera controls come out
-/// mirrored or sideways (seen with e.g. Asphalt 7's tilt camera).
-///
-/// `TOUCHHLE_ACCELEROMETER_AXES` accepts a comma-separated list of:
-/// - "swap": transpose x and y (sideways behaviour on some devices)
-/// - "flipx": negate x (left/right inversion)
-/// - "flipy": negate y (forward/backward inversion)
-/// Both flips together make a 180-degree fix; all three together swap and
-/// flip. Example: TOUCHHLE_ACCELEROMETER_AXES=swap,flipy
-///
-/// The knob is read once and cached. Gyroscope readings are NOT remapped.
-fn accelerometer_compat_remap(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<(bool, bool, bool)> = OnceLock::new();
-    let (swap, flipx, flipy) = *CACHE.get_or_init(|| {
-        let var = std::env::var("TOUCHHLE_ACCELEROMETER_AXES").unwrap_or_default();
-        let var = var.to_ascii_lowercase();
-        (
-            var.contains("swap"),
-            var.contains("flipx"),
-            var.contains("flipy"),
-        )
-    });
-    let (mut x, mut y) = (x, y);
-    if swap {
-        std::mem::swap(&mut x, &mut y);
-    }
-    if flipx {
-        x = -x;
-    }
-    if flipy {
-        y = -y;
-    }
-    (x, y, z)
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -579,6 +1027,27 @@ impl GLContext {
     }
 }
 
+/// Host-thread token of the thread the host GL context was last bound on
+/// (0 = never bound anywhere). See [Window::gl_ctx_bound_on_this_thread].
+static LAST_GL_BIND_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn current_thread_token() -> u64 {
+    thread_local! {
+        static THREAD_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    }
+    THREAD_TOKEN.with(|t| {
+        let current = t.get();
+        if current == 0 {
+            let fresh = NEXT_TOKEN.with(|n| n.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            t.set(fresh);
+            fresh
+        } else {
+            current
+        }
+    })
+}
+
 fn surface_from_image(image: &Image) -> Surface<'_> {
     let src_pixels = image.pixels();
     let (width, height) = image.dimensions();
@@ -600,6 +1069,45 @@ fn surface_from_image(image: &Image) -> Surface<'_> {
     surface
 }
 
+fn transform_software_pixels(
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    quarter_turns: i32,
+    flip_x: bool,
+    flip_y: bool,
+) -> (Vec<u8>, u32, u32) {
+    let quarter_turns = quarter_turns.rem_euclid(4);
+    let (output_width, output_height) = if quarter_turns % 2 == 0 {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    if quarter_turns == 0 && !flip_x && !flip_y {
+        return (pixels, width, height);
+    }
+    let mut output = vec![0u8; output_width as usize * output_height as usize * 4];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let source_x = if flip_x { width as usize - 1 - x } else { x };
+            let source_y = if flip_y { height as usize - 1 - y } else { y };
+            let (destination_x, destination_y) = match quarter_turns {
+                0 => (source_x, source_y),
+                1 => (height as usize - 1 - source_y, source_x),
+                2 => (
+                    width as usize - 1 - source_x,
+                    height as usize - 1 - source_y,
+                ),
+                _ => (source_y, width as usize - 1 - source_x),
+            };
+            let source = (y * width as usize + x) * 4;
+            let destination = (destination_y * output_width as usize + destination_x) * 4;
+            output[destination..destination + 4].copy_from_slice(&pixels[source..source + 4]);
+        }
+    }
+    (output, output_width, output_height)
+}
+
 /// Query the host's primary display size in physical pixels, if possible.
 ///
 /// Used by `--device-family=auto` to pick the closest emulated device before
@@ -618,143 +1126,10 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
     }
 }
 
-/// Configure the host OpenGL ES driver on Android.
-///
-/// This is done before creating an SDL window/context, because SDL loads EGL
-/// and GLES at context-creation time. With `use_angle == false` (the default,
-/// "GLES Native" ON) the bundled ANGLE override is cleared so SDL uses the
-/// vendor's native OpenGL ES driver (Adreno/Mali), which is the closest match
-/// to real-device behaviour and avoids ANGLE's stricter shader validation.
-/// With `use_angle == true` the bundled ANGLE libraries are preferred; if
-/// ANGLE is not loadable, SDL falls back to the system driver.
-#[cfg(target_os = "android")]
-fn configure_android_angle_driver(use_angle: bool) {
-    if !use_angle {
-        // Do not leave a stale or user-provided override pointing at the
-        // bundled ANGLE; SDL will use Android's system OpenGL ES driver.
-        env::remove_var("SDL_VIDEO_EGL_DRIVER");
-        env::remove_var("SDL_VIDEO_GL_DRIVER");
-        log!("GLES Native requested; using the Android system OpenGL ES driver.");
-        return;
-    }
-    const CANDIDATES: &[(&str, &str, &str)] = &[
-        (
-            "libEGL_angle.so",
-            "libGLESv1_CM_angle.so",
-            "libGLESv2_angle.so",
-        ),
-        (
-            "libEGL_angle_in_apk.so",
-            "libGLESv1_CM_angle_in_apk.so",
-            "libGLESv2_angle_in_apk.so",
-        ),
-    ];
-
-    fn can_load(name: &str) -> bool {
-        use std::ffi::CString;
-        let Ok(cname) = CString::new(name) else {
-            return false;
-        };
-        // RTLD_NOW = 2. Load, and immediately unload if it succeeded.
-        unsafe {
-            let handle = libc::dlopen(cname.as_ptr(), 2);
-            if handle.is_null() {
-                false
-            } else {
-                libc::dlclose(handle);
-                true
-            }
-        }
-    }
-
-    for &(egl, gles1, gles2) in CANDIDATES {
-        let libraries_loadable = can_load(egl) && can_load(gles1) && can_load(gles2);
-        if !libraries_loadable {
-            continue;
-        }
-
-        // Always override SDL's environment-based driver choice when the
-        // bundled ANGLE libraries are available.
-        env::set_var("SDL_VIDEO_EGL_DRIVER", egl);
-        // ANGLE's ES 1.1 front-end also resolves higher-version entry points
-        // through EGL's get-proc-address mechanism.
-        env::set_var("SDL_VIDEO_GL_DRIVER", gles1);
-        log!(
-            "Using bundled ANGLE for Android OpenGL ES ({} / {}).",
-            egl,
-            gles1
-        );
-        return;
-    }
-
-    // Do not leave a stale or user-provided override pointing at an unavailable
-    // driver; SDL will use Android's system OpenGL ES fallback.
-    env::remove_var("SDL_VIDEO_EGL_DRIVER");
-    env::remove_var("SDL_VIDEO_GL_DRIVER");
-    log!("Bundled ANGLE is unavailable; using the Android system OpenGL ES driver.");
-}
-
-pub struct Window {
-    _sdl_ctx: sdl2::Sdl,
-    video_ctx: sdl2::VideoSubsystem,
-    window: sdl2::video::Window,
-    event_pump: sdl2::EventPump,
-    event_queue: VecDeque<Event>,
-    last_polled: Instant,
-    /// TEST HOOK: injected tap coordinates for the GD music-bypass autoplay
-    /// test ( TOUCHHLE_GD_AUTOPLAY ), scheduled in popped-frame counts.
-    auto_taps: Vec<(u64, f32, f32)>,
-    /// Separate queue for extremely high-priority events (e.g. app about to
-    /// terminate).
-    high_priority_event: Option<Event>,
-    enable_event_polling: bool,
-    #[cfg(target_os = "macos")]
-    max_height: u32,
-    #[cfg(target_os = "macos")]
-    viewport_y_offset: u32,
-    /// Copy of `fullscreen` on [Options]. Note that this is meaningless when
-    /// [Self::rotatable_fullscreen] returns [true].
-    fullscreen: bool,
-    scale_hack: NonZeroU32,
-    host_screen_size: Option<(u32, u32)>,
-    internal_gl_ins: Option<Box<dyn GLESContext>>,
-    /// Cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string of the internal
-    /// OpenGL ES context, captured at window creation. Used to detect the host
-    /// GLES driver (e.g. whether we are running through ANGLE or on a vendor's
-    /// native driver such as Qualcomm Adreno) so that driver-specific
-    /// workarounds can be auto-enabled. See [Window::gl_driver_description].
-    gl_driver_description: String,
-    /// Set when a backend without GL rendering wants plain software
-    /// presentation (used by the ARM64 compatibility path).
-    software_presentation: bool,
-    splash_image: Option<Image>,
-    /// Whether the selected image already targets the startup orientation.
-    splash_image_is_orientation_specific: bool,
-    device_family: DeviceFamily,
-    device_orientation: DeviceOrientation,
-    controller_ctx: sdl2::GameControllerSubsystem,
-    controllers: Vec<sdl2::controller::GameController>,
-    dpad_state: DpadState,
-    stick_active: bool,
-    _sensor_ctx: sdl2::SensorSubsystem,
-    accelerometer: Option<sdl2::sensor::Sensor>,
-    gyroscope: Option<sdl2::sensor::Sensor>,
-    virtual_cursor_last: Option<(f32, f32, bool, bool)>,
-    virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
-    virtual_accelerometer_last: Option<(f32, f32, bool)>,
-    show_fps_counter: Cell<bool>,
-    fps_frame_count: Cell<u32>,
-    fps_last_log: RefCell<Instant>,
-    /// Host scheduling / power-management hints for the emulator thread
-    /// (Android). Fed once per presented frame from [Window::swap_window].
-    perf_hints: crate::perf_hints::PerfHints,
-    /// Whether or not we are on the "main" environment stack (rather than
-    /// a coroutine stack). Checked in various functions to make sure that
-    /// certain SDL functions (that call JNI functions) are on the main
-    /// stack on Android.
-    pub(super) on_main_stack: bool,
-}
-
+/// Return the distinct physical display resolutions exposed by the host.
+/// Android normally exposes only the active mode, while desktop SDL drivers
+/// can expose several modes. The result is normalised to portrait order so it
+/// can be used directly by the app picker's custom-resolution controls.
 pub fn host_screen_resolutions() -> Vec<(u32, u32)> {
     let Some(sdl_ctx) = sdl2::init().ok() else {
         return Vec::new();
@@ -797,6 +1172,247 @@ pub fn host_screen_resolutions() -> Vec<(u32, u32)> {
     resolutions
 }
 
+/// Query the host display refresh rate. SDL receives this from Android's
+/// Display.getRefreshRate(), so high-refresh devices are not forced to 60 Hz.
+pub fn configure_host_performance(
+    high_performance: bool,
+    force_max_clocks: bool,
+    affinity: Option<&str>,
+) {
+    #[cfg(not(target_os = "android"))]
+    let _ = affinity;
+
+    #[cfg(target_os = "android")]
+    {
+        if high_performance {
+            pin_android_thread_to_big_cores(affinity);
+        }
+        let flags = i32::from(high_performance) | (i32::from(force_max_clocks) << 1);
+        let result = unsafe { SDL_AndroidSendMessage(PERFORMANCE_MODE_COMMAND, flags) };
+        if result != 0 {
+            log!(
+                "Native Android performance hint could not be delivered: return code {}",
+                result
+            );
+        }
+    }
+
+    if high_performance {
+        sdl2::hint::set("SDL_RENDER_VSYNC", "0");
+        sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
+        unsafe {
+            std::env::set_var("TOUCHHLE_HIGH_PERFORMANCE", "1");
+        }
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -10) };
+            if result == 0 {
+                log!("High performance mode: raised the emulator process priority");
+            } else {
+                log!(
+                    "High performance mode: host denied process-priority adjustment: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        log!("High performance mode: disabled emulator-side pacing");
+    } else {
+        unsafe {
+            std::env::remove_var("TOUCHHLE_HIGH_PERFORMANCE");
+        }
+    }
+
+    if force_max_clocks {
+        unsafe {
+            std::env::set_var("TOUCHHLE_FORCE_MAX_CLOCKS", "1");
+        }
+        log!("Force max clocks requested: using the best-effort host performance hint; clock governors remain controlled by the OS");
+    } else {
+        unsafe {
+            std::env::remove_var("TOUCHHLE_FORCE_MAX_CLOCKS");
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn pin_android_thread_to_big_cores(configured: Option<&str>) {
+    let env_override = std::env::var("TOUCHHLE_AFFINITY")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let policy = env_override
+        .as_deref()
+        .or(configured)
+        .unwrap_or("big")
+        .trim();
+    if policy.eq_ignore_ascii_case("off") || policy.eq_ignore_ascii_case("all") {
+        log!("CPU affinity disabled by policy {policy:?}");
+        return;
+    }
+    let cpus = if policy.is_empty() || policy.eq_ignore_ascii_case("big") {
+        android_big_core_cpus().unwrap_or_default()
+    } else {
+        crate::options::parse_cpu_list(policy)
+    };
+    let max_cpu = std::mem::size_of::<libc::cpu_set_t>() * 8;
+    let cpus: Vec<usize> = cpus.into_iter().filter(|cpu| *cpu < max_cpu).collect();
+    if cpus.is_empty() {
+        log!("CPU affinity policy {policy:?} did not resolve to available cores; leaving scheduler unchanged");
+        return;
+    }
+    // sched_setaffinity() fails with EINVAL when the mask includes CPUs the
+    // process is not allowed to run on (cgroup/cpuset restrictions on many
+    // Android devices). Intersect the requested cores with the process's
+    // allowed set first so pinning succeeds where it can and stays silent
+    // where it cannot.
+    let cpus: Vec<usize> = match allowed_cpu_list() {
+        Some(allowed) if !allowed.is_empty() => {
+            let filtered: Vec<usize> =
+                cpus.iter().copied().filter(|cpu| allowed.contains(cpu)).collect();
+            if filtered.is_empty() {
+                log_dbg!(
+                    "CPU affinity policy {policy:?} names no cores the process may run on (allowed: {:?}); leaving scheduler unchanged",
+                    allowed
+                );
+                return;
+            }
+            filtered
+        }
+        _ => cpus,
+    };
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for &cpu in &cpus {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
+            log!("Emulator thread pinned to Android CPUs {cpus:?}");
+        } else {
+            log_dbg!(
+                "Could not apply Android CPU affinity to {cpus:?}: {}; leaving scheduler unchanged",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Parse `Cpus_allowed_list` from /proc/self/status (e.g. "0-3,6-7").
+#[cfg(target_os = "android")]
+fn allowed_cpu_list() -> Option<Vec<usize>> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("Cpus_allowed_list"))?;
+    let list = line.split(':').nth(1)?.trim();
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        let mut bounds = part.splitn(2, '-');
+        let start: usize = bounds.next()?.trim().parse().ok()?;
+        let end: usize = bounds
+            .next()
+            .and_then(|b| b.trim().parse().ok())
+            .unwrap_or(start);
+        cpus.extend(start..=end);
+    }
+    Some(cpus)
+}
+
+#[cfg(target_os = "android")]
+fn android_big_core_cpus() -> Option<Vec<usize>> {
+    let mut frequencies = Vec::new();
+    for cpu in 0..64 {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
+        if let Ok(value) = std::fs::read_to_string(path) {
+            if let Ok(khz) = value.trim().parse::<u64>() {
+                frequencies.push((cpu, khz));
+            }
+        }
+    }
+    if frequencies.len() < 2 {
+        return None;
+    }
+    let fastest = frequencies.iter().map(|(_, frequency)| *frequency).max()?;
+    let big: Vec<usize> = frequencies
+        .iter()
+        .filter(|(_, frequency)| frequency.saturating_mul(10) >= fastest.saturating_mul(9))
+        .map(|(cpu, _)| *cpu)
+        .collect();
+    (big.len() < frequencies.len()).then_some(big)
+}
+
+pub fn host_refresh_rate() -> Option<f64> {
+    let sdl_ctx = sdl2::init().ok()?;
+    let video_ctx = sdl_ctx.video().ok()?;
+    let mode = video_ctx.current_display_mode(0).ok()?;
+    let refresh_rate = mode.refresh_rate;
+    if refresh_rate > 0 {
+        Some(refresh_rate as f64)
+    } else {
+        None
+    }
+}
+
+pub struct Window {
+    _sdl_ctx: sdl2::Sdl,
+    video_ctx: sdl2::VideoSubsystem,
+    window: sdl2::video::Window,
+    event_pump: sdl2::EventPump,
+    event_queue: VecDeque<Event>,
+    last_polled: Instant,
+    /// Separate queue for extremely high-priority events (e.g. app about to
+    /// terminate).
+    high_priority_event: Option<Event>,
+    enable_event_polling: bool,
+    #[cfg(target_os = "macos")]
+    max_height: u32,
+    #[cfg(target_os = "macos")]
+    viewport_y_offset: u32,
+    /// Copy of `fullscreen` on [Options]. Note that this is meaningless when
+    /// [Self::rotatable_fullscreen] returns [true].
+    fullscreen: bool,
+    fullscreen_stretched: bool,
+    scale_hack: f32,
+    host_screen_size: Option<(u32, u32)>,
+    software_presentation: bool,
+    display_refresh_rate: f64,
+    frame_generation: bool,
+    rtcs: bool,
+    rtcs_frame: u64,
+    frame_generation_state: FrameGenerationState,
+    gpu_frame_generation_failed: bool,
+    wgpu_presentation: Option<WgpuPresentation>,
+    internal_gl_ins: Option<Box<dyn GLESContext>>,
+    splash_image: Option<Image>,
+    /// Whether the selected image already targets the startup orientation.
+    splash_image_is_orientation_specific: bool,
+    device_family: DeviceFamily,
+    device_orientation: DeviceOrientation,
+    render_rotation: crate::options::RenderRotation,
+    revert_x_axis: bool,
+    revert_y_axis: bool,
+    controller_ctx: sdl2::GameControllerSubsystem,
+    controllers: Vec<sdl2::controller::GameController>,
+    dpad_state: DpadState,
+    stick_active: bool,
+    sensor_ctx: sdl2::SensorSubsystem,
+    accelerometer: Option<sdl2::sensor::Sensor>,
+    gyroscope: Option<sdl2::sensor::Sensor>,
+    virtual_cursor_last: Option<(f32, f32, bool, bool)>,
+    virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
+    virtual_accelerometer_last: Option<(f32, f32, bool)>,
+    // FPS counter state
+    perf_hints: crate::perf_hints::PerfHints,
+    show_fps_counter: Cell<bool>,
+    fps_frame_count: Cell<u32>,
+    fps_last_log: RefCell<Instant>,
+    /// Whether or not we are on the "main" environment stack (rather than
+    /// a coroutine stack). Checked in various functions to make sure that
+    /// certain SDL functions (that call JNI functions) are on the main
+    /// stack on Android.
+    pub(super) on_main_stack: bool,
+}
+
 impl Window {
     /// Returns [true] if touchHLE is running on a device where we should always
     /// display fullscreen, but SDL2 will let us control the orientation, i.e.
@@ -834,18 +1450,108 @@ impl Window {
         }
     }
 
-    /// Create the window.
     pub fn new(
         title: &str,
         icon: Option<Image>,
         launch_image: Option<(Image, bool)>,
         options: &Options,
+        app_gles_usage: Option<crate::mach_o::GlesApiUsage>,
     ) -> Window {
-        #[cfg(target_os = "android")]
-        configure_android_angle_driver(!options.gles_native);
+        // Decide the GLES profile up front from the app's own imports, so
+        // both the SDL context attributes and the backend match it.
+        if let Some(usage) = app_gles_usage {
+            log!(
+                "App OpenGL ES API usage: ES 1.1 fixed-function: {}, ES 2.0 shaders: {}{}",
+                if usage.uses_es1 { "yes" } else { "no" },
+                if usage.uses_es2 { "yes" } else { "no" },
+                if usage.is_es2_only() { " (ES 2.0-only app)" } else { "" }
+            );
+        }
+        crate::gles::configure_quality_options(
+            options.texture_upscaler,
+            options.anti_aliasing,
+            options.memory_management as u8,
+        );
+        crate::gles::configure_pvrtc_decoding(options.pvrtc_decoding);
+        let cpu_only_requested = options.software_rendering
+            || matches!(options.graphics_api, crate::options::GraphicsApi::Software);
+        let angle_driver_active = crate::gles::configure_angle_driver(options.angle_driver);
+        let custom_driver_active = if angle_driver_active {
+            if options.custom_driver.is_some() {
+                log!("ANGLE is enabled; ignoring the custom/native vendor driver selection");
+            }
+            false
+        } else {
+            crate::gles::configure_custom_driver(options.custom_driver.as_deref())
+        };
+        let llvmpipe_requested = options.llvmpipe_fallback
+            && !matches!(options.graphics_api, crate::options::GraphicsApi::Software);
+        let llvmpipe_active = crate::gles::configure_llvmpipe_fallback(
+            llvmpipe_requested
+                && cpu_only_requested
+                && !custom_driver_active
+                && !angle_driver_active,
+        );
+        let native_cpu_renderer = cpu_only_requested && llvmpipe_active;
+        let software_presentation =
+            (cpu_only_requested || options.software_presentation) && !native_cpu_renderer;
+        if native_cpu_renderer {
+            log!("Software rendering selected: using the host's native LLVMPipe CPU rasterizer instead of the built-in fallback");
+        }
+        // `--gles-override` (and the app picker's "force GLES version" option)
+        // previously parsed into `gles_override_version` but was never consumed,
+        // so forcing GLES3/3.1/3.2/Metal silently did nothing. Resolve it into
+        // the effective graphics API here: an explicit `--graphics-api` always
+        // wins; the override only refines `Default`.
+        let effective_graphics_api = if matches!(
+            options.graphics_api,
+            crate::options::GraphicsApi::Default
+        ) {
+            match options.gles_override_version {
+                crate::options::GlesOverrideVersion::Default => options.graphics_api,
+                crate::options::GlesOverrideVersion::Gles10 => {
+                    log!("GLES override: forcing OpenGL ES 1.0 context");
+                    crate::options::GraphicsApi::GLES10
+                }
+                crate::options::GlesOverrideVersion::Gles11 => {
+                    log!("GLES override: forcing OpenGL ES 1.1 context");
+                    crate::options::GraphicsApi::GLES11
+                }
+                crate::options::GlesOverrideVersion::Gles20 => {
+                    log!("GLES override: forcing OpenGL ES 2.0 context");
+                    crate::options::GraphicsApi::GLES20
+                }
+                crate::options::GlesOverrideVersion::Gles30
+                | crate::options::GlesOverrideVersion::Gles31
+                | crate::options::GlesOverrideVersion::Gles32 => {
+                    log!("GLES override: forcing OpenGL ES 3.x context");
+                    crate::options::GraphicsApi::GLES30
+                }
+                crate::options::GlesOverrideVersion::Metal => {
+                    log!("GLES override: forcing the GLES2 compatibility path used for the Metal translator");
+                    crate::options::GraphicsApi::GLES20
+                }
+            }
+        } else {
+            options.graphics_api
+        };
 
+        let frame_generation = options.frame_generation;
+        let rtcs = options.rtcs;
+        if frame_generation && software_presentation {
+            log!("Frame generation enabled with CPU frame interpolation for software presentation");
+        } else if frame_generation {
+            log!("Frame generation enabled for the GPU renderer");
+        }
         let sdl_ctx = sdl2::init().unwrap();
         let video_ctx = sdl_ctx.video().unwrap();
+        let display_refresh_rate = video_ctx
+            .current_display_mode(0)
+            .ok()
+            .map(|mode| mode.refresh_rate as f64)
+            .filter(|rate| *rate > 0.0)
+            .unwrap_or(60.0)
+            .clamp(30.0, 240.0);
 
         // The "hidapi" feature of rust-sdl2 is enabled so that sdl2::sensor
         // is available, but we don't want to enable SDL's HIDAPI controller
@@ -853,12 +1559,42 @@ impl Window {
         // (https://github.com/libsdl-org/SDL/issues/7479). Once that's fixed,
         // remove this (https://github.com/touchHLE/touchHLE/issues/85).
         sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
+        if options.high_performance {
+            sdl2::hint::set("SDL_RENDER_VSYNC", "0");
+        }
 
         if env::consts::OS == "android" {
-            // It's important to set context version BEFORE window creation
-            // ref. https://wiki.libsdl.org/SDL2/SDL_GLattr
+            // SDL needs the host context profile before creating the window.
+            // A GLES1 window cannot later create the GLES2 context required by
+            // the fixed-function translator on Android.
             let attr = video_ctx.gl_attr();
-            attr.set_context_version(1, 1);
+            let use_gles2 =
+                matches!(
+                    options.graphics_api,
+                    crate::options::GraphicsApi::Translator
+                        | crate::options::GraphicsApi::TranslatorGLES30
+                        | crate::options::GraphicsApi::GLES20
+                        | crate::options::GraphicsApi::GLES30
+                        | crate::options::GraphicsApi::Metal
+                        | crate::options::GraphicsApi::Wgpu
+                        | crate::options::GraphicsApi::Vulkan
+                ) || (matches!(effective_graphics_api, crate::options::GraphicsApi::Default)
+                    && (options.prefer_gles2_context || angle_driver_active || llvmpipe_active));
+
+            if use_gles2 {
+                let version = if matches!(
+                    effective_graphics_api,
+                    crate::options::GraphicsApi::GLES30
+                        | crate::options::GraphicsApi::TranslatorGLES30
+                ) {
+                    (3, 0)
+                } else {
+                    (2, 0)
+                };
+                attr.set_context_version(version.0, version.1);
+            } else {
+                attr.set_context_version(1, 1);
+            }
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
 
             // Disable blocking of event loop when app is paused.
@@ -877,26 +1613,17 @@ impl Window {
         // here, and then the app can disable it if it wants to.
         video_ctx.enable_screen_saver();
 
-        // PERF: never request depth or stencil buffers for the window's own
-        // framebuffer. The only things ever drawn to it are flat,
-        // depth-untested textured quads (app presentation, splash screen, app
-        // picker); the guest app itself renders into offscreen renderbuffers
-        // with their own attachments. On tile-based mobile GPUs, skipping the
-        // window depth/stencil buffers saves memory bandwidth on every swap
-        // chain resolution. Note: must be set *before* window creation.
-        {
-            let attr = video_ctx.gl_attr();
-            attr.set_depth_size(0);
-            attr.set_stencil_size(0);
-        }
-
         let scale_hack = options.scale_hack;
         let host_screen_size = options.host_screen_size.map(normalize_portrait_size);
         // TODO: some apps specify their orientation in Info.plist, we could use
         // that here.
         let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
         let device_orientation = options.initial_orientation;
-        let fullscreen = options.fullscreen;
+        let render_rotation = options.render_rotation;
+        let revert_x_axis = options.revert_x_axis;
+        let revert_y_axis = options.revert_y_axis;
+        let fullscreen_stretched = options.fullscreen_stretched;
+        let fullscreen = options.fullscreen || fullscreen_stretched;
         let portrait_screen_size =
             host_screen_size.unwrap_or_else(|| device_family.portrait_size());
 
@@ -905,21 +1632,19 @@ impl Window {
             set_sdl2_orientation(device_orientation);
             let screen_size = video_ctx.display_bounds(0).unwrap().size();
             let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
-            let window = video_ctx
-                .window(title, width, height)
-                .fullscreen()
-                .opengl()
-                .build()
-                .unwrap();
+            let mut builder = video_ctx.window(title, width, height);
+            if !software_presentation {
+                builder.opengl();
+            }
+            let window = builder.fullscreen().build().unwrap();
             window
         } else if fullscreen {
             let (width, height) = video_ctx.display_bounds(0).unwrap().size();
-            let window = video_ctx
-                .window(title, width, height)
-                .fullscreen_desktop()
-                .opengl()
-                .build()
-                .unwrap();
+            let mut builder = video_ctx.window(title, width, height);
+            if !software_presentation {
+                builder.opengl();
+            }
+            let window = builder.fullscreen_desktop().build().unwrap();
             window
         } else {
             let (width, height) = size_for_orientation_from_size(
@@ -927,21 +1652,22 @@ impl Window {
                 device_orientation,
                 scale_hack,
             );
-            let window = video_ctx
-                .window(title, width, height)
-                .position_centered()
-                .resizable()
-                .opengl()
-                .build()
-                .unwrap();
+            let mut builder = video_ctx.window(title, width, height);
+            if !software_presentation {
+                builder.opengl();
+            }
+            let window = builder.position_centered().resizable().build().unwrap();
             window
         };
 
         if env::consts::OS == "android" {
-            // Sanity check
             let gl_attr = video_ctx.gl_attr();
             debug_assert_eq!(gl_attr.context_profile(), sdl2::video::GLProfile::GLES);
-            debug_assert_eq!(gl_attr.context_version(), (1, 1));
+            log!(
+                "Android SDL requested GLES context {}.{}",
+                gl_attr.context_version().0,
+                gl_attr.context_version().1
+            );
         }
 
         if let Some(icon) = icon {
@@ -957,47 +1683,41 @@ impl Window {
         let mut gyroscope: Option<sdl2::sensor::Sensor> = None;
         if let Ok(num_sensors) = sensor_ctx.num_sensors() {
             for sensor_idx in 0..num_sensors {
+                let Ok(sensor) = sensor_ctx.open(sensor_idx) else {
+                    continue;
+                };
+                match sensor.sensor_type() {
+                    sdl2::sensor::SensorType::Accelerometer
+                    | sdl2::sensor::SensorType::LeftAccelerometer
+                    | sdl2::sensor::SensorType::RightAccelerometer
+                        if accelerometer.is_none() =>
+                    {
+                        log!("Accelerometer detected: {}.", sensor.name());
+                        accelerometer = Some(sensor);
+                    }
+                    sdl2::sensor::SensorType::Gyroscope
+                    | sdl2::sensor::SensorType::LeftGyroscope
+                    | sdl2::sensor::SensorType::RightGyroscope
+                        if gyroscope.is_none() =>
+                    {
+                        log!("Gyroscope detected: {}.", sensor.name());
+                        gyroscope = Some(sensor);
+                    }
+                    _ => {}
+                }
                 if accelerometer.is_some() && gyroscope.is_some() {
                     break;
                 }
-                if let Ok(sensor) = sensor_ctx.open(sensor_idx) {
-                    match sensor.sensor_type() {
-                        sdl2::sensor::SensorType::Accelerometer => {
-                            if accelerometer.is_none() {
-                                log!("Accelerometer detected: {}.", sensor.name());
-                                accelerometer = Some(sensor);
-                            }
-                        }
-                        sdl2::sensor::SensorType::Gyroscope
-                        | sdl2::sensor::SensorType::LeftGyroscope
-                        | sdl2::sensor::SensorType::RightGyroscope => {
-                            // Gyroscope was previously disabled here under the
-                            // suspicion of a native abort; the real culprit was
-                            // batteryLevel -> SDL_GetPowerInfo -> JNI (see
-                            // get_battery_status cache below), so the sensor is
-                            // back.
-                            if gyroscope.is_none() {
-                                log!("Gyroscope detected: {}.", sensor.name());
-                                gyroscope = Some(sensor);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
             }
         }
+        // SDL2 never exposes a magnetometer sensor type, so Core Motion backs
+        // its magnetometer APIs with a synthetic Earth-field model (see
+        // core_motion.rs). BioShock requires a magnetometer in its device
+        // capability checks, so we report presence and synthesize readings.
+        log!(
+            "Magnetometer detected: synthetic 3-axis Earth-field model (no host magnetic sensor)."
+        );
 
-        // Populate the battery cache here, on the real SDLThread stack: guest
-        // code later calls [UIDevice batteryLevel] from a coroutine stack, and
-        // the JNI calls inside SDL_GetPowerInfo (Android_JNI_GetPowerInfo)
-        // abort ART when made from that context (pending StackOverflowError).
-        populate_battery_cache();
-
-        // Likewise, resolve the WebView overlay bridge's JNI class and
-        // method IDs here: FindClass needs the app class loader, which is
-        // only reachable from this stack before guest code starts running
-        // on a coroutine stack.
-        crate::android_web_view::populate_jni_cache();
 
         #[cfg(target_os = "macos")]
         let max_height = window.size().1;
@@ -1006,34 +1726,12 @@ impl Window {
             .map(|(image, orientation_specific)| (Some(image), orientation_specific))
             .unwrap_or((None, false));
 
-        let effective_graphics_api = options.graphics_api;
-        let software_presentation = matches!(
-            effective_graphics_api,
-            crate::options::GraphicsApi::Software
-        );
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
             video_ctx,
             window,
             event_pump,
             event_queue: VecDeque::new(),
-            auto_taps: {
-                let mut taps = Vec::new();
-                if std::env::var_os("TOUCHHLE_GD_AUTOPLAY").is_some() {
-                    // (frame, x, y) in window-drawable coordinates. GD flow:
-                    // main menu centre = play button; level select centre =
-                    // level 1 card / Normal Mode.
-                    taps = vec![
-                        (600, -1.0, -1.0),
-                        (660, -1.0, -1.0),
-                        (760, -1.0, -1.0),
-                        // Level select: tap the level card to start the level.
-                        (1100, 240.0, 150.0),
-                        (1250, 240.0, 150.0),
-                    ];
-                }
-                taps
-            },
             last_polled: Instant::now() - Duration::from_secs(1),
             high_priority_event: None,
             enable_event_polling: true,
@@ -1042,15 +1740,25 @@ impl Window {
             #[cfg(target_os = "macos")]
             viewport_y_offset: 0,
             fullscreen,
+            fullscreen_stretched,
             scale_hack,
             host_screen_size,
-            internal_gl_ins: None,
-            gl_driver_description: String::new(),
             software_presentation,
+            display_refresh_rate,
+            frame_generation,
+            rtcs,
+            rtcs_frame: 0,
+            frame_generation_state: FrameGenerationState::default(),
+            gpu_frame_generation_failed: false,
+            wgpu_presentation: None,
+            internal_gl_ins: None,
             splash_image,
             splash_image_is_orientation_specific,
             device_family,
             device_orientation,
+            render_rotation,
+            revert_x_axis,
+            revert_y_axis,
             controller_ctx,
             controllers: Vec::new(),
             dpad_state: DpadState {
@@ -1061,23 +1769,25 @@ impl Window {
                 active: false,
             },
             stick_active: false,
-            _sensor_ctx: sensor_ctx,
+            sensor_ctx,
             accelerometer,
             gyroscope,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
-            show_fps_counter: Cell::new(false),
-            fps_frame_count: Cell::new(0),
-            fps_last_log: RefCell::new(Instant::now()),
+
+            // NEW FPS fields:
             perf_hints: crate::perf_hints::PerfHints::new(
                 options.perf_hints,
                 options
                     .fps_limit
-                    .map(|fps| Duration::from_secs_f64(1.0 / fps))
-                    .unwrap_or(Duration::from_micros(16_667)),
-                options.affinity.as_deref(),
+                    .map(|fps| std::time::Duration::from_secs_f64(1.0 / fps))
+                    .unwrap_or(std::time::Duration::from_micros(16_667)),
             ),
+            show_fps_counter: Cell::new(false),
+            fps_frame_count: Cell::new(0),
+            fps_last_log: RefCell::new(Instant::now()),
+
             on_main_stack: true,
         };
 
@@ -1085,144 +1795,116 @@ impl Window {
         // (see src/frameworks/core_animation/composition.rs). OpenGL ES is used
         // because SDL2 won't let us use more than one graphics API in the same
         // window, and we also need OpenGL ES for the app's own rendering.
-        let mut gl_ins = match effective_graphics_api {
-            crate::options::GraphicsApi::Translator => {
-                create_gles1_translator_ctx_no_parent_stack(&mut window)
-            }
-            crate::options::GraphicsApi::TranslatorGLES30 => {
-                create_gles1_gles3_translator_ctx_no_parent_stack(&mut window)
-            }
-            crate::options::GraphicsApi::GLES20
-            | crate::options::GraphicsApi::GLES30
-            | crate::options::GraphicsApi::Metal
-            | crate::options::GraphicsApi::Wgpu
-            | crate::options::GraphicsApi::Vulkan => {
-                if matches!(effective_graphics_api, crate::options::GraphicsApi::GLES30) {
-                    log!("GLES 3.0 window context is unavailable; using a GLES 2.0 context");
+        if software_presentation {
+            log!("Software rendering enabled: retaining host GL context creation for SDL and compatibility paths; presentation uses CPU pixels");
+        }
+
+        if matches!(
+            options.graphics_api,
+            crate::options::GraphicsApi::Wgpu | crate::options::GraphicsApi::Vulkan
+        ) || (frame_generation && !software_presentation)
+        {
+            let presentation = if options.graphics_api == crate::options::GraphicsApi::Vulkan {
+                WgpuPresentation::new_vulkan(&window.window)
+            } else {
+                WgpuPresentation::new(&window.window)
+            };
+            log!("{} selected as the host presentation backend; guest EAGL remains on the existing GLES2 compatibility path", options.graphics_api.label());
+            match presentation {
+                Ok(mut presentation) => {
+                    presentation.set_stretch_to_fill(fullscreen_stretched);
+                    log!(
+                        "{} presentation initialized successfully",
+                        options.graphics_api.label()
+                    );
+                    window.wgpu_presentation = Some(presentation);
                 }
-                create_gles2_ctx_no_parent_stack(&mut window)
+                Err(error) => {
+                    log!("{} presentation unavailable; continuing with the GLES presentation path: {}", options.graphics_api.label(), error);
+                }
             }
-            crate::options::GraphicsApi::Software
-            | crate::options::GraphicsApi::GLES10
-            | crate::options::GraphicsApi::GLES11 => {
-                create_gles1_ctx_no_parent_stack(&mut window, options)
-            }
-            crate::options::GraphicsApi::Default => {
-                if options.prefer_gles2_context {
+        }
+
+        let mut gl_ins = if software_presentation {
+            crate::gles::GLESImplementation::Software
+                .construct(&mut window)
+                .expect("Could not create software GLES context")
+        } else {
+            match effective_graphics_api {
+                crate::options::GraphicsApi::Translator => {
+                    create_gles1_translator_ctx_no_parent_stack(&mut window)
+                }
+                crate::options::GraphicsApi::TranslatorGLES30 => {
+                    create_gles1_gles3_translator_ctx_no_parent_stack(&mut window)
+                }
+                crate::options::GraphicsApi::GLES20 => {
                     create_gles2_ctx_no_parent_stack(&mut window)
-                } else {
+                }
+                crate::options::GraphicsApi::GLES30 => {
+                    create_gles3_ctx_no_parent_stack(&mut window)
+                }
+                crate::options::GraphicsApi::GLES10 | crate::options::GraphicsApi::GLES11 => {
                     create_gles1_ctx_no_parent_stack(&mut window, options)
                 }
-            }
-        };
-        if options.trace_gl_errors {
-            gl_ins = Box::new(LoggingGLESContext {
-                inner: gl_ins,
-                verbose: options.trace_gl_errors || options.verbose_gles,
-            });
-        }
-        let gl_driver_description = {
-            let gl_ctx = gl_ins.make_current(&mut window);
-            unsafe { gl_ctx.driver_description() }
-        };
-        log!("Driver info: {}", gl_driver_description);
-        window.gl_driver_description = gl_driver_description;
-        window.internal_gl_ins = Some(gl_ins);
-
-        // Swap interval. EGL's swap interval is a property of the window
-        // surface, which every context created for this window shares, so
-        // setting it once here (with the internal context current) covers the
-        // app's EAGL contexts too.
-        //
-        // On Android the default (1, i.e. vsync) is a poor fit: the emulator
-        // already paces frames itself (`--fps-limit`, on by default) and the
-        // Android compositor synchronises to the display regardless, so a
-        // blocking swap can't prevent tearing, it can only stall the emulator
-        // thread — and a stall on top of a frame that already took nearly a
-        // refresh interval turns "almost 60 FPS" into a hard 30 FPS. Desktop
-        // drivers are left at their default unless asked otherwise.
-        let swap_interval = match options.vsync {
-            crate::options::VsyncMode::On => Some(sdl2::video::SwapInterval::VSync),
-            crate::options::VsyncMode::Off => Some(sdl2::video::SwapInterval::Immediate),
-            crate::options::VsyncMode::Auto => {
-                if env::consts::OS == "android" {
-                    Some(sdl2::video::SwapInterval::Immediate)
-                } else {
-                    None
+                crate::options::GraphicsApi::Software => {
+                    create_host_gles1_ctx_no_parent_stack(&mut window)
+                }
+                crate::options::GraphicsApi::Metal
+                | crate::options::GraphicsApi::Wgpu
+                | crate::options::GraphicsApi::Vulkan => {
+                    create_gles2_ctx_no_parent_stack(&mut window)
+                }
+                crate::options::GraphicsApi::Default => {
+                    // Note: the DamnWrapper32-style ES auto-select
+                    // (`app_is_es2_only`) was removed from this decision --
+                    // it destabilised some titles (e.g. BioShock). The
+                    // Default backend again follows only explicit
+                    // user/driver signals; the usage scan is still logged
+                    // for diagnostics.
+                    if llvmpipe_active {
+                        create_gles1_translator_ctx_no_parent_stack(&mut window)
+                    } else if options.prefer_gles2_context || angle_driver_active {
+                        create_gles2_ctx_no_parent_stack(&mut window)
+                    } else {
+                        create_gles1_ctx_no_parent_stack(&mut window, options)
+                    }
                 }
             }
         };
-        if let Some(swap_interval) = swap_interval {
-            let vsync_on = matches!(swap_interval, sdl2::video::SwapInterval::VSync);
-            match window.video_ctx.gl_set_swap_interval(swap_interval) {
-                Ok(()) => log!(
-                    "Vsync {} (swap interval {}).",
-                    if vsync_on { "enabled" } else { "disabled" },
-                    if vsync_on { 1 } else { 0 }
-                ),
-                Err(e) => log!(
-                    "Warning: could not {} vsync, leaving the driver's default swap interval: {}",
-                    if vsync_on { "enable" } else { "disable" },
-                    e
-                ),
+        {
+            let gl_ctx = gl_ins.make_current(&mut window);
+            let driver_description = unsafe { gl_ctx.driver_description() };
+            if angle_driver_active
+                && cfg!(target_os = "android")
+                && !driver_description.to_ascii_uppercase().contains("ANGLE")
+            {
+                panic!(
+                    "ANGLE was forced, but Android created a non-ANGLE context: {driver_description}"
+                );
+            }
+            log!("Driver info: {}", driver_description);
+        }
+        if !software_presentation && options.vsync {
+            if let Err(error) = window.video_ctx.gl_set_swap_interval(SwapInterval::VSync) {
+                log!("Vsync requested but SDL could not enable the host swap interval: {error}");
+            } else {
+                log!("Vsync enabled: host presentation is synchronized to the display");
+            }
+        } else if !software_presentation {
+            let result = window
+                .video_ctx
+                .gl_set_swap_interval(SwapInterval::Immediate);
+            if let Err(error) = result {
+                log_dbg!("Immediate swap interval unavailable: {error}");
             }
         }
-
-        // Detect the host GL stack once, up front, so we can auto-apply the
-        // known Adreno black-screen workarounds. Android uses bundled ANGLE
-        // whenever its libraries are available; the system driver is only a
-        // fallback if ANGLE cannot be loaded.
-        window.log_gpu_backend_hints();
+        window.internal_gl_ins = Some(gl_ins);
 
         if window.splash_image.is_some() {
             window.display_splash();
         }
 
         window
-    }
-
-    /// Whether the host OpenGL stack is Google's ANGLE (OpenGL ES translated to
-    /// Vulkan/Direct3D/Metal) rather than a vendor-native driver. Detected from
-    /// the `GL_VERSION` / `GL_RENDERER` strings captured at context creation.
-    pub fn is_angle_backend(&self) -> bool {
-        self.gl_driver_description.contains("ANGLE")
-    }
-
-    /// Whether the host GPU is a Qualcomm Adreno part. Used to decide whether
-    /// the Adreno-specific rendering workarounds should be auto-enabled.
-    pub fn is_adreno_gpu(&self) -> bool {
-        let d = &self.gl_driver_description;
-        d.contains("Adreno") || d.contains("Qualcomm")
-    }
-
-    /// The cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string for the internal
-    /// OpenGL ES context.
-    #[allow(dead_code)]
-    pub fn gl_driver_description(&self) -> &str {
-        &self.gl_driver_description
-    }
-
-    /// Log a one-line summary of the detected GPU backend and, on Adreno
-    /// hardware, whether ANGLE is active. This makes the "black screen on
-    /// Adreno" situation diagnosable straight from the log the user shares.
-    fn log_gpu_backend_hints(&self) {
-        if self.is_adreno_gpu() {
-            if self.is_angle_backend() {
-                log!(
-                    "GPU backend: Qualcomm Adreno via ANGLE (recommended). \
-                     ANGLE's lenient ES emulation avoids the native Adreno \
-                     driver's black-screen issues."
-                );
-            } else {
-                log!(
-                    "GPU backend: Qualcomm Adreno native OpenGL ES driver. \
-                     Bundled ANGLE could not be loaded; the native ES 1.1 path \
-                     can render some early iPhone OS games as a black screen. \
-                     Adreno rendering workarounds (--fix-texture-min-filter) \
-                     are auto-enabled to mitigate this."
-                );
-            }
-        }
     }
 
     /// Poll for events from the OS. This needs to be done reasonably often
@@ -1234,7 +1916,7 @@ impl Window {
     /// was called too recently.
     pub fn poll_for_events(&mut self, options: &Options) {
         if !self.on_main_stack {
-            log!("Warning: poll_for_events called off main stack, skipping");
+            log_once!("Warning: poll_for_events called off main stack, skipping");
             return;
         }
         let now = Instant::now();
@@ -1250,17 +1932,29 @@ impl Window {
             independent_of_viewport: bool,
         ) -> (f32, f32) {
             let (vx, vy, vw, vh) = if independent_of_viewport {
-                let (width, height) = size_for_orientation(
-                    window.device_family,
-                    window.device_orientation,
-                    NonZeroU32::new(1).unwrap(),
-                );
+                let (width, height) =
+                    size_for_orientation(window.device_family, window.device_orientation, 1.0);
                 (0, 0, width, height)
             } else {
                 window.viewport()
             };
-            // Clamp touches in letterbox bars to the nearest visible edge.
-            let (x, y) = geometry::normalize_viewport_coords((in_x, in_y), (vx, vy, vw, vh));
+            // Clamp into the viewport. On hosts (Android, large desktops) the
+            // SDL drawable is bigger than the iPhone's virtual screen and is
+            // letterboxed inside the viewport. Touches landing in the
+            // letterbox bars used to produce out-of-window iOS coordinates
+            // (e.g. y == -91 or y == 570 for a 320x460 portrait window),
+            // which made -[UIWindow hitTest:withEvent:] return nil for every
+            // such touch. The "SUPER HACK" fallback in ui_touch then forced
+            // the touch directly into the window object, bypassing all
+            // subviews — so taps near the very top/bottom of a landscape
+            // screen never reached overlay UI like CreateNewWorld dialogs
+            // or the in-game chat field. Clamping to the viewport keeps the
+            // touch on the nearest visible edge instead.
+            let in_x = in_x.clamp(vx as f32, (vx + vw) as f32);
+            let in_y = in_y.clamp(vy as f32, (vy + vh) as f32);
+            // normalize to unit square centred on origin
+            let x = (in_x - vx as f32) / vw as f32 - 0.5;
+            let y = (in_y - vy as f32) / vh as f32 - 0.5;
             // rotate
             //
             // If the final EAGL presentation is not being rotated, the touch
@@ -1268,18 +1962,19 @@ impl Window {
             // 320x480 UIKit space so EAGLView still receives the event; a
             // separate UITouch locationInView compatibility path can remap
             // the coordinates returned to the game.
-            // PERF: cache the read-once debug toggles; this runs per SDL
-            // touch event, and each std::env::var_os is a global-lock environ
-            // scan with allocation.
-            let [x, y] = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
-                || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
+            let [x, y] = if std::env::var_os("TOUCHHLE_DISABLE_PRESENT_ROTATION").is_some()
+                || std::env::var_os("TOUCHHLE_DISABLE_TOUCH_ROTATION").is_some()
             {
                 log_once!(
                     "TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates [this log will only be shown once]"
                 );
                 [x, y]
             } else {
-                let matrix = window.rotation_matrix().inverse().unwrap();
+                // Must be the inverse of the matrix used to DISPLAY guest
+                // content (see presentation_matrix), so taps stay aligned with
+                // what is on screen. Matches HyperHLE, whose hit-test uses the
+                // plain inverse of the device rotation matrix.
+                let matrix = window.presentation_matrix().inverse().unwrap();
                 matrix.transform([x, y])
             };
 
@@ -1290,12 +1985,12 @@ impl Window {
 
             // Optional hit-test tuning only. Do not use these unless you are
             // deliberately testing the UIKit hit-test position.
-            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_X_OFFSET") {
+            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_X_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_x += offset;
                 }
             }
-            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_Y_OFFSET") {
+            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_Y_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_y += offset;
                 }
@@ -1315,9 +2010,10 @@ impl Window {
             (out_x.round(), out_y.round())
         }
         fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
-            let coords = window.mouse_drawable_coords((in_x, in_y));
-            let (x, y) = geometry::normalize_viewport_coords(coords, window.viewport());
-            (x * 2.0, y * 2.0)
+            let (_, _, vw, vh) = window.viewport();
+            let out_x = ((in_x as f32 / vw as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            let out_y = ((in_y as f32 / vh as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            (out_x, out_y)
         }
         fn translate_button(button: sdl2::controller::Button) -> Option<crate::options::Button> {
             match button {
@@ -1351,13 +2047,13 @@ impl Window {
             let event = if let Some(e) = previous_event.take() {
                 match e {
                     E::Unknown { .. } => (),
-                    _ => log_dbg!("Consuming previous event: {:?}", e),
+                    _ => log_sampled!(256, "Consuming previous event: {:?}", e),
                 }
                 e
             } else if let Some(e) = self.event_pump.poll_event() {
                 match e {
                     E::Unknown { .. } => (),
-                    _ => log_dbg!("Consuming new event: {:?}", e),
+                    _ => log_sampled!(256, "Consuming new event: {:?}", e),
                 }
                 e
             } else {
@@ -1403,17 +2099,15 @@ impl Window {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
-                    let coords = self.mouse_drawable_coords((x, y));
-                    let coords = transform_input_coords(self, coords, false);
+                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
                     log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseMotion {
                     x, y, mousestate, ..
                 } if mousestate.left() => {
-                    let coords = self.mouse_drawable_coords((x, y));
-                    let coords = transform_input_coords(self, coords, false);
-                    log_dbg!("MouseMotion x {}, y {}, coords {:?}", x, y, coords);
+                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    log_sampled!(256, "MouseMotion x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesMove(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseButtonUp {
@@ -1422,8 +2116,7 @@ impl Window {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
-                    let coords = self.mouse_drawable_coords((x, y));
-                    let coords = transform_input_coords(self, coords, false);
+                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
                     log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1593,23 +2286,23 @@ impl Window {
                     }
                 }
                 E::AppWillEnterBackground { .. } => {
-                    log_dbg!("Received app-will-resign-active event.");
+                    log!("Received app-will-resign-active event.");
                     Event::AppWillResignActive
                 }
                 E::AppDidEnterBackground { .. } => {
-                    log_dbg!("Received app-did-enter-background event.");
+                    log!("Received app-did-enter-background event.");
                     Event::AppDidEnterBackground
                 }
                 E::AppWillEnterForeground { .. } => {
-                    log_dbg!("Received app-will-enter-foreground event.");
+                    log!("Received app-will-enter-foreground event.");
                     Event::AppWillEnterForeground
                 }
                 E::AppDidEnterForeground { .. } => {
-                    log_dbg!("Received app-did-become-active event.");
+                    log!("Received app-did-become-active event.");
                     Event::AppDidBecomeActive
                 }
                 E::AppTerminating { .. } => {
-                    log_dbg!("Received app-will-terminate event.");
+                    log!("Received app-will-terminate event.");
                     assert!(self.high_priority_event.is_none());
                     self.high_priority_event = Some(Event::AppWillTerminate);
                     // App is about to be killed by the OS. Stop polling so we
@@ -1640,7 +2333,7 @@ impl Window {
                     y,
                     ..
                 } => {
-                    log_dbg!("Starting multi-touch for {:?}", event);
+                    log_sampled!(256, "Starting multi-touch for {:?}", event);
                     // To implement multi-touch we accumulate here same touch
                     // events at the same timestamp. This is consistent with
                     // UIKit, but could be broken if events come out of order.
@@ -1648,19 +2341,13 @@ impl Window {
                     // TODO: handle out of order touches
                     let curr_timestamp = timestamp;
                     let abs_coords = finger_absolute_coords(self, (x, y));
-                    // The trainer overlay (Cheat Engine-style) gets first
-                    // dibs on touches that land on its button or panel.
                     let trainer_consumed = match event {
-                        E::FingerDown { .. } => {
-                            crate::trainer_ui::touch_down(abs_coords, self.viewport())
-                        }
-                        E::FingerUp { .. } => {
-                            crate::trainer_ui::touch_up(abs_coords, self.viewport())
-                        }
+                        E::FingerDown { .. } => crate::trainer_ui::touch_down(abs_coords, self.viewport()),
+                        E::FingerUp { .. } => crate::trainer_ui::touch_up(abs_coords, self.viewport()),
                         _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
                     };
                     let coords = transform_input_coords(self, abs_coords, false);
-                    log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
+                    log_sampled!(256, "Finger event x {}, y {}, coords {:?}", x, y, coords);
                     let mut map = if trainer_consumed {
                         HashMap::new()
                     } else {
@@ -1669,7 +2356,7 @@ impl Window {
                     while let Some(next) = self.event_pump.poll_event() {
                         match next {
                             E::Unknown { .. } => (),
-                            _ => log_dbg!("Next possible multi-touch event: {:?}", next),
+                            _ => log_sampled!(256, "Next possible multi-touch event: {:?}", next),
                         }
                         match next {
                             E::FingerUp {
@@ -1695,15 +2382,9 @@ impl Window {
                             } if timestamp == curr_timestamp && next.is_same_kind_as(&event) => {
                                 let abs_coords = finger_absolute_coords(self, (x, y));
                                 let trainer_consumed = match next {
-                                    E::FingerDown { .. } => {
-                                        crate::trainer_ui::touch_down(abs_coords, self.viewport())
-                                    }
-                                    E::FingerUp { .. } => {
-                                        crate::trainer_ui::touch_up(abs_coords, self.viewport())
-                                    }
-                                    _ => {
-                                        crate::trainer_ui::touch_motion(abs_coords, self.viewport())
-                                    }
+                                    E::FingerDown { .. } => crate::trainer_ui::touch_down(abs_coords, self.viewport()),
+                                    E::FingerUp { .. } => crate::trainer_ui::touch_up(abs_coords, self.viewport()),
+                                    _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
                                 };
                                 let coords = transform_input_coords(self, abs_coords, false);
                                 if !trainer_consumed {
@@ -1724,7 +2405,7 @@ impl Window {
                             }
                         }
                     }
-                    log_dbg!("Finishing multi-touch for {:?} with {:?}", event, map);
+                    log_sampled!(256, "Finishing multi-touch for {:?} with {:?}", event, map);
                     match event {
                         E::FingerUp { .. } => Event::TouchesUp(map),
                         E::FingerMotion { .. } => Event::TouchesMove(map),
@@ -1758,21 +2439,31 @@ impl Window {
                     self.toggle_fullscreen();
                     continue;
                 }
-                // Toggle FPS counter with F9
+                // Guest clock speed: F10 = slower, Shift+F10 = faster,
+                // Alt+F10 = reset to 1x.
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::F10),
+                    keymod,
                     repeat: false,
                     ..
                 } => {
-                    // This is a hack for the user: we can't easily modify Options
-                    // while the environment is running without some synchronization,
-                    // but for debugging we can just log that the key was pressed.
-                    // Actually, if we want to toggle it, we need access to env.options.
-                    echo!("F10 pressed: Toggle Verbose GLES (requires env.options access)");
+                    let cmd =
+                        if keymod.intersects(sdl2::keyboard::Mod::LALTMOD | sdl2::keyboard::Mod::RALTMOD) {
+                            3
+                        } else if keymod
+                            .intersects(sdl2::keyboard::Mod::LSHIFTMOD | sdl2::keyboard::Mod::RSHIFTMOD)
+                        {
+                            2
+                        } else {
+                            1
+                        };
+                    crate::guest_clock::request_speed(cmd);
                     continue;
                 }
+                // Toggle FPS counter with F9
                 E::KeyDown {
-                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    keycode: Some(sdl2::keyboard::Keycode::F9),
+                    repeat: false,
                     ..
                 } => {
                     let new = !self.show_fps_counter.get();
@@ -1836,39 +2527,6 @@ impl Window {
     /// Pop an event from the queue (in FIFO order, except for high priority
     /// events)
     pub fn pop_event(&mut self) -> Option<Event> {
-        // TEST HOOK: GD autoplay taps for verifying level music headlessly.
-        if !self.auto_taps.is_empty() {
-            static POP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let frame = POP_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let due: Vec<(f32, f32)> = self
-                .auto_taps
-                .iter()
-                .filter(|(tap_frame, _, _)| *tap_frame == frame)
-                .map(|(_, x, y)| (*x, *y))
-                .collect();
-            for (x, y) in due {
-                let (w, h) = self.window.drawable_size();
-                let x = if x < 0.0 { w as f32 / 2.0 } else { x };
-                let y = if y < 0.0 { h as f32 / 2.0 } else { y };
-                let coords = (x, y);
-                log!(
-                    "GD autoplay tap at frame {} -> drawable ({:.0},{:.0}) coords {:?}",
-                    frame,
-                    x,
-                    y,
-                    coords
-                );
-                self.event_queue
-                    .push_back(Event::TouchesDown(HashMap::from([(
-                        FingerId::Mouse,
-                        coords,
-                    )])));
-                self.event_queue
-                    .push_back(Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)])));
-            }
-            self.auto_taps
-                .retain(|(tap_frame, _, _)| *tap_frame > frame);
-        }
         self.high_priority_event
             .take()
             .or_else(|| self.event_queue.pop_front())
@@ -1931,12 +2589,54 @@ impl Window {
         }
     }
 
+    /// Return whether SDL exposed a native gyroscope for the host device.
+    pub fn has_gyroscope(&self) -> bool {
+        self.gyroscope.is_some()
+    }
+
+    /// Get native gyroscope angular velocity in radians per second using the
+    /// host device's SDL sensor. A missing or temporarily unavailable sensor
+    /// is reported as stationary instead of breaking the guest motion APIs.
+    pub fn get_gyroscope(&self) -> (f32, f32, f32) {
+        self.sensor_ctx.update();
+        let Some(gyroscope) = self.gyroscope.as_ref() else {
+            return (0.0, 0.0, 0.0);
+        };
+        match gyroscope.get_data() {
+            Ok(sdl2::sensor::SensorData::Gyro([x, y, z])) => (x, y, z),
+            Ok(data) => {
+                log_once_fmt!(
+                    "Warning: gyroscope sensor returned non-gyro data ({:?}); reporting zero rotation",
+                    data
+                );
+                (0.0, 0.0, 0.0)
+            }
+            Err(error) => {
+                log_once_fmt!(
+                    "Warning: native gyroscope read failed ({}); reporting zero rotation",
+                    error
+                );
+                (0.0, 0.0, 0.0)
+            }
+        }
+    }
+
     /// Get the real or simulated accelerometer output.
     /// See also [crate::frameworks::uikit::ui_accelerometer].
     pub fn get_acceleration(&self, options: &Options) -> (f32, f32, f32) {
+        self.sensor_ctx.update();
         if self.controllers.is_empty() || !options.analog_stick_tilt_controls {
             if let Some(ref accelerometer) = self.accelerometer {
-                let data = accelerometer.get_data().unwrap();
+                let data = match accelerometer.get_data() {
+                    Ok(data) => data,
+                    Err(error) => {
+                        log_once_fmt!(
+                            "Warning: accelerometer read failed ({}); reporting neutral acceleration",
+                            error
+                        );
+                        return (0.0, 0.0, -1.0);
+                    }
+                };
                 let sdl2::sensor::SensorData::Accel(data) = data else {
                     // We asked SDL for the accelerometer sensor explicitly
                     // earlier; if SDL handed us a different sensor variant
@@ -1957,7 +2657,7 @@ impl Window {
                 // SDL2 reports acceleration in units of m/s^2.
                 let gravity: f32 = 9.80665; // SDL_STANDARD_GRAVITY
                 let (x, y, z) = (x / gravity, y / gravity, z / gravity);
-                return accelerometer_compat_remap(x, y, z);
+                return (x, y, z);
             }
         }
 
@@ -2003,34 +2703,6 @@ impl Window {
         let [x, y, z] = matrix.transform(gravity);
 
         (x, y, z)
-    }
-
-    /// Returns [true] if the host device provides a gyroscope sensor.
-    pub fn has_gyroscope(&self) -> bool {
-        self.gyroscope.is_some()
-    }
-
-    /// Get the host gyroscope rotation rate, in radians per second, in the
-    /// device coordinate frame (+x right of the screen, +y top of the screen,
-    /// +z away from the screen), matching the axes of CMRotationRate.
-    /// SDL reports gyroscope data in radians per second relative to the
-    /// device axes, so no unit or axis conversion is needed.
-    /// See also [crate::frameworks::core_motion].
-    pub fn get_rotation_rate(&self) -> Option<(f32, f32, f32)> {
-        let gyroscope = self.gyroscope.as_ref()?;
-        let data = gyroscope.get_data().ok()?;
-        let sdl2::sensor::SensorData::Gyro(data) = data else {
-            // We asked SDL for the gyroscope sensor explicitly earlier; if
-            // SDL handed us a different sensor variant (driver bug, future
-            // SDL version, etc.), treat the sensor as unavailable.
-            log!(
-                "Warning: gyroscope sensor returned non-Gyro data ({:?}); ignoring.",
-                data
-            );
-            return None;
-        };
-        let [x, y, z] = data;
-        Some((x, y, z))
     }
 
     /// For use when redrawing the screen: Get the cached on-screen position and
@@ -2223,7 +2895,37 @@ impl Window {
     }
 
     pub unsafe fn make_gl_context_current(&self, gl_ctx: &GLContext) {
-        self.window.gl_make_current(&gl_ctx.0).unwrap();
+        match self.window.gl_make_current(&gl_ctx.0) {
+            Ok(()) => Self::mark_gl_bound_on_this_thread(),
+            Err(error) => {
+                log_once_fmt!(
+                    "Unable to make the EGL context current ({}); keeping the existing context instead of panicking",
+                    error
+                );
+            }
+        }
+    }
+
+    /// Record that the calling thread is the one the host GL context is now
+    /// bound to. See [Self::gl_ctx_bound_on_this_thread].
+    pub fn mark_gl_bound_on_this_thread() {
+        LAST_GL_BIND_THREAD.store(current_thread_token(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when the last successful host GL `MakeCurrent` happened on the
+    /// calling thread.
+    ///
+    /// SDL's Android EGL backend records the current GL context in a single
+    /// global rather than thread-local storage, so `GLContext::is_current()`
+    /// reports "current" on every thread once any thread has bound it. GL
+    /// backends must therefore skip re-binding only when the binding is both
+    /// up-to-date AND local to this thread; otherwise a guest worker thread
+    /// stealing the binding between frames leaves the main thread issuing
+    /// driver calls with no current context, and Adreno-style drivers return
+    /// `GL_INVALID_VALUE` from `glGetError()` itself.
+    pub fn gl_ctx_bound_on_this_thread() -> bool {
+        let last = LAST_GL_BIND_THREAD.load(std::sync::atomic::Ordering::Relaxed);
+        last != 0 && last == current_thread_token()
     }
 
     /// Make the internal OpenGL ES context (for splash screen and UI rendering)
@@ -2238,7 +2940,14 @@ impl Window {
                 .as_mut()
                 .unwrap()
                 .make_current_unchecked_for_window(
-                    &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
+                    &mut |gl_ctx| {
+                        if let Err(error) = self.window.gl_make_current(&gl_ctx.0) {
+                            log_once_fmt!(
+                                "Unable to reactivate the EGL context for internal rendering ({}); skipping the rebind",
+                                error
+                            );
+                        }
+                    },
                     &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
                 )
         };
@@ -2252,39 +2961,428 @@ impl Window {
         self.display_splash();
     }
 
-    pub fn present_compatibility_frame(&mut self, clear_color: [f32; 4]) {
-        if self.software_presentation {
-            let color = sdl2::pixels::Color::RGBA(
-                (clear_color[0].clamp(0.0, 1.0) * 255.0) as u8,
-                (clear_color[1].clamp(0.0, 1.0) * 255.0) as u8,
-                (clear_color[2].clamp(0.0, 1.0) * 255.0) as u8,
-                (clear_color[3].clamp(0.0, 1.0) * 255.0) as u8,
-            );
-            let mut surface = self.window.surface(&self.event_pump).unwrap();
-            surface.fill_rect(None, color).unwrap();
-            surface.update_window().unwrap();
+    fn apply_rtcs(&mut self, pixels: &mut [u8], width: u32, height: u32) {
+        if !self.rtcs || width < 2 || height < 2 {
             return;
         }
-        let (x, y, width, height) = self.viewport();
-        let mut gl = self.make_internal_gl_ctx_current();
-        unsafe {
-            gl.Viewport(x as _, y as _, width as _, height as _);
-            gl.ClearColor(
-                clear_color[0],
-                clear_color[1],
-                clear_color[2],
-                clear_color[3],
-            );
-            gl.Clear(crate::gles::gles11_raw::COLOR_BUFFER_BIT);
+        self.rtcs_frame = self.rtcs_frame.wrapping_add(1);
+        let progress = (self.rtcs_frame as f32 / 1800.0).clamp(0.0, 1.0);
+        let block = (1 + (progress * 18.0) as usize)
+            .min(width as usize / 2)
+            .max(1);
+        let stride = width as usize * 4;
+        let step = 37 + (self.rtcs_frame as usize % 97);
+        let mut index = (self.rtcs_frame as usize * 7919) % (width as usize * height as usize);
+        let affected =
+            ((width as usize * height as usize) as f32 * (0.002 + progress * 0.09)) as usize;
+        for _ in 0..affected.max(1) {
+            let x = (index % width as usize) / block * block;
+            let y = (index / width as usize) / block * block;
+            let x_end = (x + block).min(width as usize);
+            let y_end = (y + block).min(height as usize);
+            let source = (y * stride + x * 4).min(pixels.len().saturating_sub(4));
+            let rgba = [
+                pixels[source],
+                pixels[source + 1],
+                pixels[source + 2],
+                pixels[source + 3],
+            ];
+            for row in y..y_end {
+                for col in x..x_end {
+                    let dst = row * stride + col * 4;
+                    if dst + 3 < pixels.len() {
+                        pixels[dst..dst + 4].copy_from_slice(&rgba);
+                    }
+                }
+            }
+            index = index.wrapping_add(step) % (width as usize * height as usize);
         }
-        drop(gl);
-        self.swap_window();
+    }
+
+    pub fn present_software_frame(&mut self, mut pixels: Vec<u8>, width: u32, height: u32) {
+        self.apply_rtcs(&mut pixels, width, height);
+        self.present_frame_with_generation(pixels, width, height, true);
+    }
+
+    fn present_frame_with_generation(
+        &mut self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        bottom_up: bool,
+    ) {
+        if !self.frame_generation || self.frame_generation_state.adaptive_disabled {
+            self.present_software_pixels(pixels, width, height, bottom_up);
+            return;
+        }
+        let expected_len = width as usize * height as usize * 4;
+        if width == 0 || height == 0 || pixels.len() < expected_len {
+            log_dbg!(
+                "Frame generation skipped invalid frame: {}x{} with {} bytes (need {})",
+                width,
+                height,
+                pixels.len(),
+                expected_len
+            );
+            return;
+        }
+        let mut current = vec![0u8; expected_len];
+        for y in 0..height as usize {
+            let source_y = if bottom_up {
+                height as usize - 1 - y
+            } else {
+                y
+            };
+            let source = source_y * width as usize * 4;
+            let destination = y * width as usize * 4;
+            current[destination..destination + width as usize * 4]
+                .copy_from_slice(&pixels[source..source + width as usize * 4]);
+        }
+        let now = Instant::now();
+        let previous = if self.frame_generation_state.width == width
+            && self.frame_generation_state.height == height
+        {
+            self.frame_generation_state.previous.take()
+        } else {
+            self.frame_generation_state.previous = None;
+            None
+        };
+        let elapsed = self
+            .frame_generation_state
+            .last_frame_at
+            .map_or(Duration::from_secs_f64(1.0 / 60.0), |last| {
+                now.saturating_duration_since(last)
+            });
+        self.frame_generation_state.width = width;
+        self.frame_generation_state.height = height;
+        self.frame_generation_state.last_frame_at = Some(now);
+        let display_interval = Duration::from_secs_f64(1.0 / self.display_refresh_rate.max(1.0));
+        let display_slots = if elapsed <= Duration::from_millis(250) {
+            (elapsed.as_secs_f64() / display_interval.as_secs_f64())
+                .round()
+                .clamp(1.0, 8.0) as usize
+        } else {
+            1
+        };
+        if let Some(previous) = previous {
+            let mut generated = 0;
+            for step in 1..display_slots {
+                let blend = step as u32 * 256 / display_slots as u32;
+                let inverse = 256 - blend;
+                let mut interpolated = vec![0u8; expected_len];
+                for index in 0..expected_len {
+                    interpolated[index] = ((previous[index] as u32 * inverse
+                        + current[index] as u32 * blend)
+                        >> 8) as u8;
+                }
+                self.present_software_pixels(interpolated, width, height, false);
+                generated += 1;
+            }
+            log_dbg!(
+                "Frame generation: rendered frame interval {:.2}ms, displayed {} generated frame(s) at {:.2}Hz",
+                elapsed.as_secs_f64() * 1000.0,
+                generated,
+                self.display_refresh_rate
+            );
+            self.note_frame_generation_cost(now.elapsed());
+        }
+        self.present_software_pixels(current.clone(), width, height, false);
+        self.frame_generation_state.previous = Some(current);
+    }
+
+    /// Track how much wall-clock time frame generation consumed this frame.
+    /// When it persistently overruns the budget, disable it for the rest of
+    /// the session and tell the user once: a stuttering "smoother" mode is
+    /// worse than no frame generation at all.
+    fn note_frame_generation_cost(&mut self, cost: Duration) {
+        if cost > FRAME_GENERATION_BUDGET {
+            self.frame_generation_state.cost_overruns += 1;
+        } else {
+            self.frame_generation_state.cost_overruns = 0;
+        }
+        if self.frame_generation_state.cost_overruns >= FRAME_GENERATION_OVERRUN_LIMIT {
+            self.frame_generation_state.adaptive_disabled = true;
+            self.frame_generation_state.previous = None;
+            self.frame_generation_state.last_frame_at = None;
+            log!(
+                "Frame generation disabled automatically: interpolation overhead exceeded the {:.1}ms frame budget on {} consecutive frames; presenting frames directly instead",
+                FRAME_GENERATION_BUDGET.as_secs_f64() * 1000.0,
+                FRAME_GENERATION_OVERRUN_LIMIT
+            );
+        }
+    }
+
+    fn prepare_native_frame(
+        &self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        bottom_up: bool,
+    ) -> (Vec<u8>, u32, u32, bool) {
+        if width == 0 || height == 0 || pixels.len() < width as usize * height as usize * 4 {
+            return (pixels, width, height, false);
+        }
+        let row_bytes = width as usize * 4;
+        let mut top_down = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..height as usize {
+            let source_y = if bottom_up {
+                height as usize - 1 - y
+            } else {
+                y
+            };
+            let source = source_y * row_bytes;
+            let destination = y * row_bytes;
+            top_down[destination..destination + row_bytes]
+                .copy_from_slice(&pixels[source..source + row_bytes]);
+        }
+        let (transformed, output_width, output_height) = transform_software_pixels(
+            top_down,
+            width,
+            height,
+            self.presentation_quarter_turns(),
+            self.revert_x_axis,
+            self.revert_y_axis,
+        );
+        (transformed, output_width, output_height, false)
+    }
+
+    pub fn present_native_frame(
+        &mut self,
+        mut pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        bottom_up: bool,
+    ) {
+        self.apply_rtcs(&mut pixels, width, height);
+        let (pixels, width, height, bottom_up) =
+            self.prepare_native_frame(pixels, width, height, bottom_up);
+        self.present_native_frame_prepared(pixels, width, height, bottom_up);
+    }
+
+    fn present_native_frame_prepared(
+        &mut self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        bottom_up: bool,
+    ) {
+        // Frame generation intentionally runs on the default SDL surface
+        // backend (CPU interpolation), not WGPU: the pixels arriving here are
+        // already oriented for display (prepare_native_frame applied the
+        // quarter-turns and axis reverts), so they must be blitted without
+        // any further rotation. present_pixels_prepared handles that.
+        if self.frame_generation
+            && !self.gpu_frame_generation_failed
+            && !self.frame_generation_state.adaptive_disabled
+        {
+            let expected_len = width as usize * height as usize * 4;
+            if width == 0 || height == 0 || pixels.len() < expected_len {
+                self.frame_generation_state.previous = None;
+                self.frame_generation_state.last_frame_at = None;
+            } else {
+                let now = std::time::Instant::now();
+                let previous = if self.frame_generation_state.width == width
+                    && self.frame_generation_state.height == height
+                {
+                    self.frame_generation_state.previous.take()
+                } else {
+                    self.frame_generation_state.previous = None;
+                    None
+                };
+                let elapsed = self
+                    .frame_generation_state
+                    .last_frame_at
+                    .map_or(std::time::Duration::from_secs_f64(1.0 / 60.0), |last| {
+                        now.saturating_duration_since(last)
+                    });
+                self.frame_generation_state.width = width;
+                self.frame_generation_state.height = height;
+                self.frame_generation_state.last_frame_at = Some(now);
+                let display_interval =
+                    std::time::Duration::from_secs_f64(1.0 / self.display_refresh_rate.max(1.0));
+                let display_slots = if elapsed <= std::time::Duration::from_millis(250) {
+                    (elapsed.as_secs_f64() / display_interval.as_secs_f64())
+                        .round()
+                        .clamp(1.0, 8.0) as usize
+                } else {
+                    1
+                };
+                if let Some(previous) = previous {
+                    for step in 1..display_slots {
+                        let blend = step as u32 * 256 / display_slots as u32;
+                        let inverse = 256 - blend;
+                        let mut interpolated = vec![0u8; expected_len];
+                        for index in 0..expected_len {
+                            interpolated[index] = ((previous[index] as u32 * inverse
+                                + pixels[index] as u32 * blend)
+                                >> 8) as u8;
+                        }
+                        self.present_pixels_prepared(interpolated, width, height);
+                    }
+                    self.note_frame_generation_cost(now.elapsed());
+                }
+                self.present_pixels_prepared(pixels.clone(), width, height);
+                self.frame_generation_state.previous = Some(pixels);
+                return;
+            }
+        }
+        if let Some(mut wgpu) = self.wgpu_presentation.take() {
+            match wgpu.present_pixels(&pixels, width, height, bottom_up) {
+                Ok(()) => {
+                    self.wgpu_presentation = Some(wgpu);
+                    return;
+                }
+                Err(error) => {
+                    log!("WGPU presentation failed; returning to the SDL swap path: {error}");
+                }
+            }
+        }
+        self.frame_generation_state.previous = None;
+        self.frame_generation_state.last_frame_at = None;
+        self.wgpu_presentation = None;
+        self.window.gl_swap_window();
+    }
+
+    /// Blit display-oriented pixels (already rotated by
+    /// [Self::prepare_native_frame]) to the window surface via SDL without
+    /// applying the presentation transform again. This is the default-backend
+    /// presentation path for frame generation on the GPU readback routes.
+    fn present_pixels_prepared(&mut self, pixels: Vec<u8>, width: u32, height: u32) {
+        if width == 0 || height == 0 || pixels.len() < width as usize * height as usize * 4 {
+            return;
+        }
+        let mut source_pixels = pixels;
+        let source = match Surface::from_data(
+            &mut source_pixels,
+            width,
+            height,
+            width * 4,
+            PixelFormatEnum::RGBA32,
+        ) {
+            Ok(surface) => surface,
+            Err(error) => {
+                log!("Could not create software presentation surface: {error}");
+                return;
+            }
+        };
+        let (x, y, target_width, target_height) = self.viewport();
+        let mut target = match self.window.surface(&self.event_pump) {
+            Ok(surface) => surface,
+            Err(error) => {
+                log!("Could not access software presentation target: {error}");
+                return;
+            }
+        };
+        if let Err(error) = target.fill_rect(None, Color::BLACK) {
+            log!("Could not clear software presentation target: {error}");
+            return;
+        }
+        if let Err(error) = source.blit_scaled(
+            None,
+            &mut *target,
+            Some(sdl2::rect::Rect::new(
+                x as i32,
+                y as i32,
+                target_width,
+                target_height,
+            )),
+        ) {
+            log!("Could not scale software presentation frame: {error}");
+            return;
+        }
+        if let Err(error) = target.update_window() {
+            log!("Could not update software presentation target: {error}");
+        }
+    }
+
+    fn present_software_pixels(
+        &mut self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        bottom_up: bool,
+    ) {
+        if width == 0 || height == 0 || pixels.len() < width as usize * height as usize * 4 {
+            return;
+        }
+        let mut source_pixels = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..height as usize {
+            let source_y = if bottom_up {
+                height as usize - 1 - y
+            } else {
+                y
+            };
+            let source = source_y * width as usize * 4;
+            let destination = y * width as usize * 4;
+            source_pixels[destination..destination + width as usize * 4]
+                .copy_from_slice(&pixels[source..source + width as usize * 4]);
+        }
+
+        let (mut source_pixels, source_width, source_height) = transform_software_pixels(
+            source_pixels,
+            width,
+            height,
+            self.presentation_quarter_turns(),
+            self.revert_x_axis,
+            self.revert_y_axis,
+        );
+        let source = match Surface::from_data(
+            &mut source_pixels,
+            source_width,
+            source_height,
+            source_width * 4,
+            PixelFormatEnum::RGBA32,
+        ) {
+            Ok(surface) => surface,
+            Err(error) => {
+                log!("Could not create software presentation surface: {}", error);
+                return;
+            }
+        };
+        let (x, y, target_width, target_height) = self.viewport();
+        let mut target = match self.window.surface(&self.event_pump) {
+            Ok(surface) => surface,
+            Err(error) => {
+                log!("Could not access software presentation target: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = target.fill_rect(None, Color::BLACK) {
+            log!("Could not clear software presentation target: {}", error);
+            return;
+        }
+        if let Err(error) = source.blit_scaled(
+            None,
+            &mut *target,
+            Some(sdl2::rect::Rect::new(
+                x as i32,
+                y as i32,
+                target_width,
+                target_height,
+            )),
+        ) {
+            log!("Could not scale software presentation frame: {}", error);
+            return;
+        }
+        if let Err(error) = target.update_window() {
+            log!("Could not update software presentation target: {}", error);
+        }
+    }
+
+    fn present_software_image(&mut self, pixels: Vec<u8>, width: u32, height: u32) {
+        self.present_software_pixels(pixels, width, height, false);
     }
 
     fn display_splash(&mut self) {
         assert!(self.splash_image.is_some());
 
         let image = self.splash_image.as_ref().unwrap();
+        if self.software_presentation {
+            let (width, height) = image.dimensions();
+            self.present_software_image(image.pixels().to_vec(), width, height);
+            return;
+        }
+
         let (image_width, image_height) = image.dimensions();
 
         // Legacy iPhone landscape launch images are stored in a portrait-sized
@@ -2299,9 +3397,9 @@ impl Window {
         let rotation = if self.splash_image_is_orientation_specific {
             Matrix::identity()
         } else if is_landscape && image_height > image_width {
-            self.rotation_matrix().inverse().unwrap()
+            self.presentation_matrix().inverse().unwrap()
         } else {
-            self.rotation_matrix()
+            self.presentation_matrix()
         };
 
         // OpenGL ES expects bottom-to-top row order for image data, but our
@@ -2316,7 +3414,14 @@ impl Window {
                 .as_mut()
                 .unwrap()
                 .make_current_unchecked_for_window(
-                    &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
+                    &mut |gl_ctx| {
+                        if let Err(error) = self.window.gl_make_current(&gl_ctx.0) {
+                            log_once_fmt!(
+                                "Unable to reactivate the EGL context for splash rendering ({}); skipping the rebind",
+                                error
+                            );
+                        }
+                    },
                     &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
                 );
 
@@ -2366,7 +3471,9 @@ impl Window {
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
     pub fn swap_window(&mut self) {
-        self.window.gl_swap_window();
+        if !self.software_presentation {
+            self.window.gl_swap_window();
+        }
         self.perf_hints.frame_presented();
 
         // FPS logging / UI: count frames and print once per second if enabled.
@@ -2391,15 +3498,44 @@ impl Window {
                 // Also show FPS in the window title so it's visible when the
                 // app is running fullscreen or without console.
                 let base_title = if crate::branding().is_empty() {
-                    format!("MetalHLE 2.0 {}", crate::VERSION)
+                    format!("MetalHLE 1.0 {}", crate::VERSION)
                 } else {
-                    format!("MetalHLE 2.0 {} {}", crate::branding(), crate::VERSION)
+                    format!("MetalHLE 1.0 {} {}", crate::branding(), crate::VERSION)
                 };
                 let title = format!("{} - FPS: {:.1}", base_title, fps);
                 // Ignore any error setting the title.
                 let _ = self.window.set_title(&title);
             }
         }
+    }
+
+    pub fn present_compatibility_frame(&mut self, clear_color: [f32; 4]) {
+        if self.software_presentation {
+            let color = Color::RGBA(
+                (clear_color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (clear_color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (clear_color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                (clear_color[3].clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            let mut surface = self.window.surface(&self.event_pump).unwrap();
+            surface.fill_rect(None, color).unwrap();
+            surface.update_window().unwrap();
+            return;
+        }
+        let (x, y, width, height) = self.viewport();
+        let mut gl = self.make_internal_gl_ctx_current();
+        unsafe {
+            gl.Viewport(x as _, y as _, width as _, height as _);
+            gl.ClearColor(
+                clear_color[0],
+                clear_color[1],
+                clear_color[2],
+                clear_color[3],
+            );
+            gl.Clear(crate::gles::gles11_raw::COLOR_BUFFER_BIT);
+        }
+        drop(gl);
+        self.swap_window();
     }
 
     /// Consider the emulated device to be rotated to a particular orientation.
@@ -2491,53 +3627,38 @@ impl Window {
         self.device_orientation
     }
 
+    /// Rotation applied to rendered content without changing the device orientation or window bounds.
+    pub fn render_rotation(&self) -> crate::options::RenderRotation {
+        self.render_rotation
+    }
+
+    pub fn revert_x_axis(&self) -> bool {
+        self.revert_x_axis
+    }
+
+    pub fn revert_y_axis(&self) -> bool {
+        self.revert_y_axis
+    }
+
     /// Get the size in pixels of the window without rotation or scaling.
     ///
     /// The aspect ratio, scale and orientation reflect the guest app's view of
     /// the world.
     pub fn size_unrotated_unscaled(&self) -> (u32, u32) {
-        size_for_orientation_from_size(
-            self.screen_size(),
-            DeviceOrientation::Portrait,
-            NonZeroU32::new(1).unwrap(),
-        )
+        size_for_orientation_from_size(self.screen_size(), DeviceOrientation::Portrait, 1.0)
     }
 
-    /// Get the region of the on-screen window (x, y, width, height) used to
-    /// display the app content.
-    ///
-    /// The aspect ratio of this region always reflects the guest app's view of
-    /// the world, but the scale and orientation might not.
-    pub fn viewport(&self) -> (u32, u32, u32, u32) {
-        let (app_width, app_height) = size_for_orientation_from_size(
-            self.screen_size(),
-            self.device_orientation,
-            self.scale_hack,
-        );
-        // Preserve the macOS resize workaround in rotate_device(), which
-        // positions an app-sized viewport using viewport_y_offset().
-        #[cfg(target_os = "macos")]
-        if !self.fullscreen {
-            return (0, 0, app_width, app_height);
-        }
-
-        // Fit the actual drawable in windowed mode too: the compositor may
-        // resize the window or give it more pixels than its logical size.
-        geometry::fit_viewport((app_width, app_height), self.window.drawable_size())
+    pub fn framebuffer_size(&self) -> (u32, u32) {
+        size_for_orientation_from_size(self.screen_size(), self.device_orientation, self.scale_hack)
     }
-
-    /// SDL mouse coordinates must use the same pixel space as the viewport.
-    fn mouse_drawable_coords(&self, (x, y): (i32, i32)) -> (f32, f32) {
-        geometry::window_to_drawable(
-            (x as f32, y as f32),
-            self.window.size(),
-            self.window.drawable_size(),
-        )
+    pub fn drawable_size(&self) -> (u32, u32) {
+        self.window.drawable_size()
     }
 
     /// Map a guest-space `CGRect` (points, possibly rotated/letterboxed) to
     /// host window pixels `(x, y, w, h)` for host-side overlays (native
-    /// Android webviews etc.). Returns `w`/`h` of 0 when nothing is visible.
+    /// Android webviews etc.). Ported from HyperHLE. Returns `w`/`h` of 0
+    /// when nothing is visible.
     pub fn guest_frame_to_window_px(
         &self,
         frame: crate::frameworks::core_graphics::CGRect,
@@ -2553,25 +3674,25 @@ impl Window {
         // Rotate the guest rect into the device orientation, then scale to
         // viewport pixels (mirrors the composition rotation).
         let (x, y, w, h) = match self.device_orientation {
-            crate::window::DeviceOrientation::Portrait => (
+            DeviceOrientation::Portrait => (
                 frame.origin.x as f32,
                 frame.origin.y as f32,
                 frame.size.width as f32,
                 frame.size.height as f32,
             ),
-            crate::window::DeviceOrientation::PortraitUpsideDown => (
+            DeviceOrientation::PortraitUpsideDown => (
                 app_w - frame.origin.x as f32 - frame.size.width as f32,
                 app_h - frame.origin.y as f32 - frame.size.height as f32,
                 frame.size.width as f32,
                 frame.size.height as f32,
             ),
-            crate::window::DeviceOrientation::LandscapeLeft => (
+            DeviceOrientation::LandscapeLeft => (
                 frame.origin.y as f32,
                 app_w - frame.origin.x as f32 - frame.size.width as f32,
                 frame.size.height as f32,
                 frame.size.width as f32,
             ),
-            crate::window::DeviceOrientation::LandscapeRight => (
+            DeviceOrientation::LandscapeRight => (
                 app_h - frame.origin.y as f32 - frame.size.height as f32,
                 frame.origin.x as f32,
                 frame.size.height as f32,
@@ -2583,6 +3704,41 @@ impl Window {
         let pw = (w * sx).round() as i32;
         let ph = (h * sy).round() as i32;
         (px, py, pw.max(0), ph.max(0))
+    }
+
+    pub fn is_software_presentation(&self) -> bool {
+        self.software_presentation
+    }
+
+    pub fn is_frame_generation_enabled(&self) -> bool {
+        self.frame_generation
+    }
+
+    pub fn display_refresh_rate(&self) -> f64 {
+        self.display_refresh_rate
+    }
+
+    /// Get the region of the on-screen window (x, y, width, height) used to
+    /// display the app content.
+    ///
+    /// The aspect ratio of this region always reflects the guest app's view of
+    /// the world, but the scale and orientation might not.
+    pub fn viewport(&self) -> (u32, u32, u32, u32) {
+        if self.fullscreen_stretched {
+            let (screen_width, screen_height) = self.window.drawable_size();
+            return (0, 0, screen_width, screen_height);
+        }
+        let (app_width, app_height) = size_for_orientation_from_size(
+            self.screen_size(),
+            self.device_orientation,
+            self.scale_hack,
+        );
+        if !self.fullscreen && !Self::rotatable_fullscreen() {
+            return (0, 0, app_width, app_height);
+        }
+
+        let (screen_width, screen_height) = self.window.drawable_size();
+        calculate_letterboxed_viewport(app_width, app_height, screen_width, screen_height)
     }
 
     /// Special offset to add to y co-ordinates, only when drawing to screen.
@@ -2605,6 +3761,51 @@ impl Window {
             DeviceOrientation::LandscapeLeft => Matrix::z_rotation(-FRAC_PI_2),
             DeviceOrientation::LandscapeRight => Matrix::z_rotation(FRAC_PI_2),
         }
+    }
+
+    /// Transform an already-rendered game-space image for final display only.
+    /// Guest matrices and viewports never use this transform.
+    pub fn presentation_matrix(&self) -> Matrix<2> {
+        let render_rotation = match self.render_rotation {
+            RenderRotation::Default => Matrix::identity(),
+            RenderRotation::Minus90 => Matrix::z_rotation(-FRAC_PI_2),
+            RenderRotation::Minus180 | RenderRotation::Plus180 => Matrix::z_rotation(PI),
+            RenderRotation::Plus90 => Matrix::z_rotation(FRAC_PI_2),
+        };
+        let axis_revert = Matrix::scale_2d(
+            if self.revert_x_axis { -1.0 } else { 1.0 },
+            if self.revert_y_axis { -1.0 } else { 1.0 },
+        );
+        self.rotation_matrix()
+            .multiply(&render_rotation)
+            .multiply(&axis_revert)
+    }
+
+    /// Presentation transform for GUEST-AUTHORED content (UIKit layer trees,
+    /// EAGL renderbuffers).
+    ///
+    /// DEPRECATED: this used to mirror the landscape quarter-turn (drop the
+    /// device turn for guest content) to fix one game's menu; that mis-rotated
+    /// every landscape game by 90 degrees, so it now simply forwards to
+    /// [Self::presentation_matrix] — the HyperHLE-proven single pipeline.
+    pub fn guest_content_presentation_matrix(&self) -> Matrix<2> {
+        self.presentation_matrix()
+    }
+
+    fn presentation_quarter_turns(&self) -> i32 {
+        let device_turns: i32 = match self.device_orientation {
+            DeviceOrientation::Portrait => 0,
+            DeviceOrientation::LandscapeRight => 1,
+            DeviceOrientation::PortraitUpsideDown => 2,
+            DeviceOrientation::LandscapeLeft => 3,
+        };
+        let render_turns: i32 = match self.render_rotation {
+            RenderRotation::Default => 0,
+            RenderRotation::Minus90 => 3,
+            RenderRotation::Minus180 | RenderRotation::Plus180 => 2,
+            RenderRotation::Plus90 => 1,
+        };
+        (device_turns + render_turns).rem_euclid(4)
     }
 
     pub fn is_screen_saver_enabled(&self) -> bool {
@@ -2640,24 +3841,6 @@ impl Window {
         }
     }
 
-    pub fn is_text_input_active(&self) -> bool {
-        if !self.on_main_stack {
-            log!("Warning: is_text_input_active called off main stack, returning false");
-            return false;
-        }
-        unsafe { sdl2_sys::SDL_IsTextInputActive() == sdl2_sys::SDL_bool::SDL_TRUE }
-    }
-
-    pub fn is_screen_keyboard_shown(&self) -> bool {
-        if !self.on_main_stack {
-            log!("Warning: is_screen_keyboard_shown called off main stack, returning false");
-            return false;
-        }
-        unsafe {
-            sdl2_sys::SDL_IsScreenKeyboardShown(self.window.raw()) == sdl2_sys::SDL_bool::SDL_TRUE
-        }
-    }
-
     pub fn on_main_stack(&self) -> bool {
         self.on_main_stack
     }
@@ -2672,41 +3855,42 @@ impl Window {
 }
 
 pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
-    // On Android prefer our own JNI path to the system browser: SDL's
-    // SDL_OpenURL goes through SDLActivity.openURL, which works, but doing
-    // it directly keeps the intent flags predictable and avoids issues when
-    // the app process is paused on return. Non-Android platforms keep using
-    // SDL_OpenURL (desktop shell handlers).
     #[cfg(target_os = "android")]
     {
-        if crate::android_web_view::open_url_external(url) {
-            return Ok(());
+        let command = match url {
+            "touchhle://game-folder" => Some(GAME_FOLDER_COMMAND),
+            "touchhle://custom-driver" => Some(CUSTOM_DRIVER_COMMAND),
+            _ => None,
+        };
+        if let Some(command) = command {
+            let result = env
+                .on_parent_stack_in_coroutine(|_, _| unsafe { SDL_AndroidSendMessage(command, 0) });
+            if result == 0 {
+                return Ok(());
+            }
+            return Err(format!(
+                "Android picker command failed with return code {result}"
+            ));
         }
     }
     env.on_parent_stack_in_coroutine(|_, _| sdl2::url::open_url(url).map_err(|e| e.to_string()))
 }
 
-/// SDL COMMAND_USER value used to ask MainActivity to open the system file
-/// picker for adding an .ipa file. Must be >= 0x8000 (see SDLActivity.java).
 #[cfg(target_os = "android")]
 const ADD_IPA_COMMAND: u32 = 0x8000;
-
-// SDL_AndroidSendMessage is only available in SDL builds for Android.
 #[cfg(target_os = "android")]
-extern "C" {
+const PERFORMANCE_MODE_COMMAND: u32 = 0x8001;
+#[cfg(target_os = "android")]
+const GAME_FOLDER_COMMAND: u32 = 0x8002;
+#[cfg(target_os = "android")]
+const CUSTOM_DRIVER_COMMAND: u32 = 0x8003;
+
+#[cfg(target_os = "android")]
+unsafe extern "C" {
     fn SDL_AndroidSendMessage(command: u32, param: i32) -> i32;
 }
 
-/// Ask the Java side to open the system file picker for adding an .ipa file
-/// (see MainActivity.onUnhandledMessage). On other platforms, fall back to
-/// opening the apps directory in the file manager.
-///
-/// Unlike [open_url], this never opens a URL, so it is safe to call from the
-/// app picker without risking a failed system intent.
 pub fn launch_ipa_picker(env: &mut Environment) -> Result<(), String> {
-    // Like other SDL calls from the app picker, this must run on the main
-    // stack (see on_parent_stack_in_coroutine), otherwise Android can
-    // misbehave or crash.
     let result = env.on_parent_stack_in_coroutine(|_, _| {
         #[cfg(target_os = "android")]
         {
@@ -2720,15 +3904,8 @@ pub fn launch_ipa_picker(env: &mut Environment) -> Result<(), String> {
     if result == 0 {
         return Ok(());
     }
-    // Fall back to opening the apps directory in the file manager, so a
-    // .ipa file can still be added manually.
-    match crate::paths::url_for_opening_apps_dir() {
-        Ok(url) => open_url(env, &url),
-        Err(e) => Err(format!(
-            "SDL_AndroidSendMessage returned {result}, and opening the \
-             apps directory failed too: {e}"
-        )),
-    }
+    let url = crate::paths::url_for_opening_apps_dir()?;
+    open_url(env, &url)
 }
 
 /// Show an SDL messagebox for an error (typically after a panic).
@@ -2745,7 +3922,7 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 0,
-            text: "Open MetalHLE directory",
+            text: "Open touchHLE directory",
         },
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
@@ -2757,13 +3934,13 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
     let Ok(clicked_button) = messagebox::show_message_box(
         messagebox::MessageBoxFlag::ERROR,
         &mbox,
-        "MetalHLE 2.0 crashed!",
-        &format!("MetalHLE 2.0 crashed with the following error: {error_message}"),
+        "touchHLE crashed!",
+        &format!("MetalHLE 1.0 crashed with the following error: {error_message}"),
         window.map(|win| &win.window),
         None,
     ) else {
         log!("Warning: Failed to show error message box; falling back to stderr only.");
-        eprintln!("MetalHLE 2.0 crashed: {}", error_message);
+        eprintln!("touchHLE crashed: {}", error_message);
         return;
     };
 
@@ -2800,38 +3977,13 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
 /// - pct: i32 - percentage of battery remaining.
 /// - status: [BatteryState] - the current status of the battery
 ///   (unplugged, charging, full, etc.)
-/// Battery state cached once at window creation. Guest code runs on a
-/// coroutine stack where JNI calls abort on Android (see populate_battery_cache),
-/// so [UIDevice batteryLevel] must never reach SDL_GetPowerInfo directly.
-static BATTERY_CACHE: std::sync::OnceLock<(i32, BatteryState)> = std::sync::OnceLock::new();
-
-/// Read the battery once, from the real SDLThread stack. JNI (Android) is only
-/// safe here — this runs before guest emulation starts on a coroutine stack.
-pub fn populate_battery_cache() {
-    let mut pct = 0;
-    let status = unsafe { sdl2_sys::SDL_GetPowerInfo(null_mut(), &mut pct) };
-    let state = match status {
-        SDL_PowerState::SDL_POWERSTATE_UNKNOWN => BatteryState::Unknown,
-        SDL_PowerState::SDL_POWERSTATE_ON_BATTERY => BatteryState::OnBattery,
-        SDL_PowerState::SDL_POWERSTATE_NO_BATTERY => BatteryState::NoBattery,
-        SDL_PowerState::SDL_POWERSTATE_CHARGING => BatteryState::Charging,
-        SDL_PowerState::SDL_POWERSTATE_CHARGED => BatteryState::Full,
-    };
-    let _ = BATTERY_CACHE.set((pct, state));
-}
-
 pub fn get_battery_status() -> (i32, BatteryState) {
-    if let Some(&(pct, ref state)) = BATTERY_CACHE.get() {
-        let state = match *state {
-            BatteryState::Unknown => BatteryState::Unknown,
-            BatteryState::OnBattery => BatteryState::OnBattery,
-            BatteryState::NoBattery => BatteryState::NoBattery,
-            BatteryState::Charging => BatteryState::Charging,
-            BatteryState::Full => BatteryState::Full,
-        };
-        return (pct, state);
+    if env::consts::OS == "android" {
+        log_once!(
+            "Warning: get_battery_status on Android, returning fully charged to avoid SDL crash"
+        );
+        return (100, BatteryState::Full);
     }
-    // Not cached yet (headless/window-less use): query directly.
     let mut pct = 0;
     // Unfortunately, Rust-SDL2 does not expose this function yet.
     // iPhoneOS does not measure the battery in seconds remaining,
@@ -2915,4 +4067,39 @@ pub fn show_alert_dialog(
             _ => 0,
         }
     })
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::{calculate_letterboxed_viewport, transform_software_pixels};
+
+    #[test]
+    fn portrait_game_is_letterboxed_inside_landscape_drawable() {
+        assert_eq!(
+            calculate_letterboxed_viewport(320, 480, 3088, 1440),
+            (1064, 0, 960, 1440)
+        );
+    }
+
+    #[test]
+    fn output_rotation_preserves_pixels_and_swaps_dimensions() {
+        let pixels = vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
+        let (rotated, width, height) = transform_software_pixels(pixels, 2, 2, 1, false, false);
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            rotated,
+            vec![3, 0, 0, 255, 1, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn output_axis_reverts_are_applied_before_rotation() {
+        let pixels = vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
+        let (flipped, width, height) = transform_software_pixels(pixels, 2, 2, 0, true, false);
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            flipped,
+            vec![2, 0, 0, 255, 1, 0, 0, 255, 4, 0, 0, 255, 3, 0, 0, 255]
+        );
+    }
 }

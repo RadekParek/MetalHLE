@@ -12,7 +12,11 @@ use super::cg_color_space::{
     kCGColorSpaceModelCMYK, kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB,
     CGColorSpaceHostObject, CGColorSpaceRef,
 };
-use super::cg_context::{CGContextHostObject, CGContextRef, CGContextSubclass};
+use super::cg_context::{
+    kCGBlendModeClear, kCGBlendModeCopy, kCGBlendModeDarken, kCGBlendModeLighten,
+    kCGBlendModeMultiply, kCGBlendModeNormal, kCGBlendModeScreen, CGContextHostObject,
+    CGContextRef, CGContextSubclass,
+};
 use super::cg_image::{
     self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
     kCGImageAlphaNone, kCGImageAlphaNoneSkipFirst, kCGImageAlphaNoneSkipLast, kCGImageAlphaOnly,
@@ -95,11 +99,6 @@ pub fn CGBitmapContextCreate(
         transform: CGAffineTransformIdentity,
         text_transform: None,
         rgb_fill_color: (0.0, 0.0, 0.0, 1.0),
-        fill_color_space_model: match color_space_name {
-            kCGColorSpaceGenericGray => kCGColorSpaceModelMonochrome,
-            kCGColorSpaceGenericCMYK => kCGColorSpaceModelCMYK,
-            _ => kCGColorSpaceModelRGB,
-        },
         rgb_stroke_color: (0.0, 0.0, 0.0, 1.0),
         alpha: 1.0,
         line_width: 1.0,
@@ -107,7 +106,12 @@ pub fn CGBitmapContextCreate(
         line_join: 0,
         miter_limit: 10.0,
         flatness: 0.0,
-        blend_mode: 0,
+        fill_color_space_model: match color_space_name {
+            kCGColorSpaceGenericGray => kCGColorSpaceModelMonochrome,
+            kCGColorSpaceGenericCMYK => kCGColorSpaceModelCMYK,
+            _ => kCGColorSpaceModelRGB,
+        },
+        blend_mode: kCGBlendModeNormal,
         interpolation_quality: 2,
         // Quartz's default font state.
         font: crate::mem::Ptr::null(),
@@ -280,7 +284,17 @@ fn blend_alpha(bg: f32, fg: f32) -> f32 {
     fg + bg * (1.0 - fg)
 }
 
-fn blend_straight(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+fn blend_straight(
+    bg: (f32, f32, f32, f32),
+    fg: (f32, f32, f32, f32),
+    blend_mode: i32,
+) -> (f32, f32, f32, f32) {
+    if blend_mode == kCGBlendModeCopy {
+        return fg;
+    }
+    if blend_mode == kCGBlendModeClear {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
     if fg.3 == 0.0 {
         bg
     } else {
@@ -294,11 +308,50 @@ fn blend_straight(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f32, f
     }
 }
 
-fn blend_premultiplied(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+fn blend_premultiplied(
+    bg: (f32, f32, f32, f32),
+    fg: (f32, f32, f32, f32),
+    blend_mode: i32,
+) -> (f32, f32, f32, f32) {
+    // kCGBlendModeCopy replaces the destination with the source unmodified.
+    if blend_mode == kCGBlendModeCopy {
+        return fg;
+    }
+    // kCGBlendModeClear erases the destination.
+    if blend_mode == kCGBlendModeClear {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    // Blend (premultiplied components; see the W3C compositing spec).
+    let blend_res = match blend_mode {
+        kCGBlendModeNormal => (bg.3 * fg.0, bg.3 * fg.1, bg.3 * fg.2),
+        kCGBlendModeMultiply => (bg.0 * fg.0, bg.1 * fg.1, bg.2 * fg.2),
+        kCGBlendModeScreen => (
+            fg.3 * bg.0 + bg.3 * fg.0 - bg.0 * fg.0,
+            fg.3 * bg.1 + bg.3 * fg.1 - bg.1 * fg.1,
+            fg.3 * bg.2 + bg.3 * fg.2 - bg.2 * fg.2,
+        ),
+        kCGBlendModeDarken => (
+            (fg.3 * bg.0).min(bg.3 * fg.0),
+            (fg.3 * bg.1).min(bg.3 * fg.1),
+            (fg.3 * bg.2).min(bg.3 * fg.2),
+        ),
+        kCGBlendModeLighten => (
+            (fg.3 * bg.0).max(bg.3 * fg.0),
+            (fg.3 * bg.1).max(bg.3 * fg.1),
+            (fg.3 * bg.2).max(bg.3 * fg.2),
+        ),
+        kCGBlendModeClear => (0.0, 0.0, 0.0),
+        // Modes that MetalHLE does not model yet fall back to Normal so
+        // drawing still produces sensible output instead of nothing.
+        _ => (bg.3 * fg.0, bg.3 * fg.1, bg.3 * fg.2),
+    };
+    // Compose
+    let neg_bg_a = 1.0 - bg.3;
+    let neg_fg_a = 1.0 - fg.3;
     (
-        fg.0 + bg.0 * (1.0 - fg.3),
-        fg.1 + bg.1 * (1.0 - fg.3),
-        fg.2 + bg.2 * (1.0 - fg.3),
+        fg.0 * neg_bg_a + blend_res.0 + bg.0 * neg_fg_a,
+        fg.1 * neg_bg_a + blend_res.1 + bg.1 * neg_fg_a,
+        fg.2 * neg_bg_a + blend_res.2 + bg.2 * neg_fg_a,
         blend_alpha(bg.3, fg.3),
     )
 }
@@ -361,6 +414,7 @@ fn put_pixel(
     coords: (i32, i32),
     pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
     blend: bool,
+    blend_mode: i32,
 ) {
     let (x, y) = coords;
     if x < 0 || y < 0 {
@@ -378,9 +432,9 @@ fn put_pixel(
     let bg_pixel = get_pixel(data, pixels, first_component_idx);
     let (r, g, b, a) = if blend {
         match data.alpha_info {
-            kCGImageAlphaLast | kCGImageAlphaFirst => blend_straight(bg_pixel, pixel),
+            kCGImageAlphaLast | kCGImageAlphaFirst => blend_straight(bg_pixel, pixel, blend_mode),
             kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => {
-                blend_premultiplied(bg_pixel, pixel)
+                blend_premultiplied(bg_pixel, pixel, blend_mode)
             }
             kCGImageAlphaOnly => (pixel.0, pixel.1, pixel.2, blend_alpha(bg_pixel.3, pixel.3)),
             _ => pixel,
@@ -409,6 +463,7 @@ pub struct CGBitmapContextDrawer<'a> {
     bitmap_info: CGBitmapContextData,
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     transform: CGAffineTransform,
+    blend_mode: i32,
     pixels: &'a mut [u8],
 }
 impl CGBitmapContextDrawer<'_> {
@@ -421,6 +476,7 @@ impl CGBitmapContextDrawer<'_> {
             subclass: CGContextSubclass::CGBitmapContext(bitmap_info),
             rgb_fill_color,
             transform,
+            blend_mode,
             ..
         } = objc.borrow(context);
         let pixels = get_pixels(&bitmap_info, mem);
@@ -429,6 +485,7 @@ impl CGBitmapContextDrawer<'_> {
             bitmap_info,
             rgb_fill_color,
             transform,
+            blend_mode,
             pixels,
         }
     }
@@ -459,7 +516,7 @@ impl CGBitmapContextDrawer<'_> {
         color: (CGFloat, CGFloat, CGFloat, CGFloat),
         blend: bool,
     ) {
-        put_pixel(&self.bitmap_info, self.pixels, coords, color, blend)
+        put_pixel(&self.bitmap_info, self.pixels, coords, color, blend, self.blend_mode)
     }
 
     /// Convert a straight sRGB source into the representation used by this

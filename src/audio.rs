@@ -9,7 +9,6 @@
 
 mod caf_decoder;
 mod ima4;
-pub mod music_bypass;
 pub mod openal;
 pub mod symphonia_formats;
 
@@ -118,26 +117,8 @@ impl AudioFile {
         path: P,
         fs: &Fs,
     ) -> Result<Self, AudioFileOpenError> {
-        let bytes = match fs.read(path.as_ref()) {
-            Ok(bytes) => bytes,
-            Err(()) => {
-                // Guests (or bundled middleware) sometimes hardcode asset
-                // paths whose layout only matches the original device's
-                // flattened bundle; e.g. ObjectAL music tracks built as
-                // `<bundle>/music2.mp3` while the file ships in a
-                // subdirectory. Try the lenient basename scan before
-                // giving up, mirroring NSBundle's last-resort fallback.
-                let Some(resolved) = fs.resolve_lenient_path(path.as_ref()) else {
-                    return Err(AudioFileOpenError::FileReadError);
-                };
-                log!(
-                    "AudioFile: {:?} not found; lenient resolution -> {:?}",
-                    path.as_ref(),
-                    resolved
-                );
-                fs.read(&resolved)
-                    .map_err(|_| AudioFileOpenError::FileReadError)?
-            }
+        let Ok(bytes) = fs.read(path.as_ref()) else {
+            return Err(AudioFileOpenError::FileReadError);
         };
         if let Ok(file) = Self::read_from_vec(bytes) {
             Ok(file)
@@ -156,17 +137,6 @@ impl AudioFile {
             raw_data: std::sync::Arc::new(bytes),
             inner,
         })
-    }
-
-    /// Fully decodes the file to 16-bit little-endian interleaved PCM for the
-    /// host-side music bypass. Returns `(pcm_bytes, sample_rate, channels)`,
-    /// or `None` for formats the bypass can't hand to OpenAL as-is (Wave and
-    /// AAC use dedicated readers rather than the generic Symphonia path).
-    pub fn into_decoded_pcm(self) -> Option<(Vec<u8>, u32, u32)> {
-        match self.inner {
-            AudioFileInner::Symphonia(pcm) => Some((pcm.bytes, pcm.sample_rate, pcm.channels)),
-            _ => None,
-        }
     }
 
     // Extracted parse_inner to fix E0599 and removed duplicate read_from_vec

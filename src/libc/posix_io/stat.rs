@@ -66,37 +66,10 @@ fn mkdir(env: &mut Environment, path: ConstPtr<u8>, mode: mode_t) -> i32 {
 
     // Безопасное чтение пути, чтобы избежать panic через unwrap()
     let path_str = match env.mem.cstr_at_utf8(path) {
-        Ok(s) => {
-            // Collapse doubled separators (`a//b` -> `a/b`). Some guests build
-            // paths by joining a directory that already ends in `/` with a
-            // sub-path, producing `//`. Previously mkdir bailed out with a fake
-            // `return 0` on any `//` path (the "XaView BypassMkdirLoop" hack),
-            // which stopped one game's retry loop but meant the directory was
-            // never actually created. Minecraft PE relies on mkdir of such a
-            // `//` path (e.g. `minecraftWorlds//<id>/db/db`) genuinely creating
-            // the directory before it opens LevelDB files inside it, so the
-            // fake-success caused world creation to fail with "cannot open".
-            // Normalising and then really creating the directory satisfies both
-            // cases: the retry loop stops (mkdir succeeds) and the directory
-            // exists.
-            let mut collapsed = String::with_capacity(s.len());
-            let mut prev_slash = false;
-            for c in s.chars() {
-                if c == '/' {
-                    if !prev_slash {
-                        collapsed.push(c);
-                    }
-                    prev_slash = true;
-                } else {
-                    collapsed.push(c);
-                    prev_slash = false;
-                }
-            }
-            collapsed
-        }
+        Ok(s) => s.to_string(), // Отвязываем от заимствования env.mem (как в функции stat ниже)
         Err(_) => {
             set_errno(env, ENOENT);
-            return 0;
+            return -1;
         }
     };
 
@@ -234,7 +207,7 @@ fn fstat(env: &mut Environment, fd: FileDescriptor, buf: MutPtr<stat>) -> i32 {
     result
 }
 
-pub(crate) fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
+fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
     set_errno(env, 0);
     if path.is_null() {
         set_errno(env, ENOENT);
@@ -251,16 +224,24 @@ pub(crate) fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>)
         }
     };
 
-    // Unity normally probes its player archive with `stat` before it calls
-    // `open`.  Use the same case-insensitive and bundle-relative resolution as
-    // open(), including stale absolute .app paths, so a successful probe cannot
-    // disagree with the later file open.
-    let Some(resolved_path) = super::resolve_existing_guest_path(env, &path_str) else {
-        env.note_missing_unity_player_archive(&path_str);
-        set_errno(env, ENOENT);
-        return -1;
+    let resolved_path = if !path_str.starts_with('/') && !env.fs.exists(GuestPath::new(&path_str)) {
+        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+        let relative = path_str.strip_prefix("Data/").unwrap_or(&path_str);
+        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
+        let candidate = format!("{bundle_root}/Data/{relative}");
+        if env.fs.exists(GuestPath::new(&candidate)) {
+            candidate
+        } else {
+            path_str.clone()
+        }
+    } else {
+        path_str.clone()
     };
     let guest_path = GuestPath::new(&resolved_path);
+    if !env.fs.exists(guest_path) {
+        set_errno(env, ENOENT);
+        return -1;
+    }
 
     let mut st = stat::default();
 
@@ -272,23 +253,10 @@ pub(crate) fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>)
         st.st_nlink = 1;
     }
 
-    match env.fs.size(guest_path) {
-        Ok(size) => {
-            // A zero-byte data.unity3d is just as unusable as a missing one.
-            // This happens when a corrupt IPA entry could be listed but not
-            // decompressed. Record it before Unity reaches fatal exit().
-            if size == 0 {
-                env.note_missing_unity_player_archive(&path_str);
-            }
-            st.st_size = size as off_t;
-            st.st_blksize = 4096;
-            st.st_blocks = size.div_ceil(512) as blkcnt_t;
-        }
-        Err(()) => {
-            // Preserve the historical best-effort stat result while ensuring
-            // an unreadable mandatory Unity archive cannot be frame-recovered.
-            env.note_missing_unity_player_archive(&path_str);
-        }
+    if let Ok(size) = env.fs.size(guest_path) {
+        st.st_size = size as off_t;
+        st.st_blksize = 4096;
+        st.st_blocks = size.div_ceil(512) as blkcnt_t;
     }
 
     if let Ok(mtime) = env.fs.modified(guest_path) {

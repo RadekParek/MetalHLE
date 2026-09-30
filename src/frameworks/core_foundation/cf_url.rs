@@ -10,24 +10,23 @@
 //! This is toll-free bridged to `NSURL` in Apple's implementation. Here it is
 //! the same type.
 use super::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
+use super::cf_array::CFArrayRef;
+use super::cf_data::CFDataRef;
+use super::cf_dictionary::CFDictionaryRef;
 use super::{CFIndex, CFRelease, CFRetain};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
-use crate::frameworks::core_foundation::cf_data;
 use crate::frameworks::core_foundation::cf_string::{
     kCFStringEncodingUTF8, CFStringConvertEncodingToNSStringEncoding, CFStringEncoding, CFStringRef,
 };
 use crate::frameworks::foundation::ns_string::{
     from_rust_string, get_static_str, to_rust_string, NSUTF8StringEncoding,
 };
-use crate::frameworks::foundation::ns_property_list_serialization;
 use crate::frameworks::foundation::NSUInteger;
-use crate::mem::{ConstPtr, GuestUSize, MutPtr};
+use crate::mem::{ConstPtr, MutPtr};
 use crate::objc::{id, msg, msg_class, nil, release, retain};
 use crate::Environment;
 
 pub type CFURLRef = super::CFTypeRef;
-
-type SInt32 = i32;
 
 // Path styles
 type CFURLPathStyle = CFIndex;
@@ -821,26 +820,26 @@ fn CFURLGetBytes(
         return -1;
     }
 
-    // Get the UTF-8 byte count from the string itself instead of scanning
-    // guest memory byte by byte for the NUL terminator, which could run away
-    // if the terminator were ever missing.
-    let length: NSUInteger = msg![env; url_string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-    // Keep room for the NUL terminator within CFIndex (i32) arithmetic.
-    let length: CFIndex = length.min((CFIndex::MAX - 1) as NSUInteger) as CFIndex;
-
-    // Apple's CFURL.h: if `buffer` is non-NULL but too small to hold the
-    // bytes plus a NUL terminator, the function must return -1 rather than
-    // silently truncating. Callers pass a NULL buffer (or length 0) to query
-    // the required size.
-    if !buffer.is_null() {
-        if buffer_length < length + 1 {
-            return -1;
+    // Calculate length
+    let mut length: CFIndex = 0;
+    loop {
+        // Приведение типа к u32
+        if env.mem.read(c_string + (length as u32)) == 0 {
+            break;
         }
-        let src = env.mem.bytes_at(c_string, length as GuestUSize).to_vec();
-        env.mem
-            .bytes_at_mut(buffer, length as GuestUSize)
-            .copy_from_slice(&src);
-        env.mem.write(buffer + length as GuestUSize, 0u8);
+        length += 1;
+    }
+
+    if !buffer.is_null() && buffer_length > 0 {
+        let copy_length = length.min(buffer_length - 1);
+        for i in 0..copy_length {
+            // Разделение read/write во избежание двойного заимствования
+            let byte = env.mem.read(c_string + (i as u32));
+            env.mem.write(buffer + (i as u32), byte);
+        }
+        // Приведение типа к u32
+        env.mem.write(buffer + (copy_length as u32), 0);
+        // Null terminate
     }
 
     length
@@ -923,62 +922,22 @@ fn CFURLGetByteRangeForComponent(
 
 // MARK: - Percent Escaping
 
-// Decodes every `%XX` percent escape in `original`, per the documented
-// behaviour of `CFURLCreateStringByReplacingPercentEscapesUsingEncoding`:
-// each escape is replaced by the corresponding character, escapes for
-// characters listed in `characters_to_leave_escaped` are left intact, and
-// invalid or incomplete escape sequences make the function return NULL.
-// Passing an empty string as `characters_to_leave_escaped` removes all
-// percent escapes.
-// https://developer.apple.com/documentation/corefoundation/1541961-cfurlcreatestringbyreplacingpercente
-fn decode_percent_escapes(original: &str, leave_escaped: Option<&str>) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(original.len());
-    let src = original.as_bytes();
-    let mut i = 0;
-    while i < src.len() {
-        if src[i] != b'%' {
-            out.push(src[i]);
-            i += 1;
-            continue;
-        }
-        let (Some(&high), Some(&low)) = (src.get(i + 1), src.get(i + 2)) else {
-            log_dbg!(
-                "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: {:?} has an \
-                 incomplete percent escape at byte {}",
-                original,
-                i
-            );
-            return None;
-        };
-        let hex_value = |digit: u8| -> Option<u8> {
-            match digit {
-                b'0'..=b'9' => Some(digit - b'0'),
-                b'a'..=b'f' => Some(digit - b'a' + 10),
-                b'A'..=b'F' => Some(digit - b'A' + 10),
-                _ => None,
-            }
-        };
-        let (Some(high), Some(low)) = (hex_value(high), hex_value(low)) else {
-            log_dbg!(
-                "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: {:?} has an \
-                 invalid percent escape at byte {}",
-                original,
-                i
-            );
-            return None;
-        };
-        let decoded = (high << 4) | low;
-        let should_leave = leave_escaped.is_some_and(|chars| chars.contains(decoded as char));
-        if should_leave {
-            out.push(b'%');
-            out.push(src[i + 1]);
-            out.push(src[i + 2]);
-        } else {
-            out.push(decoded);
-        }
-        i += 3;
+fn CFURLCreateStringByReplacingPercentEscapes(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    original_string: CFStringRef,
+    _characters_to_leave_escaped: CFStringRef,
+) -> CFStringRef {
+    if !validate_allocator(env, allocator) {
+        return nil;
     }
-    Some(out)
+
+    if original_string.is_null() {
+        return nil;
+    }
+
+    log!("TODO: CFURLCreateStringByReplacingPercentEscapes is stubbed to prevent crash");
+    msg![env; original_string copy]
 }
 
 fn CFURLCreateStringByReplacingPercentEscapesUsingEncoding(
@@ -992,55 +951,24 @@ fn CFURLCreateStringByReplacingPercentEscapesUsingEncoding(
         return nil;
     }
 
-    if original_string.is_null() {
-        return nil;
-    }
-
-    let original = to_rust_string(env, original_string);
-    let leave_escaped = if characters_to_leave_escaped.is_null() {
-        None
-    } else {
-        Some(to_rust_string(env, characters_to_leave_escaped).into_owned())
-    };
-
-    let Some(decoded) = decode_percent_escapes(&original, leave_escaped.as_deref()) else {
-        return nil;
-    };
-
     if encoding == kCFStringEncodingUTF8 {
-        let Ok(decoded) = String::from_utf8(decoded) else {
-            log_dbg!(
-                "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: decoded bytes are \
-                 not valid UTF-8, returning NULL"
-            );
-            return nil;
-        };
-        return from_rust_string(env, decoded);
+        return CFURLCreateStringByReplacingPercentEscapes(
+            env,
+            allocator,
+            original_string,
+            characters_to_leave_escaped,
+        );
     }
 
-    // For the single-byte CFString encodings of the iPhone OS era (MacRoman,
-    // Windows Latin 1, ISO Latin 1) each decoded byte maps directly to the
-    // character it names in that encoding.
-    log_dbg!(
-        "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: treating decoded bytes \
-         as single-byte encoding {:#x}",
+    log!(
+        "TODO: Percent escape replacement with encoding {:#x}",
         encoding
     );
-    from_rust_string(env, decoded.into_iter().map(|byte| byte as char).collect())
-}
-
-fn CFURLCreateStringByReplacingPercentEscapes(
-    env: &mut Environment,
-    allocator: CFAllocatorRef,
-    original_string: CFStringRef,
-    characters_to_leave_escaped: CFStringRef,
-) -> CFStringRef {
-    CFURLCreateStringByReplacingPercentEscapesUsingEncoding(
+    CFURLCreateStringByReplacingPercentEscapes(
         env,
         allocator,
         original_string,
         characters_to_leave_escaped,
-        kCFStringEncodingUTF8,
     )
 }
 
@@ -1139,145 +1067,44 @@ fn CFURLCreateStringByAddingPercentEscapes(
     from_rust_string(env, result)
 }
 
-// MARK: - Type Info
-
-fn CFURLGetTypeID(_env: &mut Environment) -> u32 {
-    // Return a fake CFTypeID for CFURL
-    0x4346554C // 'CFUL' in hex
-}
-
-// MARK: - Resource access (CFURLAccess.h)
-
-/// `Boolean CFURLCreateDataAndPropertiesFromResource(CFAllocatorRef alloc,
-///     CFURLRef url, CFDataRef *data, CFDictionaryRef *properties,
-///     CFTypeRef desiredProperties, SInt32 *errorCode)`
-///
-/// Legacy CFURLAccess API: loads a resource's bytes and/or a dictionary of
-/// its properties. Chrome uses it (via its plist/XML glue) to read local
-/// files referenced by `file://` URLs.
-///
-/// - `data` (optional) receives the resource contents as a CFData.
-/// - `properties` (optional) receives a dictionary with the properties named
-///   in `desiredProperties` (or all known ones when it is NULL): we support
-///   `kCFURLFileLength` (kCFURLFileLengthKey → kCFURLFileLength), the one
-///   property Chrome actually consults.
-/// - `errorCode` (optional) receives `kCFURLSuccess` (0) or `kCFURLUnknownError` (-10).
-#[allow(clippy::too_many_arguments)]
 fn CFURLCreateDataAndPropertiesFromResource(
     env: &mut Environment,
-    _allocator: crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef,
+    allocator: CFAllocatorRef,
     url: CFURLRef,
-    data: MutPtr<cf_data::CFDataRef>,
-    properties: MutPtr<id>,
-    _desired_properties: super::CFTypeRef,
-    error_code: MutPtr<SInt32>,
+    resource_data: MutPtr<CFDataRef>,
+    properties: MutPtr<CFDictionaryRef>,
+    _desired_properties: CFArrayRef,
+    error_code: MutPtr<CFIndex>,
 ) -> bool {
-    const K_CF_URL_SUCCESS: SInt32 = 0;
-    const K_CF_URL_UNKNOWN_ERROR: SInt32 = -10;
-
-    if url.is_null() {
+    if !validate_allocator(env, allocator) || url.is_null() {
         if !error_code.is_null() {
-            env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
+            env.mem.write(error_code, -15);
         }
         return false;
     }
 
-    // Get the file-system path for the URL.
-    const PATH_MAX: GuestUSize = 4096;
-    let path_buf: MutPtr<u8> = env.mem.alloc(PATH_MAX).cast();
-    let ok: bool = msg![env; url getFileSystemRepresentation:path_buf maxLength:PATH_MAX];
-    let path = if ok {
-        let cstr = env.mem.cstr_at_utf8(path_buf);
-        cstr.ok().map(|s| s.to_owned())
-    } else {
-        None
-    };
-    env.mem.free(path_buf.cast());
-
-    let Some(path) = path else {
+    let data: id = msg_class![env; NSData dataWithContentsOfURL:url];
+    if data.is_null() {
         if !error_code.is_null() {
-            env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
+            env.mem.write(error_code, -12);
         }
         return false;
-    };
-
-    let file_len = std::fs::metadata(&path).map(|m| m.len()).ok();
-
-    if !data.is_null() {
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let length: CFIndex = bytes.len() as CFIndex;
-                let bytes_ptr = env.mem.alloc(bytes.len().max(1) as GuestUSize);
-                env.mem
-                    .bytes_at_mut(bytes_ptr.cast(), bytes.len() as GuestUSize)
-                    .copy_from_slice(&bytes);
-                let cf_data =
-                    cf_data::CFDataCreate(
-                        env,
-                        super::cf_allocator::kCFAllocatorDefault,
-                        bytes_ptr.cast::<u8>().cast_const(),
-                        length,
-                    );
-                env.mem.write(data, cf_data);
-            }
-            Err(err) => {
-                log_dbg!("CFURLCreateDataAndPropertiesFromResource: couldn't read {:?}: {}", path, err);
-                if !error_code.is_null() {
-                    env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
-                }
-                return false;
-            }
-        }
     }
 
+    if !resource_data.is_null() {
+        let retained = retain(env, data);
+        env.mem.write(resource_data, retained);
+    }
     if !properties.is_null() {
-        let mut dict: id = msg_class![env; NSMutableDictionary dictionary];
-        if let Some(len) = file_len {
-            let key = get_static_str(env, "NSURLFileSize");
-            let len_i64 = len as i64;
-            let number: id = msg_class![env; NSNumber alloc];
-            let number: id = msg![env; number initWithLongLong:len_i64];
-            let _prev: () = msg![env; dict setObject:number forKey:key];
-            let _ = dict;
-        }
-        env.mem.write(properties, dict);
+        env.mem.write(properties, nil);
     }
-
     if !error_code.is_null() {
-        env.mem.write(error_code, K_CF_URL_SUCCESS);
+        env.mem.write(error_code, 0);
     }
     true
 }
 
-
-// MARK: - CFPropertyList (CFPropertyList.h subset)
-
-/// `CFPropertyListRef CFPropertyListCreateFromXMLData(CFAllocatorRef allocator,
-///     CFDataRef xmlData, CFOptionFlags options, CFStringRef *errorString)`
-///
-/// Legacy CoreFoundation API: deserialize XML plist bytes into a property
-/// list object. Chrome calls this while parsing local files (via the
-/// CFURLAccess path). `options` uses the CF mutability flags, which have the
-/// same numeric values as `NSPropertyListMutabilityOptions`.
-fn CFPropertyListCreateFromXMLData(
-    env: &mut Environment,
-    _allocator: crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef,
-    xml_data: crate::frameworks::core_foundation::cf_data::CFDataRef,
-    options: crate::frameworks::foundation::NSUInteger,
-    error_string: MutPtr<id>,
-) -> id {
-    let result = ns_property_list_serialization::cf_property_list_create_from_xml_data(
-        env,
-        xml_data,
-        options,
-    );
-    if !error_string.is_null() {
-        // Apple leaves the error string untouched on success; write NULL for
-        // determinism either way (callers only read it on failure).
-        env.mem.write(error_string, nil);
-    }
-    result
-}
+// MARK: - Type Info
 
 // MARK: - Exports
 
@@ -1285,9 +1112,6 @@ pub const FUNCTIONS: FunctionExports = &[
     // Retain/Release
     export_c_func!(CFURLRetain(_)),
     export_c_func!(CFURLRelease(_)),
-    // Resource access (CFURLAccess.h, deprecated by Apple but used by apps)
-    export_c_func!(CFURLCreateDataAndPropertiesFromResource(_, _, _, _, _, _)),
-    export_c_func!(CFPropertyListCreateFromXMLData(_, _, _, _)),
     // File System Representation
     export_c_func!(CFURLGetFileSystemRepresentation(_, _, _, _)),
     export_c_func!(CFURLCreateFromFileSystemRepresentation(_, _, _, _)),
@@ -1300,6 +1124,7 @@ pub const FUNCTIONS: FunctionExports = &[
     )),
     // Home directory
     export_c_func!(CFCopyHomeDirectoryURL()),
+    export_c_func!(CFURLCreateDataAndPropertiesFromResource(_, _, _, _, _, _)),
     // Creation
     export_c_func!(CFURLCreateWithBytes(_, _, _, _, _)),
     export_c_func!(CFURLCreateWithString(_, _, _)),

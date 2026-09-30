@@ -16,13 +16,13 @@
 //! main loop thread, where `&mut Mem` is available.
 
 use crate::font::{Font, TextAlignment};
-use crate::guest_clock::Speed;
 use crate::gles::gles11_raw as gles11;
-use crate::gles::{GLES, GLint, GLuint};
-use crate::trainer::{SearchResult, VType};
+use crate::gles::gles11_raw::types::{GLboolean, GLenum, GLint, GLsizei, GLuint, GLvoid};
+use crate::gles::GLES;
+use crate::trainer::classify::ResultFilter;
 use crate::trainer::watch::{Change, WatchFilter};
+use crate::trainer::{SearchResult, VType};
 use std::collections::VecDeque;
-use crate::trainer::classify::{Category, ResultFilter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -32,23 +32,46 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Debug)]
 pub enum TrainerCmd {
-    Search { vtype: VType, text: String },
-    Refine { vtype: VType, text: String },
+    Search {
+        vtype: VType,
+        text: String,
+    },
+    Refine {
+        vtype: VType,
+        text: String,
+    },
     Reset,
-    Set { vtype: VType, text: String },
-    WatchSet { addr: u32, vtype: VType, text: String },
-    SetAll { vtype: VType, text: String, confirm: bool, safe_mode: bool, filter: ResultFilter },
+    Set {
+        vtype: VType,
+        text: String,
+    },
+    WatchSet {
+        addr: u32,
+        vtype: VType,
+        text: String,
+    },
+    SetAll {
+        vtype: VType,
+        text: String,
+        confirm: bool,
+        safe_mode: bool,
+        filter: ResultFilter,
+    },
     CancelBulk,
     RefreshView,
     InspectSelection,
     Mark,
     Compare(WatchFilter),
     ClearActivity,
-    Freeze { vtype: VType, text: String },
+    Freeze {
+        vtype: VType,
+        text: String,
+    },
     UnfreezeAll,
     Dump,
-    SaveHack { vtype: VType },
-    ApplyHack { addr: u32, vtype: VType, bits: u64 },
+    SaveHack {
+        vtype: VType,
+    },
 }
 
 static COMMANDS: Mutex<Vec<TrainerCmd>> = Mutex::new(Vec::new());
@@ -85,10 +108,6 @@ struct TrainerUi {
     bulk_preview: bool,
     /// Latched preference for this session, not the current touch state.
     safe_mode: bool,
-    /// Latched StoreKit IAP emulation (Lucky Patcher-style free in-app buys).
-    iap: bool,
-    speed: Speed,
-    speed_dirty: bool,
     /// Widget id pressed but not yet released (pending activation).
     pending: Option<u16>,
     watch_open: bool,
@@ -126,21 +145,26 @@ impl TrainerUi {
             ResultFilter::All => results.len(),
             ResultFilter::Category(c) => self.category_counts[c.index()],
         };
-        self.scroll = self.scroll.min(self.filtered_results.saturating_sub(RESULT_ROWS));
-        self.results = results.iter()
+        self.scroll = self
+            .scroll
+            .min(self.filtered_results.saturating_sub(RESULT_ROWS));
+        self.results = results
+            .iter()
             .filter(|r| self.filter.matches(r.analysis.category))
-            .skip(self.scroll).take(RESULT_ROWS).copied().collect();
-        if self.selected.is_some() && !self.results.iter().any(|r| {
-            Some(r.addr) == self.selected && Some(r.vtype) == self.selected_type
-        }) {
+            .skip(self.scroll)
+            .take(RESULT_ROWS)
+            .copied()
+            .collect();
+        if self.selected.is_some()
+            && !self
+                .results
+                .iter()
+                .any(|r| Some(r.addr) == self.selected && Some(r.vtype) == self.selected_type)
+        {
             self.status = "SELECTION LEFT CURRENT PAGE".to_string();
             self.selected = None;
             self.selected_type = None;
         }
-    }
-
-    fn take_speed_request(&mut self) -> Option<Speed> {
-        std::mem::take(&mut self.speed_dirty).then_some(self.speed)
     }
 
     const fn new() -> TrainerUi {
@@ -164,11 +188,6 @@ impl TrainerUi {
             frozen_count: 0,
             bulk_preview: false,
             safe_mode: true,
-            // Cannot read the environment in this const context; the env
-            // default is picked up lazily by the activation toggle.
-            iap: false,
-            speed: Speed::Normal,
-            speed_dirty: false,
             pending: None,
             watch_open: false,
             watch_paused: false,
@@ -216,8 +235,6 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.status.clear();
     ui.frozen_count = 0;
     ui.bulk_preview = false;
-    ui.speed = Speed::Normal;
-    ui.speed_dirty = false;
     ui.pending = None;
     ui.watch_open = false;
     ui.watch_target = None;
@@ -239,7 +256,9 @@ pub fn publish_live_values(results: &[SearchResult]) {
 pub fn publish_activity(changes: &VecDeque<Change>, changed: usize, tracked: usize) {
     let mut ui = UI.lock().unwrap();
     // Do not let a live reorder replace the row under the user's finger.
-    let pressing_row = ui.pending.is_some_and(|id| (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id));
+    let pressing_row = ui
+        .pending
+        .is_some_and(|id| (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id));
     if !ui.watch_paused && !pressing_row {
         ui.activity_scroll = 0;
         ui.activity = changes.iter().copied().collect();
@@ -262,17 +281,16 @@ pub fn watch_target() -> Option<(u32, VType)> {
 
 pub fn publish_watch_value(target: (u32, VType), value: Option<u64>) {
     let mut ui = UI.lock().unwrap();
-    if ui.watch_target == Some(target) { ui.watch_current = value; }
+    if ui.watch_target == Some(target) {
+        ui.watch_current = value;
+    }
 }
 
 pub fn publish_watch_status(target: (u32, VType), status: String) {
     let mut ui = UI.lock().unwrap();
-    if ui.watch_target == Some(target) { ui.watch_status = status; }
-}
-
-/// Consumed by Environment, which owns the per-app guest clock.
-pub fn take_speed_request() -> Option<Speed> {
-    UI.lock().unwrap().take_speed_request()
+    if ui.watch_target == Some(target) {
+        ui.watch_status = status;
+    }
 }
 
 pub fn take_commands() -> Vec<TrainerCmd> {
@@ -285,7 +303,11 @@ pub fn publish_results(results: &[SearchResult], _total: usize) {
 
 pub fn selected_result_type(addr: u32) -> Option<VType> {
     let ui = UI.lock().unwrap();
-    if ui.selected == Some(addr) { ui.selected_type } else { None }
+    if ui.selected == Some(addr) {
+        ui.selected_type
+    } else {
+        None
+    }
 }
 
 pub fn publish_status(status: String) {
@@ -322,9 +344,6 @@ const W_UNFREEZE: u16 = 11;
 const W_SET_ALL: u16 = 12;
 const W_DUMP: u16 = 16;
 const W_SAFE_MODE: u16 = 17;
-const W_SPEED_DOWN: u16 = 18;
-const W_SPEED_RESET: u16 = 19;
-const W_SPEED_UP: u16 = 20;
 const W_CATEGORY: u16 = 21;
 const W_WATCH: u16 = 22;
 const W_MARK: u16 = 23;
@@ -338,7 +357,6 @@ const W_DECREASED: u16 = 27;
 const W_WATCH_PAUSE: u16 = 28;
 const W_WATCH_CLEAR: u16 = 29;
 const W_WATCH_CLOSE: u16 = 30;
-const W_IAP: u16 = 31;
 const W_WATCH_NEWER: u16 = 45;
 const W_WATCH_OLDER: u16 = 46;
 const W_WATCH_FIELD: u16 = 47;
@@ -400,10 +418,17 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     // drawing by (vx, vy), and the touch handlers subtract it before
     // hit-testing. Adding the origin here would double it (panel shifted
     // by the letterbox offset, tap targets misaligned with drawn keys).
-    let (_vx, _vy, vw, vh) = viewport;
+    let (_, _, vw, vh) = viewport;
     let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
-    // Fit the complete panel, including speed controls, in both orientations.
-    let s = (vh / 545.0).min(vw / if ui.watch_open && ui.open { 600.0 } else { 320.0 }).clamp(0.1, 4.0);
+    let s = (vh / 495.0)
+        .min(
+            vw / if ui.watch_open && ui.open {
+                600.0
+            } else {
+                320.0
+            },
+        )
+        .clamp(0.1, 4.0);
     let btn = 30.0 * s;
     let button = Rect {
         x: vx + vw - btn - 6.0 * s,
@@ -421,27 +446,48 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         let key_h = 24.0 * s;
         let mut widgets = Vec::new();
         let mut y = py + 3.0 * s;
-        let mut push_widget = |id: u16, wx: f32, wy: f32, ww: f32, wh: f32, widgets: &mut Vec<(u16, Rect)>| {
-            widgets.push((id, Rect { x: wx, y: wy, w: ww, h: wh }));
-        };
+        let push_widget =
+            |id: u16, wx: f32, wy: f32, ww: f32, wh: f32, widgets: &mut Vec<(u16, Rect)>| {
+                widgets.push((
+                    id,
+                    Rect {
+                        x: wx,
+                        y: wy,
+                        w: ww,
+                        h: wh,
+                    },
+                ));
+            };
         // Header row (title + close button).
-        push_widget(W_CLOSE, px + pw - small_h - 4.0 * s, y, small_h, small_h, &mut widgets);
+        push_widget(
+            W_CLOSE,
+            px + pw - small_h - 4.0 * s,
+            y,
+            small_h,
+            small_h,
+            &mut widgets,
+        );
         y += small_h + 3.0 * s;
         // Type and latched safe-mode toggle share a row.
         push_widget(W_TYPE, px + 6.0 * s, y, 110.0 * s, row_h, &mut widgets);
-        push_widget(W_SAFE_MODE, px + 120.0 * s, y, pw - 126.0 * s, row_h, &mut widgets);
-        y += row_h + 3.0 * s;
-        // Game speed: minus, current value (tap to reset), plus.
-        let speed_side = 38.0 * s;
-        push_widget(W_SPEED_DOWN, px + 6.0 * s, y, speed_side, row_h, &mut widgets);
-        push_widget(W_SPEED_RESET, px + 48.0 * s, y, pw - 96.0 * s, row_h, &mut widgets);
-        push_widget(W_SPEED_UP, px + pw - 44.0 * s, y, speed_side, row_h, &mut widgets);
-        y += row_h + 3.0 * s;
-        // Latched IAP emulation toggle (StoreKit free in-app purchases).
-        push_widget(W_IAP, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
+        push_widget(
+            W_SAFE_MODE,
+            px + 120.0 * s,
+            y,
+            pw - 126.0 * s,
+            row_h,
+            &mut widgets,
+        );
         y += row_h + 3.0 * s;
         // Search value field.
-        push_widget(W_FIELD_SEARCH, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
+        push_widget(
+            W_FIELD_SEARCH,
+            px + 6.0 * s,
+            y,
+            pw - 12.0 * s,
+            row_h,
+            &mut widgets,
+        );
         y += row_h + 3.0 * s;
         // Keypad: 4 columns x 4 rows.
         let key_w = (pw - 12.0 * s) / 4.0;
@@ -466,49 +512,120 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         // Actions row.
         let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
         for (i, id) in [W_SEARCH, W_REFINE, W_RESET].iter().enumerate() {
-            push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
+            push_widget(
+                *id,
+                px + 6.0 * s + (third + 4.0 * s) * i as f32,
+                y,
+                third,
+                row_h,
+                &mut widgets,
+            );
         }
         y += row_h + 3.0 * s;
         // Explicit before/after comparison: independent of live refresh.
         let fifth = (pw - 12.0 * s - 8.0 * s) / 5.0;
-        for (i, id) in [W_MARK, W_CHANGED, W_SAME, W_INCREASED, W_DECREASED].iter().enumerate() {
-            push_widget(*id, px + 6.0 * s + (fifth + 2.0 * s) * i as f32, y, fifth, row_h, &mut widgets);
+        for (i, id) in [W_MARK, W_CHANGED, W_SAME, W_INCREASED, W_DECREASED]
+            .iter()
+            .enumerate()
+        {
+            push_widget(
+                *id,
+                px + 6.0 * s + (fifth + 2.0 * s) * i as f32,
+                y,
+                fifth,
+                row_h,
+                &mut widgets,
+            );
         }
         y += row_h + 3.0 * s;
         // Category selector: guesses always keep a question mark.
-        push_widget(W_CATEGORY, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
+        push_widget(
+            W_CATEGORY,
+            px + 6.0 * s,
+            y,
+            pw - 12.0 * s,
+            row_h,
+            &mut widgets,
+        );
         y += row_h + 3.0 * s;
         // Results header + scroll buttons.
         let results_header_y = y;
         let res_h = 16.0 * s;
-        push_widget(W_SCROLL_UP, px + pw - 2.0 * (res_h + 3.0 * s), y, res_h, res_h, &mut widgets);
-        push_widget(W_SCROLL_DOWN, px + pw - res_h - 3.0 * s, y, res_h, res_h, &mut widgets);
+        push_widget(
+            W_SCROLL_UP,
+            px + pw - 2.0 * (res_h + 3.0 * s),
+            y,
+            res_h,
+            res_h,
+            &mut widgets,
+        );
+        push_widget(
+            W_SCROLL_DOWN,
+            px + pw - res_h - 3.0 * s,
+            y,
+            res_h,
+            res_h,
+            &mut widgets,
+        );
         y += res_h + 2.0 * s;
         // Result rows.
         for i in 0..RESULT_ROWS {
-            push_widget(W_RESULT_BASE + i as u16, px + 6.0 * s, y, pw - 12.0 * s, res_h, &mut widgets);
+            push_widget(
+                W_RESULT_BASE + i as u16,
+                px + 6.0 * s,
+                y,
+                pw - 12.0 * s,
+                res_h,
+                &mut widgets,
+            );
             y += res_h;
         }
         y += 3.0 * s;
         // Set value field.
-        push_widget(W_FIELD_SET, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
+        push_widget(
+            W_FIELD_SET,
+            px + 6.0 * s,
+            y,
+            pw - 12.0 * s,
+            row_h,
+            &mut widgets,
+        );
         y += row_h + 3.0 * s;
         // Set / set-all / freeze row.
         let quarter = (pw - 12.0 * s - 12.0 * s) / 4.0;
         for (i, id) in [W_SET, W_SET_ALL, W_FREEZE, W_UNFREEZE].iter().enumerate() {
-            push_widget(*id, px + 6.0 * s + (quarter + 4.0 * s) * i as f32, y, quarter, row_h, &mut widgets);
+            push_widget(
+                *id,
+                px + 6.0 * s + (quarter + 4.0 * s) * i as f32,
+                y,
+                quarter,
+                row_h,
+                &mut widgets,
+            );
         }
         y += row_h + 3.0 * s;
         // Activity window with inline editing, plus dump/save.
         let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
         for (i, id) in [W_DUMP, W_SAVE, W_WATCH].iter().enumerate() {
-            push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
+            push_widget(
+                *id,
+                px + 6.0 * s + (third + 4.0 * s) * i as f32,
+                y,
+                third,
+                row_h,
+                &mut widgets,
+            );
         }
         y += row_h + 3.0 * s;
         // Status line (not interactive).
         let ph = y + small_h + 3.0 * s - py;
         Some(PanelLayout {
-            rect: Rect { x: px, y: py, w: pw, h: ph },
+            rect: Rect {
+                x: px,
+                y: py,
+                w: pw,
+                h: ph,
+            },
             widgets,
             results_header_y,
         })
@@ -518,44 +635,110 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     let monitor = if ui.watch_open {
         // A compact independent window leaves the rest of the game touchable.
         // Beside the editor when it is open; larger when watching the game.
-        let ms = if ui.open { s } else { (vw / 300.0).min(vh / 480.0).clamp(0.1, 2.0) };
-        let height = if ui.watch_target.is_some() { 428.0 } else { 218.0 };
-        let rect = Rect { x: 6.0 * ms, y: 42.0 * ms, w: 280.0 * ms, h: height * ms };
+        let ms = if ui.open {
+            s
+        } else {
+            (vw / 300.0).min(vh / 480.0).clamp(0.1, 2.0)
+        };
+        let height = if ui.watch_target.is_some() {
+            428.0
+        } else {
+            218.0
+        };
+        let rect = Rect {
+            x: 6.0 * ms,
+            y: 42.0 * ms,
+            w: 280.0 * ms,
+            h: height * ms,
+        };
         let mut widgets = Vec::new();
-        for (i, id) in [W_WATCH_PAUSE, W_WATCH_CLEAR, W_WATCH_CLOSE].iter().enumerate() {
-            widgets.push((*id, Rect { x: rect.x + (128.0 + i as f32 * 48.0) * ms,
-                y: rect.y + 3.0 * ms, w: 46.0 * ms, h: 23.0 * ms }));
+        for (i, id) in [W_WATCH_PAUSE, W_WATCH_CLEAR, W_WATCH_CLOSE]
+            .iter()
+            .enumerate()
+        {
+            widgets.push((
+                *id,
+                Rect {
+                    x: rect.x + (128.0 + i as f32 * 48.0) * ms,
+                    y: rect.y + 3.0 * ms,
+                    w: 46.0 * ms,
+                    h: 23.0 * ms,
+                },
+            ));
         }
         for row in 0..RESULT_ROWS {
-            widgets.push((W_CHANGE_BASE + row as u16, Rect { x: rect.x + 4.0 * ms,
-                y: rect.y + (42.0 + row as f32 * 29.0) * ms,
-                w: rect.w - 8.0 * ms, h: 28.0 * ms }));
+            widgets.push((
+                W_CHANGE_BASE + row as u16,
+                Rect {
+                    x: rect.x + 4.0 * ms,
+                    y: rect.y + (42.0 + row as f32 * 29.0) * ms,
+                    w: rect.w - 8.0 * ms,
+                    h: 28.0 * ms,
+                },
+            ));
         }
         for (i, id) in [W_WATCH_NEWER, W_WATCH_OLDER].iter().enumerate() {
-            widgets.push((*id, Rect { x: rect.x + (4.0 + i as f32 * 138.0) * ms,
-                y: rect.y + 190.0 * ms, w: 134.0 * ms, h: 23.0 * ms }));
+            widgets.push((
+                *id,
+                Rect {
+                    x: rect.x + (4.0 + i as f32 * 138.0) * ms,
+                    y: rect.y + 190.0 * ms,
+                    w: 134.0 * ms,
+                    h: 23.0 * ms,
+                },
+            ));
         }
         if ui.watch_target.is_some() {
             for (id, x, width) in [(W_WATCH_FIELD, 4.0, 198.0), (W_WATCH_SET, 206.0, 70.0)] {
-                widgets.push((id, Rect { x: rect.x + x * ms, y: rect.y + 242.0 * ms,
-                    w: width * ms, h: 24.0 * ms }));
+                widgets.push((
+                    id,
+                    Rect {
+                        x: rect.x + x * ms,
+                        y: rect.y + 242.0 * ms,
+                        w: width * ms,
+                        h: 24.0 * ms,
+                    },
+                ));
             }
             for (row, keys) in KEYPAD.iter().enumerate() {
                 for (col, key) in keys.iter().enumerate() {
                     if key.is_some() {
-                        widgets.push((W_WATCH_KEY_BASE + (row * 4 + col) as u16,
-                            Rect { x: rect.x + (4.0 + col as f32 * 68.0) * ms,
+                        widgets.push((
+                            W_WATCH_KEY_BASE + (row * 4 + col) as u16,
+                            Rect {
+                                x: rect.x + (4.0 + col as f32 * 68.0) * ms,
                                 y: rect.y + (270.0 + row as f32 * 26.0) * ms,
-                                w: 66.0 * ms, h: 24.0 * ms }));
+                                w: 66.0 * ms,
+                                h: 24.0 * ms,
+                            },
+                        ));
                     }
                 }
             }
-            widgets.push((W_WATCH_DONE, Rect { x: rect.x + 4.0 * ms,
-                y: rect.y + 378.0 * ms, w: 272.0 * ms, h: 23.0 * ms }));
+            widgets.push((
+                W_WATCH_DONE,
+                Rect {
+                    x: rect.x + 4.0 * ms,
+                    y: rect.y + 378.0 * ms,
+                    w: 272.0 * ms,
+                    h: 23.0 * ms,
+                },
+            ));
         }
-        Some(PanelLayout { rect, widgets, results_header_y: rect.y + 28.0 * ms })
-    } else { None };
-    Layout { scale: s, button, panel, monitor }
+        Some(PanelLayout {
+            rect,
+            widgets,
+            results_header_y: rect.y + 28.0 * ms,
+        })
+    } else {
+        None
+    };
+    Layout {
+        scale: s,
+        button,
+        panel,
+        monitor,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -583,7 +766,9 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
         return true;
     }
     for panel in layout.panels() {
-        if !panel.rect.contains(x, y) { continue; }
+        if !panel.rect.contains(x, y) {
+            continue;
+        }
         for (id, rect) in &panel.widgets {
             if rect.contains(x, y) {
                 ui.pending = Some(*id);
@@ -598,7 +783,7 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     false
 }
 
-pub fn touch_motion(abs: (f32, f32), _viewport: (u32, u32, u32, u32)) -> bool {
+pub fn touch_motion(_abs: (f32, f32), _viewport: (u32, u32, u32, u32)) -> bool {
     if !overlay_active() {
         return false;
     }
@@ -626,7 +811,11 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     };
     // Activate if the finger is released over the same widget.
     let hit = pending == W_BUTTON && layout.button.contains(x, y)
-        || layout.panels().any(|p| p.widgets.iter().any(|(id, r)| *id == pending && r.contains(x, y)));
+        || layout.panels().any(|p| {
+            p.widgets
+                .iter()
+                .any(|(id, r)| *id == pending && r.contains(x, y))
+        });
     if hit {
         activate_widget(&mut ui, pending);
     }
@@ -653,7 +842,8 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             ui.activity_scroll = if id == W_WATCH_NEWER {
                 ui.activity_scroll.saturating_sub(RESULT_ROWS)
             } else {
-                (ui.activity_scroll + RESULT_ROWS).min(ui.activity.len().saturating_sub(RESULT_ROWS))
+                (ui.activity_scroll + RESULT_ROWS)
+                    .min(ui.activity.len().saturating_sub(RESULT_ROWS))
             };
         }
         W_WATCH_CLEAR => {
@@ -665,13 +855,18 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         W_MARK => COMMANDS.lock().unwrap().push(TrainerCmd::Mark),
         W_CHANGED | W_SAME | W_INCREASED | W_DECREASED => {
             let filter = match id {
-                W_CHANGED => WatchFilter::Changed, W_SAME => WatchFilter::Same,
-                W_INCREASED => WatchFilter::Increased, _ => WatchFilter::Decreased,
+                W_CHANGED => WatchFilter::Changed,
+                W_SAME => WatchFilter::Same,
+                W_INCREASED => WatchFilter::Increased,
+                _ => WatchFilter::Decreased,
             };
             COMMANDS.lock().unwrap().push(TrainerCmd::Compare(filter));
         }
         id if (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id) => {
-            if let Some(change) = ui.activity.get(ui.activity_scroll + (id - W_CHANGE_BASE) as usize) {
+            if let Some(change) = ui
+                .activity
+                .get(ui.activity_scroll + (id - W_CHANGE_BASE) as usize)
+            {
                 // Pin identity, not row index: subsequent live events cannot
                 // redirect the edit to a different address or AUTO alias.
                 ui.watch_target = Some((change.addr, change.vtype));
@@ -692,7 +887,9 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             if let Some((addr, vtype)) = ui.watch_target {
                 if ui.watch_current.is_some() {
                     COMMANDS.lock().unwrap().push(TrainerCmd::WatchSet {
-                        addr, vtype, text: ui.watch_text.trim().to_string(),
+                        addr,
+                        vtype,
+                        text: ui.watch_text.trim().to_string(),
                     });
                 } else {
                     ui.watch_status = "ADDRESS UNAVAILABLE: WAIT OR SEARCH AGAIN".to_string();
@@ -703,7 +900,9 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             let index = (id - W_WATCH_KEY_BASE) as usize;
             if let Some(ch) = KEYPAD[index / 4][index % 4] {
                 match ch {
-                    '\u{8}' => { ui.watch_text.pop(); }
+                    '\u{8}' => {
+                        ui.watch_text.pop();
+                    }
                     '\u{4}' => ui.watch_text.clear(),
                     _ if ui.watch_text.len() < 24 => ui.watch_text.push(ch),
                     _ => {}
@@ -718,25 +917,8 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
                 "SAFE MODE ON: FILTER BULK WRITES"
             } else {
                 "SAFE MODE OFF: EXTRA CRASH RISK"
-            }.to_string();
-        }
-        W_IAP => {
-            ui.iap = !ui.iap;
-            crate::frameworks::store_kit::set_emulation_enabled(ui.iap);
-            ui.status = if ui.iap {
-                "IN-APP ON: PURCHASES FREE"
-            } else {
-                "IN-APP OFF: STOCK STORE STUBS"
             }
             .to_string();
-        }
-        W_SPEED_DOWN | W_SPEED_RESET | W_SPEED_UP => {
-            ui.speed = match id {
-                W_SPEED_DOWN => ui.speed.step(false),
-                W_SPEED_UP => ui.speed.step(true),
-                _ => Speed::Normal,
-            };
-            ui.speed_dirty = true;
         }
         W_CATEGORY => {
             ui.filter = ui.filter.next();
@@ -755,39 +937,46 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         W_FIELD_SET => ui.focus = Focus::Set,
         W_SEARCH => {
             let text = ui.search_text.trim().to_string();
-            COMMANDS
-                .lock()
-                .unwrap()
-                .push(TrainerCmd::Search { vtype: ui.vtype, text });
+            COMMANDS.lock().unwrap().push(TrainerCmd::Search {
+                vtype: ui.vtype,
+                text,
+            });
         }
         W_REFINE => {
             let text = ui.search_text.trim().to_string();
-            COMMANDS
-                .lock()
-                .unwrap()
-                .push(TrainerCmd::Refine { vtype: ui.vtype, text });
+            COMMANDS.lock().unwrap().push(TrainerCmd::Refine {
+                vtype: ui.vtype,
+                text,
+            });
         }
         W_RESET => {
             COMMANDS.lock().unwrap().push(TrainerCmd::Reset);
         }
         W_SET => {
             let text = ui.set_text.trim().to_string();
-            COMMANDS.lock().unwrap().push(TrainerCmd::Set { vtype: ui.vtype, text });
+            COMMANDS.lock().unwrap().push(TrainerCmd::Set {
+                vtype: ui.vtype,
+                text,
+            });
         }
         W_SET_ALL => {
             let text = ui.set_text.trim().to_string();
             let confirm = ui.bulk_preview;
             ui.bulk_preview = false;
             COMMANDS.lock().unwrap().push(TrainerCmd::SetAll {
-                vtype: ui.vtype, text, confirm, safe_mode: ui.safe_mode, filter: ui.filter,
+                vtype: ui.vtype,
+                text,
+                confirm,
+                safe_mode: ui.safe_mode,
+                filter: ui.filter,
             });
         }
         W_FREEZE => {
             let text = ui.set_text.trim().to_string();
-            COMMANDS
-                .lock()
-                .unwrap()
-                .push(TrainerCmd::Freeze { vtype: ui.vtype, text });
+            COMMANDS.lock().unwrap().push(TrainerCmd::Freeze {
+                vtype: ui.vtype,
+                text,
+            });
         }
         W_UNFREEZE => {
             COMMANDS.lock().unwrap().push(TrainerCmd::UnfreezeAll);
@@ -796,7 +985,10 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             COMMANDS.lock().unwrap().push(TrainerCmd::Dump);
         }
         W_SAVE => {
-            COMMANDS.lock().unwrap().push(TrainerCmd::SaveHack { vtype: ui.vtype });
+            COMMANDS
+                .lock()
+                .unwrap()
+                .push(TrainerCmd::SaveHack { vtype: ui.vtype });
         }
         W_SCROLL_UP | W_SCROLL_DOWN => {
             let last = ui.filtered_results.saturating_sub(RESULT_ROWS);
@@ -815,7 +1007,11 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             if let Some(result) = ui.results.get(idx) {
                 ui.selected = Some(result.addr);
                 ui.selected_type = Some(result.vtype);
-                ui.status = format!("{}: {}", result.analysis.category.label(), result.analysis.description());
+                ui.status = format!(
+                    "{}: {}",
+                    result.analysis.category.label(),
+                    result.analysis.description()
+                );
                 COMMANDS.lock().unwrap().push(TrainerCmd::InspectSelection);
             }
         }
@@ -1016,10 +1212,26 @@ unsafe fn build_atlas(gles: &mut dyn GLES) -> Option<Atlas> {
         gles11::UNSIGNED_BYTE,
         bitmap.as_ptr() as *const _,
     );
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as _);
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, gles11::LINEAR as _);
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_MIN_FILTER,
+        gles11::LINEAR as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_MAG_FILTER,
+        gles11::LINEAR as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_S,
+        gles11::CLAMP_TO_EDGE as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_T,
+        gles11::CLAMP_TO_EDGE as _,
+    );
     Some(Atlas {
         tex,
         height: cell_h,
@@ -1075,10 +1287,26 @@ unsafe fn upload_atlas_texture(
         gles11::UNSIGNED_BYTE,
         bitmap.as_ptr() as *const _,
     );
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as _);
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, gles11::LINEAR as _);
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
-    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_MIN_FILTER,
+        gles11::LINEAR as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_MAG_FILTER,
+        gles11::LINEAR as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_S,
+        gles11::CLAMP_TO_EDGE as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_T,
+        gles11::CLAMP_TO_EDGE as _,
+    );
     tex
 }
 
@@ -1104,10 +1332,22 @@ fn quad_vertices(q: &Quad) -> [f32; 16] {
     let (u0, v0, u1, v1) = (q.u0, q.v0, q.u1, q.v1);
     // Interleaved pos(2) + uv(2), triangle strip: TL, BL, TR, BR.
     [
-        x, y, u0, v0,
-        x, y + h, u0, v1,
-        x + w, y, u1, v0,
-        x + w, y + h, u1, v1,
+        x,
+        y,
+        u0,
+        v0,
+        x,
+        y + h,
+        u0,
+        v1,
+        x + w,
+        y,
+        u1,
+        v0,
+        x + w,
+        y + h,
+        u1,
+        v1,
     ]
 }
 
@@ -1203,11 +1443,7 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
 
 /// Entry point for native OpenGL ES 2.0 present paths (see
 /// present_renderbuffer_es2), which lack the fixed-function pipeline.
-pub unsafe fn draw_es2(
-    gles: &mut dyn GLES,
-    viewport: (u32, u32, u32, u32),
-    context_token: usize,
-) {
+pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_token: usize) {
     // When the game switches EAGL contexts (e.g. between apps or between
     // context instances), all our cached GL objects (program, VBO, atlas
     // texture) belong to a dead context. Drop them so they get rebuilt.
@@ -1232,14 +1468,11 @@ pub unsafe fn draw_es2(
 
 /// Build the overlay scene (shared by both renderers). Returns None when the
 /// overlay is disabled or the glyph atlas is unavailable.
-unsafe fn build_scene(
-    gles: &mut dyn GLES,
-    viewport: (u32, u32, u32, u32),
-) -> Option<Vec<Quad>> {
+unsafe fn build_scene(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) -> Option<Vec<Quad>> {
     if !HARDWARE_ENABLED.load(Ordering::SeqCst) {
         return None;
     }
-    let mut ui_state = UI.lock().unwrap();
+    let ui_state = UI.lock().unwrap();
     if !ui_state.enabled || ui_state.app_id.is_none() {
         return None;
     }
@@ -1255,11 +1488,16 @@ unsafe fn build_scene(
 
     // Floating button.
     let lit = ui_state.pending == Some(W_BUTTON) || ui_state.open;
-    push_rect(&mut quads, layout.button, if lit { COL_WIDGET_LIT } else { COL_ACCENT });
+    push_rect(
+        &mut quads,
+        layout.button,
+        if lit { COL_WIDGET_LIT } else { COL_ACCENT },
+    );
     let bs = layout.scale;
     let label = if ui_state.open { "X" } else { "CE" };
     let tw = text_width(atlas, label, 12.0 * bs);
-    push_text(&mut quads,
+    push_text(
+        &mut quads,
         atlas,
         label,
         layout.button.x + (layout.button.w - tw) / 2.0,
@@ -1271,41 +1509,99 @@ unsafe fn build_scene(
     if let Some(monitor) = &layout.monitor {
         let ms = monitor.rect.w / 280.0;
         push_rect(&mut quads, monitor.rect, COL_PANEL);
-        push_text(&mut quads, atlas, if ui_state.watch_paused { "CHANGES PAUSED" } else { "LIVE CHANGES" },
-            monitor.rect.x + 5.0 * ms, monitor.rect.y + 9.0 * ms, 10.0 * ms, COL_ACCENT);
+        push_text(
+            &mut quads,
+            atlas,
+            if ui_state.watch_paused {
+                "CHANGES PAUSED"
+            } else {
+                "LIVE CHANGES"
+            },
+            monitor.rect.x + 5.0 * ms,
+            monitor.rect.y + 9.0 * ms,
+            10.0 * ms,
+            COL_ACCENT,
+        );
         let counts = if ui_state.activity_tracked == 0 {
             "Search a value first; then play".to_string()
         } else {
-            format!("{} changed / {} tracked{}", ui_state.activity_changed, ui_state.activity_tracked,
-                if ui_state.activity_changed > 256 { " (sampled)" } else { "" })
+            format!(
+                "{} changed / {} tracked{}",
+                ui_state.activity_changed,
+                ui_state.activity_tracked,
+                if ui_state.activity_changed > 256 {
+                    " (sampled)"
+                } else {
+                    ""
+                }
+            )
         };
         let size = 9.0 * ms;
-        let size = size * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, &counts, size).max(1.0)).min(1.0);
-        push_text(&mut quads, atlas, &counts, monitor.rect.x + 5.0 * ms,
-            monitor.results_header_y + 2.0 * ms, size, COL_TEXT_DIM);
+        let size = size
+            * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, &counts, size).max(1.0)).min(1.0);
+        push_text(
+            &mut quads,
+            atlas,
+            &counts,
+            monitor.rect.x + 5.0 * ms,
+            monitor.results_header_y + 2.0 * ms,
+            size,
+            COL_TEXT_DIM,
+        );
         for &(id, rect) in &monitor.widgets {
             push_rect(&mut quads, rect, COL_WIDGET);
             let label = match id {
-                W_WATCH_PAUSE => Some(if ui_state.watch_paused { "RESUME" } else { "PAUSE" }),
-                W_WATCH_CLEAR => Some("CLEAR"), W_WATCH_CLOSE => Some("X"),
-                W_WATCH_NEWER => Some("< NEWER"), W_WATCH_OLDER => Some("OLDER >"), _ => None,
+                W_WATCH_PAUSE => Some(if ui_state.watch_paused {
+                    "RESUME"
+                } else {
+                    "PAUSE"
+                }),
+                W_WATCH_CLEAR => Some("CLEAR"),
+                W_WATCH_CLOSE => Some("X"),
+                W_WATCH_NEWER => Some("< NEWER"),
+                W_WATCH_OLDER => Some("OLDER >"),
+                _ => None,
             };
             if let Some(label) = label {
-                push_text(&mut quads, atlas, label, rect.x + 3.0 * ms, rect.y + 7.0 * ms, 9.0 * ms, COL_TEXT);
+                push_text(
+                    &mut quads,
+                    atlas,
+                    label,
+                    rect.x + 3.0 * ms,
+                    rect.y + 7.0 * ms,
+                    9.0 * ms,
+                    COL_TEXT,
+                );
             } else if (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id) {
                 let Some(change) = ui_state.activity.get(ui_state.activity_scroll + (id - W_CHANGE_BASE) as usize) else { continue; };
                 if ui_state.watch_target == Some((change.addr, change.vtype)) {
                     push_rect(&mut quads, rect, COL_SELECTED);
                 }
                 let fresh = !ui_state.watch_paused && change.at.elapsed().as_secs_f32() < 0.75;
-                let title = format!("0x{:08X} {}  {:.1}s ago", change.addr, change.vtype.name(), change.at.elapsed().as_secs_f32());
-                let values = format!("{} -> {}", change.vtype.format(change.before), change.vtype.format(change.after));
+                let title = format!(
+                    "0x{:08X} {}  {:.1}s ago",
+                    change.addr,
+                    change.vtype.name(),
+                    change.at.elapsed().as_secs_f32()
+                );
+                let values = format!(
+                    "{} -> {}",
+                    change.vtype.format(change.before),
+                    change.vtype.format(change.after)
+                );
                 for (line, text) in [title, values].iter().enumerate() {
                     let size = 10.0 * ms;
-                    let size = size * ((rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0)).min(1.0);
-                    push_text(&mut quads, atlas, text, rect.x + 4.0 * ms,
-                        rect.y + (2.0 + line as f32 * 13.0) * ms, size,
-                        if fresh { COL_ACCENT } else { COL_TEXT });
+                    let size = size
+                        * ((rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0)).min(1.0);
+                    push_text(
+                        &mut quads,
+                        atlas,
+                        text,
+                        rect.x + 4.0 * ms,
+                        rect.y + (2.0 + line as f32 * 13.0) * ms,
+                        size,
+                        if fresh { COL_ACCENT } else { COL_TEXT },
+                    );
                 }
             } else {
                 let label = match id {
@@ -1317,24 +1613,49 @@ unsafe fn build_scene(
                         match KEYPAD[index / 4][index % 4] {
                             Some('\u{8}') => "DEL".to_string(),
                             Some('\u{4}') => "CLR".to_string(),
-                            Some(ch) => ch.to_string(), None => String::new(),
+                            Some(ch) => ch.to_string(),
+                            None => String::new(),
                         }
                     }
                     _ => String::new(),
                 };
                 let size = 11.0 * ms;
-                let size = size * ((rect.w - 8.0 * ms) / text_width(atlas, &label, size).max(1.0)).min(1.0);
-                push_text(&mut quads, atlas, &label, rect.x + 4.0 * ms, rect.y + 6.0 * ms, size, COL_TEXT);
+                let size = size
+                    * ((rect.w - 8.0 * ms) / text_width(atlas, &label, size).max(1.0)).min(1.0);
+                push_text(
+                    &mut quads,
+                    atlas,
+                    &label,
+                    rect.x + 4.0 * ms,
+                    rect.y + 6.0 * ms,
+                    size,
+                    COL_TEXT,
+                );
             }
         }
         if let Some((addr, vtype)) = ui_state.watch_target {
-            let current = ui_state.watch_current.map(|v| vtype.format(v)).unwrap_or_else(|| "unavailable".to_string());
+            let current = ui_state
+                .watch_current
+                .map(|v| vtype.format(v))
+                .unwrap_or_else(|| "unavailable".to_string());
             let target = format!("0x{:08X} {} NOW: {}", addr, vtype.name(), current);
-            for (y, text) in [(222.0, target.as_str()), (407.0, ui_state.watch_status.as_str())] {
+            for (y, text) in [
+                (222.0, target.as_str()),
+                (407.0, ui_state.watch_status.as_str()),
+            ] {
                 let size = 10.0 * ms;
-                let size = size * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0)).min(1.0);
-                push_text(&mut quads, atlas, text, monitor.rect.x + 5.0 * ms,
-                    monitor.rect.y + y * ms, size, COL_ACCENT);
+                let size = size
+                    * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0))
+                        .min(1.0);
+                push_text(
+                    &mut quads,
+                    atlas,
+                    text,
+                    monitor.rect.x + 5.0 * ms,
+                    monitor.rect.y + y * ms,
+                    size,
+                    COL_ACCENT,
+                );
             }
         }
     }
@@ -1344,7 +1665,8 @@ unsafe fn build_scene(
 
         // Header.
         let title = "Cheat Engine";
-        push_text(&mut quads,
+        push_text(
+            &mut quads,
             atlas,
             title,
             panel.rect.x + 8.0 * bs,
@@ -1359,7 +1681,8 @@ unsafe fn build_scene(
                 W_CLOSE => {
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let tw = text_width(atlas, "X", 12.0 * bs);
-                    push_text(&mut quads,
+                    push_text(
+                        &mut quads,
                         atlas,
                         "X",
                         rect.x + (rect.w - tw) / 2.0,
@@ -1371,7 +1694,15 @@ unsafe fn build_scene(
                 W_TYPE => {
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label = format!("TYPE: {}", ui_state.vtype.name());
-                    push_text(&mut quads, atlas, &label, rect.x + 6.0 * bs, rect.y + 5.0 * bs, 12.0 * bs, COL_TEXT);
+                    push_text(
+                        &mut quads,
+                        atlas,
+                        &label,
+                        rect.x + 6.0 * bs,
+                        rect.y + 5.0 * bs,
+                        12.0 * bs,
+                        COL_TEXT,
+                    );
                 }
                 W_SAFE_MODE => {
                     let (background, foreground) = safe_mode_colors(ui_state.safe_mode);
@@ -1379,57 +1710,56 @@ unsafe fn build_scene(
                     let label = "SAFE MODE";
                     let size = 11.0 * bs;
                     let tw = text_width(atlas, label, size);
-                    push_text(&mut quads, atlas, label,
+                    push_text(
+                        &mut quads,
+                        atlas,
+                        label,
                         rect.x + (rect.w - tw) / 2.0,
                         rect.y + (rect.h - atlas.height * (size / FONT_PX)) / 2.0,
-                        size, foreground,
-                    );
-                }
-                W_IAP => {
-                    let (background, foreground) = safe_mode_colors(ui_state.iap);
-                    push_rect(&mut quads, *rect, background);
-                    let label = "IN-APP: FREE BUYS";
-                    let size = 11.0 * bs;
-                    let tw = text_width(atlas, label, size);
-                    push_text(&mut quads, atlas, label,
-                        rect.x + (rect.w - tw) / 2.0,
-                        rect.y + (rect.h - atlas.height * (size / FONT_PX)) / 2.0,
-                        size, foreground,
-                    );
-                }
-                W_SPEED_DOWN | W_SPEED_RESET | W_SPEED_UP => {
-                    push_rect(&mut quads, *rect, if *id == W_SPEED_RESET && ui_state.speed != Speed::Normal {
-                        COL_WIDGET_LIT
-                    } else { COL_WIDGET });
-                    let label = match *id {
-                        W_SPEED_DOWN => "-".to_string(),
-                        W_SPEED_UP => "+".to_string(),
-                        _ => format!("SPEED {}", ui_state.speed.label()),
-                    };
-                    let size = 12.0 * bs;
-                    let tw = text_width(atlas, &label, size);
-                    push_text(&mut quads, atlas, &label,
-                        rect.x + (rect.w - tw) / 2.0,
-                        rect.y + 5.0 * bs, size, COL_TEXT,
+                        size,
+                        foreground,
                     );
                 }
                 W_CATEGORY => {
                     push_rect(&mut quads, *rect, COL_WIDGET);
-                    let label = format!("GROUP: {} ({})", ui_state.filter.label(), ui_state.filtered_results);
-                    push_text(&mut quads, atlas, &label,
-                        rect.x + 6.0 * bs, rect.y + 5.0 * bs, 11.0 * bs, COL_ACCENT);
+                    let label = format!(
+                        "GROUP: {} ({})",
+                        ui_state.filter.label(),
+                        ui_state.filtered_results
+                    );
+                    push_text(
+                        &mut quads,
+                        atlas,
+                        &label,
+                        rect.x + 6.0 * bs,
+                        rect.y + 5.0 * bs,
+                        11.0 * bs,
+                        COL_ACCENT,
+                    );
                 }
                 W_FIELD_SEARCH | W_FIELD_SET => {
                     let focus_here = (*id == W_FIELD_SEARCH && ui_state.focus == Focus::Search)
                         || (*id == W_FIELD_SET && ui_state.focus == Focus::Set);
-                    push_rect(&mut quads, *rect, if focus_here { COL_SELECTED } else { COL_FIELD });
+                    push_rect(
+                        &mut quads,
+                        *rect,
+                        if focus_here { COL_SELECTED } else { COL_FIELD },
+                    );
                     let (label, content) = if *id == W_FIELD_SEARCH {
                         ("VAL", &ui_state.search_text)
                     } else {
                         ("SET", &ui_state.set_text)
                     };
                     let text = format!("{}: {}_", label, content);
-                    push_text(&mut quads, atlas, &text, rect.x + 6.0 * bs, rect.y + 5.0 * bs, 12.0 * bs, COL_TEXT);
+                    push_text(
+                        &mut quads,
+                        atlas,
+                        &text,
+                        rect.x + 6.0 * bs,
+                        rect.y + 5.0 * bs,
+                        12.0 * bs,
+                        COL_TEXT,
+                    );
                 }
                 id if (W_KEY_BASE..W_KEY_BASE + 16).contains(&id) => {
                     let key_idx = (id - W_KEY_BASE) as usize;
@@ -1446,7 +1776,8 @@ unsafe fn build_scene(
                     if !label.is_empty() {
                         let size = 12.0 * bs;
                         let tw = text_width(atlas, &label, size);
-                        push_text(&mut quads,
+                        push_text(
+                            &mut quads,
                             atlas,
                             &label,
                             rect.x + (rect.w - tw) / 2.0,
@@ -1456,14 +1787,22 @@ unsafe fn build_scene(
                         );
                     }
                 }
-                W_SEARCH | W_REFINE | W_RESET | W_SET | W_SET_ALL | W_FREEZE | W_UNFREEZE | W_DUMP | W_SAVE | W_WATCH | W_MARK | W_CHANGED | W_SAME | W_INCREASED | W_DECREASED => {
+                W_SEARCH | W_REFINE | W_RESET | W_SET | W_SET_ALL | W_FREEZE | W_UNFREEZE
+                | W_DUMP | W_SAVE | W_WATCH | W_MARK | W_CHANGED | W_SAME | W_INCREASED
+                | W_DECREASED => {
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label: &str = match *id {
                         W_SEARCH => "SEARCH",
                         W_REFINE => "REFINE",
                         W_RESET => "RESET",
                         W_SET => "SET",
-                        W_SET_ALL => if ui_state.bulk_preview { "CONFIRM" } else { "SET ALL" },
+                        W_SET_ALL => {
+                            if ui_state.bulk_preview {
+                                "CONFIRM"
+                            } else {
+                                "SET ALL"
+                            }
+                        }
                         W_FREEZE => "FREEZE",
                         W_UNFREEZE => "UNFRZ",
                         W_DUMP => "DUMP",
@@ -1477,9 +1816,11 @@ unsafe fn build_scene(
                         _ => "",
                     };
                     let size = 12.0 * bs;
-                    let size = size * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
+                    let size = size
+                        * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
                     let tw = text_width(atlas, label, size);
-                    push_text(&mut quads,
+                    push_text(
+                        &mut quads,
                         atlas,
                         label,
                         rect.x + (rect.w - tw) / 2.0,
@@ -1492,9 +1833,11 @@ unsafe fn build_scene(
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label: &str = if *id == W_SCROLL_UP { "^" } else { "v" };
                     let size = 12.0 * bs;
-                    let size = size * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
+                    let size = size
+                        * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
                     let tw = text_width(atlas, label, size);
-                    push_text(&mut quads,
+                    push_text(
+                        &mut quads,
                         atlas,
                         label,
                         rect.x + (rect.w - tw) / 2.0,
@@ -1529,7 +1872,15 @@ unsafe fn build_scene(
                         let size = 10.0 * bs;
                         let width = text_width(atlas, &text, size).max(1.0);
                         let size = size * ((rect.w - 12.0 * bs) / width).min(1.0);
-                        push_text(&mut quads, atlas, &text, rect.x + 6.0 * bs, rect.y + 3.0 * bs, size, COL_TEXT);
+                        push_text(
+                            &mut quads,
+                            atlas,
+                            &text,
+                            rect.x + 6.0 * bs,
+                            rect.y + 3.0 * bs,
+                            size,
+                            COL_TEXT,
+                        );
                     }
                 }
                 _ => {}
@@ -1541,7 +1892,8 @@ unsafe fn build_scene(
             "HITS {}/{} FROZEN {}",
             ui_state.filtered_results, ui_state.total_results, ui_state.frozen_count
         );
-        push_text(&mut quads,
+        push_text(
+            &mut quads,
             atlas,
             &res_label,
             panel.rect.x + 8.0 * bs,
@@ -1556,7 +1908,8 @@ unsafe fn build_scene(
             let size = 11.0 * bs;
             let width = text_width(atlas, &ui_state.status, size).max(1.0);
             let size = size * ((panel.rect.w - 16.0 * bs) / width).min(1.0);
-            push_text(&mut quads,
+            push_text(
+                &mut quads,
                 atlas,
                 &ui_state.status,
                 panel.rect.x + 8.0 * bs,
@@ -1576,8 +1929,8 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     // drawing by (vx, vy), and the touch handlers subtract it before
     // hit-testing. Adding the origin here would double it (panel shifted
     // by the letterbox offset, tap targets misaligned with drawn keys).
-    let (_vx, _vy, vw, vh) = viewport;
-    let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
+    let (_, _, vw, vh) = viewport;
+    let (_vx, _vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
 
     // Save state (mirrors draw_onscreen_text).
     let mut old_active_texture: GLint = 0;
@@ -1585,7 +1938,11 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     let mut old_texture: GLint = 0;
     gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut old_texture);
     let mut old_tex_env_mode: GLint = 0;
-    gles.GetTexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &mut old_tex_env_mode);
+    gles.GetTexEnviv(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        &mut old_tex_env_mode,
+    );
     // The presenter uses REPLACE for the game frame; glyphs instead need
     // their atlas coverage multiplied by the overlay's text colour.
     let tex_env_mode = gles11::MODULATE as GLint;
@@ -1629,17 +1986,16 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
         }
         let verts = quad_vertices(q);
         gles.VertexPointer(2, gles11::FLOAT, 16, verts.as_ptr() as *const _);
-        gles.TexCoordPointer(
-            2,
-            gles11::FLOAT,
-            16,
-            verts.as_ptr().add(2) as *const _,
-        );
+        gles.TexCoordPointer(2, gles11::FLOAT, 16, verts.as_ptr().add(2) as *const _);
         gles.DrawArrays(gles11::TRIANGLE_STRIP, 0, 4);
     }
 
     // Restore state.
-    gles.TexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &old_tex_env_mode);
+    gles.TexEnviv(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        &old_tex_env_mode,
+    );
     gles.BindTexture(gles11::TEXTURE_2D, old_texture as _);
     gles.ActiveTexture(old_active_texture as _);
     gles.Disable(gles11::BLEND);
@@ -1768,7 +2124,6 @@ unsafe fn ensure_overlay_program(gles: &mut dyn GLES) -> Option<OverlayProgram> 
 }
 
 unsafe fn ensure_overlay_vbo(gles: &mut dyn GLES) -> GLuint {
-    use crate::gles::gles2_raw as gles2;
     let mut guard = OVERLAY_VBO.lock().unwrap();
     if let Some(vbo) = *guard {
         return vbo;
@@ -1806,12 +2161,94 @@ unsafe fn ensure_overlay_white_tex(gles: &mut dyn GLES) -> GLuint {
         gles2::UNSIGNED_BYTE,
         white.as_ptr() as *const _,
     );
-    gles.TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_MIN_FILTER, gles2::NEAREST as _);
-    gles.TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_MAG_FILTER, gles2::NEAREST as _);
-    gles.TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_S, gles2::CLAMP_TO_EDGE as _);
-    gles.TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_T, gles2::CLAMP_TO_EDGE as _);
+    gles.TexParameteri(
+        gles2::TEXTURE_2D,
+        gles2::TEXTURE_MIN_FILTER,
+        gles2::NEAREST as _,
+    );
+    gles.TexParameteri(
+        gles2::TEXTURE_2D,
+        gles2::TEXTURE_MAG_FILTER,
+        gles2::NEAREST as _,
+    );
+    gles.TexParameteri(
+        gles2::TEXTURE_2D,
+        gles2::TEXTURE_WRAP_S,
+        gles2::CLAMP_TO_EDGE as _,
+    );
+    gles.TexParameteri(
+        gles2::TEXTURE_2D,
+        gles2::TEXTURE_WRAP_T,
+        gles2::CLAMP_TO_EDGE as _,
+    );
     *guard = Some(tex);
     tex
+}
+
+#[derive(Copy, Clone)]
+struct SavedVertexAttrib {
+    index: GLuint,
+    enabled: bool,
+    size: GLint,
+    type_: GLenum,
+    normalized: GLboolean,
+    stride: GLsizei,
+    buffer: GLint,
+    pointer: *mut GLvoid,
+}
+
+unsafe fn save_vertex_attrib(gles: &mut dyn GLES, index: GLuint) -> SavedVertexAttrib {
+    use crate::gles::gles2_raw as gles2;
+    let mut enabled = 0;
+    let mut size = 0;
+    let mut type_ = 0;
+    let mut normalized = 0;
+    let mut stride = 0;
+    let mut buffer = 0;
+    let mut pointer = std::ptr::null_mut();
+    gles.GetVertexAttribiv(index, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut enabled);
+    gles.GetVertexAttribiv(index, gles2::VERTEX_ATTRIB_ARRAY_SIZE, &mut size);
+    gles.GetVertexAttribiv(index, gles2::VERTEX_ATTRIB_ARRAY_TYPE, &mut type_);
+    gles.GetVertexAttribiv(
+        index,
+        gles2::VERTEX_ATTRIB_ARRAY_NORMALIZED,
+        &mut normalized,
+    );
+    gles.GetVertexAttribiv(index, gles2::VERTEX_ATTRIB_ARRAY_STRIDE, &mut stride);
+    gles.GetVertexAttribiv(
+        index,
+        gles2::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING,
+        &mut buffer,
+    );
+    gles.GetVertexAttribPointerv(index, gles2::VERTEX_ATTRIB_ARRAY_POINTER, &mut pointer);
+    SavedVertexAttrib {
+        index,
+        enabled: enabled != 0,
+        size,
+        type_: type_ as GLenum,
+        normalized: normalized as GLboolean,
+        stride,
+        buffer,
+        pointer,
+    }
+}
+
+unsafe fn restore_vertex_attrib(gles: &mut dyn GLES, state: SavedVertexAttrib) {
+    use crate::gles::gles2_raw as gles2;
+    gles.BindBuffer(gles2::ARRAY_BUFFER, state.buffer as GLuint);
+    gles.VertexAttribPointer(
+        state.index,
+        state.size,
+        state.type_,
+        state.normalized,
+        state.stride,
+        state.pointer as *const _,
+    );
+    if state.enabled {
+        gles.EnableVertexAttribArray(state.index);
+    } else {
+        gles.DisableVertexAttribArray(state.index);
+    }
 }
 
 /// Render the scene with a small ES 2.0 shader program. Saves and restores
@@ -1843,13 +2280,25 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     let mut old_tex0: GLint = 0;
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_tex0);
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
-    let attribs = [program.a_pos as GLuint, program.a_uv as GLuint, program.a_col as GLuint];
-    let mut attrib_states = [0u8; 3];
-    for (slot, &attrib) in attrib_states.iter_mut().zip(attribs.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attrib as GLuint, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
+    let mut old_blend = [0; 4];
+    for (value, pname) in old_blend.iter_mut().zip([
+        gles2::BLEND_SRC_RGB,
+        gles2::BLEND_DST_RGB,
+        gles2::BLEND_SRC_ALPHA,
+        gles2::BLEND_DST_ALPHA,
+    ]) {
+        gles.GetIntegerv(pname, value);
     }
+    let attribs = [
+        program.a_pos as GLuint,
+        program.a_uv as GLuint,
+        program.a_col as GLuint,
+    ];
+    let attrib_states = [
+        save_vertex_attrib(gles, attribs[0]),
+        save_vertex_attrib(gles, attribs[1]),
+        save_vertex_attrib(gles, attribs[2]),
+    ];
 
     gles.UseProgram(program.program);
     gles.Uniform2f(program.u_viewport, viewport.2 as f32, viewport.3 as f32);
@@ -1918,13 +2367,15 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
         gles.DrawArrays(gles2::TRIANGLE_STRIP, 0, 4);
     }
 
-    for (&attr, &was) in attribs.iter().zip(attrib_states.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attr as _);
-        } else {
-            gles.DisableVertexAttribArray(attr as _);
-        }
+    for state in attrib_states {
+        restore_vertex_attrib(gles, state);
     }
+    gles.BlendFuncSeparate(
+        old_blend[0] as GLenum,
+        old_blend[1] as GLenum,
+        old_blend[2] as GLenum,
+        old_blend[3] as GLenum,
+    );
     if !blend_was_on {
         gles.Disable(gles2::BLEND);
     }

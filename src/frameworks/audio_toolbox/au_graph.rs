@@ -21,9 +21,7 @@ use crate::export_c_func;
 use crate::frameworks::audio_toolbox::audio_components::{
     self, AURenderCallbackStruct, AudioComponentInstance,
 };
-use crate::frameworks::audio_toolbox::audio_unit::{
-    notify_audio_unit_is_running, setup_audio_unit_for_render, AudioUnit,
-};
+use crate::frameworks::audio_toolbox::audio_unit::{setup_audio_unit_for_render, AudioUnit};
 use crate::frameworks::carbon_core::{paramErr, OSStatus};
 use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
 use crate::frameworks::foundation::ns_run_loop;
@@ -79,9 +77,8 @@ struct GraphState {
     is_open: bool,
     is_initialized: bool,
     is_running: bool,
-    /// Which external output started this graph when its generic output node used a separate handle.
-    bridged_output: Option<AudioUnit>,
-    /// Which node is the graph's output (RemoteIO).
+    /// Какой узел является конечным выходом (RemoteIO).
+    /// Нужен, чтобы знать, какой `AudioUnit` стартовать в `AUGraphStart`.
     output_node: Option<AUNode>,
 }
 
@@ -328,116 +325,6 @@ fn AUGraphStart(env: &mut Environment, graph: AUGraph) -> OSStatus {
     0
 }
 
-pub fn start_graph_for_output(env: &mut Environment, output_unit: AudioUnit) -> bool {
-    let output_component_type = audio_components::State::get(&mut env.framework_state)
-        .audio_component_instances
-        .get(&output_unit)
-        .and_then(|obj| obj.component_desc)
-        .map(|(component_type, _, _)| component_type);
-    let graphs: Vec<(AUGraph, Vec<AudioUnit>, bool)> = {
-        State::get(&mut env.framework_state)
-            .graphs
-            .iter()
-            .filter_map(|(graph, state)| {
-                if !state.is_initialized {
-                    return None;
-                }
-                let contains_output = state
-                    .nodes
-                    .values()
-                    .any(|node| node.audio_unit == Some(output_unit));
-                let has_connected_output = output_component_type == Some(kAudioUnitType_Output)
-                    && state.nodes.iter().any(|(node_id, node)| {
-                        let component_type = node.desc.component_type;
-                        component_type == kAudioUnitType_Output
-                            && state.connections.iter().any(|connection| {
-                                connection.source_node == *node_id
-                                    || connection.dest_node == *node_id
-                            })
-                    });
-                if !contains_output && !has_connected_output {
-                    return None;
-                }
-                Some((
-                    *graph,
-                    state.nodes.values().filter_map(|node| node.audio_unit).collect(),
-                    !contains_output,
-                ))
-            })
-            .collect()
-    };
-
-    if graphs.is_empty() {
-        return false;
-    }
-
-    for (graph, units, bridged) in graphs {
-        if let Some(state) = State::get(&mut env.framework_state).graphs.get_mut(&graph) {
-            state.is_running = true;
-            if bridged {
-                state.bridged_output = Some(output_unit);
-            }
-        }
-        for unit in units {
-            setup_audio_unit_for_render(env, unit);
-        }
-        if bridged {
-            setup_audio_unit_for_render(env, output_unit);
-        }
-    }
-    true
-}
-
-pub fn stop_graph_for_output(env: &mut Environment, output_unit: AudioUnit) {
-    let graphs: Vec<(AUGraph, Vec<AudioUnit>)> = {
-        State::get(&mut env.framework_state)
-            .graphs
-            .iter()
-            .filter_map(|(graph, state)| {
-                let contains_output = state
-                    .nodes
-                    .values()
-                    .any(|node| node.audio_unit == Some(output_unit));
-                if !contains_output && state.bridged_output != Some(output_unit) {
-                    return None;
-                }
-                Some((
-                    *graph,
-                    state
-                        .nodes
-                        .values()
-                        .filter_map(|node| node.audio_unit)
-                        .filter(|unit| *unit != output_unit)
-                        .collect(),
-                ))
-            })
-            .collect()
-    };
-
-    for (graph, units) in graphs {
-        if let Some(state) = State::get(&mut env.framework_state).graphs.get_mut(&graph) {
-            state.is_running = false;
-            state.bridged_output = None;
-        }
-        for unit in units {
-            let was_started = audio_components::State::get(&mut env.framework_state)
-                .audio_component_instances
-                .get(&unit)
-                .map(|obj| obj.started)
-                .unwrap_or(false);
-            if let Some(obj) = audio_components::State::get(&mut env.framework_state)
-                .audio_component_instances
-                .get_mut(&unit)
-            {
-                obj.started = false;
-            }
-            if was_started {
-                notify_audio_unit_is_running(env, unit);
-            }
-        }
-    }
-}
-
 fn AUGraphStop(env: &mut Environment, graph: AUGraph) -> OSStatus {
     let units: Vec<AudioUnit> = match State::get(&mut env.framework_state).graphs.get(&graph) {
         Some(s) => s.nodes.values().filter_map(|n| n.audio_unit).collect(),
@@ -445,21 +332,11 @@ fn AUGraphStop(env: &mut Environment, graph: AUGraph) -> OSStatus {
     };
 
     for unit in units {
-        let was_started = audio_components::State::get(&mut env.framework_state)
-            .audio_component_instances
-            .get(&unit)
-            .map(|obj| obj.started)
-            .unwrap_or(false);
-
         if let Some(obj) = audio_components::State::get(&mut env.framework_state)
             .audio_component_instances
             .get_mut(&unit)
         {
             obj.started = false;
-        }
-
-        if was_started {
-            notify_audio_unit_is_running(env, unit);
         }
     }
 

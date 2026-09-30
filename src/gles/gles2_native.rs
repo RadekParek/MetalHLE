@@ -11,10 +11,9 @@
 
 use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
-use super::gles2_glsl::patch_shadow_samplers_extension;
 use super::gles2_raw as gles2;
 use super::gles_generic::{GLchar, GLES};
-use super::util::{try_decode_pvrtc, PalettedTextureFormat};
+use super::util::{try_decode_pvrtc, try_decode_pvrtc_sub, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::ffi::CStr;
@@ -38,8 +37,6 @@ pub struct GLES2NativeContext {
     /// Whether the driver supports `GL_EXT_shader_texture_lod`. When it does
     /// not, we must patch shaders that use `texture2DLodEXT` and friends.
     texture_lod_ext_supported: bool,
-    /// Whether the host driver advertises `GL_EXT_shadow_samplers`.
-    shadow_samplers_ext_supported: bool,
 }
 
 impl GLESContext for GLES2NativeContext {
@@ -54,7 +51,6 @@ impl GLESContext for GLES2NativeContext {
             pvrtc_native: false,
             pvrtc_native_checked: false,
             texture_lod_ext_supported: false,
-            shadow_samplers_ext_supported: false,
         })
     }
 
@@ -67,7 +63,6 @@ impl GLESContext for GLES2NativeContext {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
-                shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -83,14 +78,12 @@ impl GLESContext for GLES2NativeContext {
         if !self.pvrtc_native_checked {
             self.pvrtc_native = unsafe { detect_pvrtc_support() };
             self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support() };
-            self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
-            shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -105,7 +98,6 @@ impl GLESContext for GLES2NativeContext {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
-                shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -116,14 +108,12 @@ impl GLESContext for GLES2NativeContext {
         if !self.pvrtc_native_checked {
             self.pvrtc_native = detect_pvrtc_support();
             self.texture_lod_ext_supported = detect_texture_lod_ext_support();
-            self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
-            shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -175,21 +165,6 @@ unsafe fn detect_texture_lod_ext_support() -> bool {
     s.split(' ').any(|ext| ext == "GL_EXT_shader_texture_lod")
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 2.0 driver
-/// advertises `GL_EXT_shadow_samplers`. Must be called with a current GL context.
-unsafe fn detect_shadow_samplers_ext_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(extensions) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    extensions
-        .split_whitespace()
-        .any(|extension| extension == "GL_EXT_shadow_samplers")
-}
-
 /// Returns `true` if the shader source contains a top-level default float
 /// precision declaration (`precision lowp|mediump|highp float;`).
 fn shader_has_default_float_precision(source: &str) -> bool {
@@ -217,30 +192,23 @@ fn shader_has_default_float_precision(source: &str) -> bool {
 /// 1. Hoisting `#extension` directives to the top (right after `#version`),
 ///    because some drivers (notably Mali) reject them if they appear after
 ///    non-preprocessor tokens.
-/// 2. Removing `GL_EXT_shadow_samplers` from vertex shaders and making the
-///    fragment-shader requirement optional. The extension only provides
-///    fragment-stage shadow samplers; some apps require it in both stages.
-/// 3. When the driver lacks `GL_EXT_shader_texture_lod`, stripping the
+/// 2. When the driver lacks `GL_EXT_shader_texture_lod`, stripping the
 ///    corresponding `#extension` line and replacing `texture2DLodEXT(s, c, l)`
 ///    with `texture2D(s, c)` (dropping the LOD parameter). This loses mipmap
 ///    control but lets the shader compile and produce visually acceptable
 ///    results.
-/// 4. Injecting a default `precision mediump float;` declaration when the
+/// 3. Injecting a default `precision mediump float;` declaration when the
 ///    shader source does not define one and the caller requests it (fragment
 ///    shaders only — GLSL ES gives fragment shaders no default float
 ///    precision, so drivers reject such shaders outright; vertex shaders
 ///    default to `highp` and must not be downgraded).
-/// 5. Fixing variable redeclaration errors by deduplicating identical
+/// 4. Fixing variable redeclaration errors by deduplicating identical
 ///    variable declarations in function scope.
 fn patch_shader_for_native_es2(
     source: &str,
     texture_lod_ext_supported: bool,
-    shadow_samplers_ext_supported: bool,
     inject_default_float_precision: bool,
-    is_vertex_shader: bool,
 ) -> String {
-    let source =
-        patch_shadow_samplers_extension(source, is_vertex_shader, shadow_samplers_ext_supported);
     let lines: Vec<&str> = source.lines().collect();
 
     // Separate lines into categories for hoisting.
@@ -284,7 +252,7 @@ fn patch_shader_for_native_es2(
         out.push_str(ext);
         out.push('\n');
     }
-    if inject_default_float_precision && !is_vertex_shader && !has_default_float_precision {
+    if inject_default_float_precision && !has_default_float_precision {
         out.push_str("precision mediump float;\n");
     }
     for line in &body_lines {
@@ -395,7 +363,7 @@ mod tests {
     fn injects_default_float_precision_when_missing() {
         let src = "#version 100\nvoid main() { gl_FragColor = vec4(1.0); }\n";
         assert!(!shader_has_default_float_precision(src));
-        let out = patch_shader_for_native_es2(src, true, true, true, false);
+        let out = patch_shader_for_native_es2(src, true, true);
         assert!(out.contains("precision mediump float;"));
         assert!(out.contains("void main()"));
     }
@@ -405,7 +373,7 @@ mod tests {
         let src =
             "#version 100\nprecision highp float;\nvoid main() { gl_FragColor = vec4(1.0); }\n";
         assert!(shader_has_default_float_precision(src));
-        let out = patch_shader_for_native_es2(src, true, true, true, false);
+        let out = patch_shader_for_native_es2(src, true, true);
         assert!(out.contains("precision highp float;"));
         assert_eq!(out.matches("precision").count(), 1);
     }
@@ -413,29 +381,18 @@ mod tests {
     #[test]
     fn does_not_inject_when_not_requested() {
         let src = "#version 100\nvoid main() { gl_Position = vec4(1.0); }\n";
-        let out = patch_shader_for_native_es2(src, true, false, true, true);
+        let out = patch_shader_for_native_es2(src, true, false);
         assert!(!out.contains("precision"));
     }
 
     #[test]
     fn hoists_extension_directives_before_body_code() {
         let src = "#version 100\nvoid helper() {}\n#extension GL_OES_texture_3D : enable\nvoid main() { gl_FragColor = vec4(1.0); }\n";
-        let out = patch_shader_for_native_es2(src, true, false, true, false);
+        let out = patch_shader_for_native_es2(src, true, false);
         let ext_pos = out.find("#extension GL_OES_texture_3D : enable").unwrap();
         let helper_pos = out.find("void helper()").unwrap();
         assert!(ext_pos < helper_pos);
         assert!(out.starts_with("#version 100\n#extension GL_OES_texture_3D : enable\n"));
-    }
-
-    #[test]
-    fn patches_shadow_sampler_extension_by_shader_stage() {
-        let src = "#version 100\n#extension GL_EXT_shadow_samplers : require\nvoid main() {}\n";
-        let vertex = patch_shader_for_native_es2(src, true, false, true, true);
-        let unsupported_fragment = patch_shader_for_native_es2(src, true, false, true, false);
-        let supported_fragment = patch_shader_for_native_es2(src, true, true, true, false);
-        assert!(!vertex.contains("GL_EXT_shadow_samplers"));
-        assert!(!unsupported_fragment.contains("GL_EXT_shadow_samplers"));
-        assert!(supported_fragment.contains("#extension GL_EXT_shadow_samplers : require"));
     }
 }
 
@@ -444,7 +401,6 @@ pub struct GLES2Native<'gl_ctx> {
     pvrtc_native: bool,
     /// Whether `GL_EXT_shader_texture_lod` is advertised by the host driver.
     texture_lod_ext_supported: bool,
-    shadow_samplers_ext_supported: bool,
     /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
     ///
     /// Games can legitimately have more than one buffer mapped at a time
@@ -726,9 +682,6 @@ impl GLES for GLES2Native<'_> {
             }
             return;
         }
-        if !self.shadow_samplers_ext_supported && matches!(pname, 0x884C | 0x884D) {
-            return;
-        }
         gles2::TexParameteri(target, pname, param)
     }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) {
@@ -736,9 +689,6 @@ impl GLES for GLES2Native<'_> {
             if param != 0.0 {
                 gles2::GenerateMipmap(target);
             }
-            return;
-        }
-        if !self.shadow_samplers_ext_supported && matches!(pname, 0x884C | 0x884D) {
             return;
         }
         gles2::TexParameterf(target, pname, param)
@@ -750,9 +700,6 @@ impl GLES for GLES2Native<'_> {
             }
             return;
         }
-        if !self.shadow_samplers_ext_supported && matches!(pname, 0x884C | 0x884D) {
-            return;
-        }
         gles2::TexParameteriv(target, pname, params)
     }
     unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
@@ -762,16 +709,7 @@ impl GLES for GLES2Native<'_> {
             }
             return;
         }
-        if !self.shadow_samplers_ext_supported && matches!(pname, 0x884C | 0x884D) {
-            return;
-        }
         gles2::TexParameterfv(target, pname, params)
-    }
-    unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
-        gles2::GetTexParameteriv(target, pname, params)
-    }
-    unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
-        gles2::GetTexParameterfv(target, pname, params)
     }
     #[allow(clippy::too_many_arguments)]
     unsafe fn TexImage2D(
@@ -943,22 +881,6 @@ impl GLES for GLES2Native<'_> {
             data,
         )
     }
-    unsafe fn CompressedTexSubImage2D(
-        &mut self,
-        target: GLenum,
-        level: GLint,
-        xoffset: GLint,
-        yoffset: GLint,
-        width: GLsizei,
-        height: GLsizei,
-        format: GLenum,
-        image_size: GLsizei,
-        data: *const GLvoid,
-    ) {
-        gles2::CompressedTexSubImage2D(
-            target, level, xoffset, yoffset, width, height, format, image_size, data,
-        )
-    }
     unsafe fn CopyTexImage2D(
         &mut self,
         target: GLenum,
@@ -1125,10 +1047,58 @@ impl GLES for GLES2Native<'_> {
     // games (e.g. LEGO Ninjago Spinjitzu Scavenger Hunt) call these even when
     // they asked EAGL for an ES 1.1 context — combined with
     // `--prefer-gles2-context`, they end up here.
+    unsafe fn CompressedTexSubImage2D(
+        &mut self,
+        target: GLenum,
+        level: GLint,
+        xoffset: GLint,
+        yoffset: GLint,
+        width: GLsizei,
+        height: GLsizei,
+        format: GLenum,
+        image_size: GLsizei,
+        data: *const GLvoid,
+    ) {
+        // Streamed PVRTC updates must not pass through on hosts that lack
+        // `GL_IMG_texture_compression_pvrtc` (every error here stalls the
+        // game's loader). Decode to RGBA and update the uncompressed texture
+        // that the full-upload path created.
+        if !self.pvrtc_native && !data.is_null() && image_size > 0 {
+            let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
+            if try_decode_pvrtc_sub(
+                self,
+                target,
+                level,
+                xoffset,
+                yoffset,
+                width,
+                height,
+                format,
+                payload,
+            ) {
+                return;
+            }
+        }
+        gles2::CompressedTexSubImage2D(
+            target, level, xoffset, yoffset, width, height, format, image_size, data,
+        )
+    }
     unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid {
         if gles2::MapBufferOES::is_loaded() {
             let mapped = gles2::MapBufferOES(target, access);
             if !mapped.is_null() {
+                // Sentinel entry (empty staging): marks this target as
+                // driver-mapped so the matching UnmapBufferOES driver-unmaps
+                // instead of hitting the driver with an unrequested unmap
+                // (Adreno reports GL_INVALID_OPERATION for those).
+                match self
+                    .map_buffer_stagings
+                    .iter_mut()
+                    .find(|(t, _)| *t == target)
+                {
+                    Some(entry) => *entry = (target, Vec::new()),
+                    None => self.map_buffer_stagings.push((target, Vec::new())),
+                }
                 return mapped;
             }
             // Driver exports the entry point but refuses the map (common on
@@ -1148,12 +1118,19 @@ impl GLES for GLES2Native<'_> {
         let ptr = staging.as_ptr();
         // Replace any stale staging entry for this target (an unbalanced
         // earlier map without unmap); keep other targets' entries intact.
-        match self
-            .map_buffer_stagings
-            .iter_mut()
-            .find(|(t, _)| *t == target)
-        {
-            Some(entry) => *entry = (target, staging),
+        match self.map_buffer_stagings.iter_mut().find(|(t, _)| *t == target) {
+            Some(entry) => {
+                if entry.1.is_empty() {
+                    // Replacing a driver-mapped sentinel: release the stale
+                    // driver mapping so the driver-side map count stays
+                    // balanced (swallow the error it generates).
+                    if gles2::UnmapBufferOES::is_loaded() {
+                        gles2::UnmapBufferOES(target);
+                        gles2::GetError();
+                    }
+                }
+                *entry = (target, staging);
+            }
             None => self.map_buffer_stagings.push((target, staging)),
         }
         ptr as *mut GLvoid
@@ -1165,6 +1142,13 @@ impl GLES for GLES2Native<'_> {
             .position(|(mapped_target, _)| *mapped_target == target)
         {
             let (_, staging) = self.map_buffer_stagings.swap_remove(pos);
+            if staging.is_empty() {
+                // Sentinel: the buffer was driver-mapped; just unmap it.
+                if gles2::UnmapBufferOES::is_loaded() {
+                    return gles2::UnmapBufferOES(target);
+                }
+                return gles2::TRUE;
+            }
             gles2::BufferSubData(
                 target,
                 0,
@@ -1270,6 +1254,11 @@ impl GLES for GLES2Native<'_> {
         string: *const *const GLchar,
         length: *const GLint,
     ) {
+        if !crate::gles::shader_compatibility_fixes_enabled() {
+            gles2::ShaderSource(shader, count, string, length);
+            return;
+        }
+
         // Even on a native ES 2.0 driver we may need to patch shaders:
         // - Hoist #extension directives before non-preprocessor tokens
         //   (Mali drivers reject them otherwise).
@@ -1335,9 +1324,7 @@ impl GLES for GLES2Native<'_> {
         let patched = patch_shader_for_native_es2(
             &joined,
             self.texture_lod_ext_supported,
-            self.shadow_samplers_ext_supported,
             needs_precision_inject,
-            shader_type as GLenum == gles2::VERTEX_SHADER,
         );
         let c = match CString::new(patched) {
             Ok(c) => c,

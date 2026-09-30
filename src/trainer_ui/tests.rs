@@ -5,7 +5,8 @@
  */
 
 use super::*;
-use crate::gles::{GLenum, GLfloat, GLsizei, GLvoid};
+use crate::gles::gles11_raw::types::{GLenum, GLfloat, GLsizei, GLvoid};
+use crate::trainer::classify::Category;
 
 static INPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -184,17 +185,53 @@ fn panel_has_unique_actions_and_results_header_below_keypad() {
             assert!(rect.w > 0.0 && rect.h > 0.0, "invalid widget {id}");
             assert!(rect.y >= panel.rect.y && rect.y + rect.h <= panel.rect.y + panel.rect.h);
         }
-        for id in [W_SPEED_DOWN, W_SPEED_RESET, W_SPEED_UP, W_CATEGORY] {
-            assert_eq!(panel.widgets.iter().filter(|&&(widget, _)| widget == id).count(), 1);
+        for id in [W_CATEGORY] {
+            assert_eq!(
+                panel
+                    .widgets
+                    .iter()
+                    .filter(|&&(widget, _)| widget == id)
+                    .count(),
+                1
+            );
         }
-        assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_SET_ALL).count(), 1);
-        assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_DUMP).count(), 1);
-        let toggle = panel.widgets.iter().find(|&&(id, _)| id == W_SAFE_MODE).unwrap().1;
-        let type_button = panel.widgets.iter().find(|&&(id, _)| id == W_TYPE).unwrap().1;
+        assert_eq!(
+            panel
+                .widgets
+                .iter()
+                .filter(|&&(id, _)| id == W_SET_ALL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            panel
+                .widgets
+                .iter()
+                .filter(|&&(id, _)| id == W_DUMP)
+                .count(),
+            1
+        );
+        let toggle = panel
+            .widgets
+            .iter()
+            .find(|&&(id, _)| id == W_SAFE_MODE)
+            .unwrap()
+            .1;
+        let type_button = panel
+            .widgets
+            .iter()
+            .find(|&&(id, _)| id == W_TYPE)
+            .unwrap()
+            .1;
         assert_eq!(toggle.y, type_button.y);
         assert!(toggle.x >= type_button.x + type_button.w);
         assert!(toggle.x + toggle.w <= panel.rect.x + panel.rect.w);
-        let scroll = panel.widgets.iter().find(|&&(id, _)| id == W_SCROLL_UP).unwrap().1;
+        let scroll = panel
+            .widgets
+            .iter()
+            .find(|&&(id, _)| id == W_SCROLL_UP)
+            .unwrap()
+            .1;
         assert_eq!(panel.results_header_y, scroll.y);
         for &(id, rect) in &panel.widgets {
             if (W_KEY_BASE..W_KEY_BASE + 16).contains(&id) {
@@ -212,24 +249,38 @@ fn dump_and_set_all_dispatch_distinct_commands() {
     take_commands();
     activate_widget(&mut ui, W_DUMP);
     let commands = take_commands();
-    assert!(matches!(commands.as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Dump]));
+    assert!(matches!(
+        commands.as_slice(),
+        [TrainerCmd::CancelBulk, TrainerCmd::Dump]
+    ));
     activate_widget(&mut ui, W_SET_ALL);
     let commands = take_commands();
-    assert!(matches!(commands.as_slice(), [TrainerCmd::SetAll { confirm: false, .. }]));
+    assert!(matches!(
+        commands.as_slice(),
+        [TrainerCmd::SetAll { confirm: false, .. }]
+    ));
     ui.bulk_preview = true;
     activate_widget(&mut ui, W_SET_ALL);
     let commands = take_commands();
-    assert!(matches!(commands.as_slice(), [TrainerCmd::SetAll { confirm: true, .. }]));
+    assert!(matches!(
+        commands.as_slice(),
+        [TrainerCmd::SetAll { confirm: true, .. }]
+    ));
     // A second click before a new preview is drawn cannot confirm again.
     activate_widget(&mut ui, W_SET_ALL);
     let commands = take_commands();
-    assert!(matches!(commands.as_slice(), [TrainerCmd::SetAll { confirm: false, .. }]));
+    assert!(matches!(
+        commands.as_slice(),
+        [TrainerCmd::SetAll { confirm: false, .. }]
+    ));
     ui.bulk_preview = true;
     activate_widget(&mut ui, W_TYPE);
     assert!(!ui.bulk_preview);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk]
+    ));
 }
-
 
 #[test]
 fn safe_mode_latches_and_is_sent_with_bulk_commands() {
@@ -237,7 +288,10 @@ fn safe_mode_latches_and_is_sent_with_bulk_commands() {
     let mut ui = TrainerUi::new();
     ui.set_text = "999".to_string();
     assert!(ui.safe_mode);
-    assert_eq!(safe_mode_colors(ui.safe_mode), (COL_SAFE_MODE_ON, COL_SAFE_MODE_TEXT));
+    assert_eq!(
+        safe_mode_colors(ui.safe_mode),
+        (COL_SAFE_MODE_ON, COL_SAFE_MODE_TEXT)
+    );
     take_commands();
 
     ui.bulk_preview = true;
@@ -245,11 +299,19 @@ fn safe_mode_latches_and_is_sent_with_bulk_commands() {
     assert!(!ui.safe_mode);
     assert!(!ui.bulk_preview);
     assert_eq!(safe_mode_colors(ui.safe_mode), (COL_WIDGET, COL_TEXT));
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk]
+    ));
     activate_widget(&mut ui, W_SET_ALL);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::SetAll {
-        safe_mode: false, confirm: false, ..
-    }]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::SetAll {
+            safe_mode: false,
+            confirm: false,
+            ..
+        }]
+    ));
     assert!(!ui.safe_mode);
 
     activate_widget(&mut ui, W_SAFE_MODE);
@@ -262,48 +324,35 @@ fn safe_mode_latches_and_is_sent_with_bulk_commands() {
     }
     take_commands();
     activate_widget(&mut ui, W_SET_ALL);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::SetAll {
-        safe_mode: true, confirm: false, ..
-    }]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::SetAll {
+            safe_mode: true,
+            confirm: false,
+            ..
+        }]
+    ));
     assert!(ui.safe_mode);
 }
 
-
-#[test]
-fn speed_controls_latch_clamp_and_reset_without_memory_commands() {
-    let _guard = INPUT_TEST_LOCK.lock().unwrap();
-    let mut ui = TrainerUi::new();
-    take_commands();
-    assert_eq!(ui.speed, Speed::Normal);
-    assert_eq!(ui.take_speed_request(), None);
-    activate_widget(&mut ui, W_SPEED_DOWN);
-    assert_eq!(ui.take_speed_request(), Some(Speed::Half));
-    assert_eq!(ui.take_speed_request(), None);
-    activate_widget(&mut ui, W_SPEED_DOWN);
-    activate_widget(&mut ui, W_SPEED_DOWN);
-    assert_eq!(ui.take_speed_request(), Some(Speed::Quarter));
-    for _ in 0..8 {
-        activate_widget(&mut ui, W_SPEED_UP);
-    }
-    assert_eq!(ui.take_speed_request(), Some(Speed::Quadruple));
-    activate_widget(&mut ui, W_CLOSE);
-    activate_widget(&mut ui, W_BUTTON);
-    assert_eq!(ui.speed, Speed::Quadruple);
-    assert_eq!(ui.take_speed_request(), None);
-    ui.bulk_preview = true;
-    activate_widget(&mut ui, W_SPEED_RESET);
-    assert_eq!(ui.take_speed_request(), Some(Speed::Normal));
-    assert!(!ui.bulk_preview);
-    assert!(take_commands().iter().all(|cmd| matches!(cmd, TrainerCmd::CancelBulk)));
-}
-
 fn category_results(count: usize) -> Vec<SearchResult> {
-    (0..count).map(|i| {
-        let mut analysis = crate::trainer::classify::Analysis::default();
-        analysis.category = if i < 250 { Category::Unknown } else { Category::Money };
-        SearchResult { addr: 0x1000 + i as u32 * 4, vtype: VType::I32,
-            bits: 135, changed: false, analysis }
-    }).collect()
+    (0..count)
+        .map(|i| {
+            let mut analysis = crate::trainer::classify::Analysis::default();
+            analysis.category = if i < 250 {
+                Category::Unknown
+            } else {
+                Category::Money
+            };
+            SearchResult {
+                addr: 0x1000 + i as u32 * 4,
+                vtype: VType::I32,
+                bits: 135,
+                changed: false,
+                analysis,
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -319,8 +368,14 @@ fn categories_and_paging_use_all_hits_not_just_the_first_two_hundred() {
     take_commands();
     activate_widget(&mut ui, W_CATEGORY);
     assert_eq!(ui.filter, ResultFilter::Category(Category::Money));
-    assert!(ui.results.is_empty(), "stale page must not remain selectable");
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]));
+    assert!(
+        ui.results.is_empty(),
+        "stale page must not remain selectable"
+    );
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]
+    ));
     ui.update_results(&hits, false);
     assert_eq!(ui.filtered_results, 50);
     assert_eq!(ui.results[0].addr, hits[250].addr);
@@ -348,18 +403,30 @@ fn category_selection_cancels_preview_and_scopes_bulk_command() {
     assert!(!ui.bulk_preview);
     assert_eq!(ui.selected, None);
     assert_eq!(ui.selected_type, None);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]
+    ));
     activate_widget(&mut ui, W_SET_ALL);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::SetAll {
-        filter: ResultFilter::Category(Category::Money), confirm: false, safe_mode: true, ..
-    }]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::SetAll {
+            filter: ResultFilter::Category(Category::Money),
+            confirm: false,
+            safe_mode: true,
+            ..
+        }]
+    ));
 }
 
 #[test]
 fn selected_result_keeps_concrete_type_and_shows_reason() {
     let _guard = INPUT_TEST_LOCK.lock().unwrap();
     let mut hits = category_results(1);
-    hits.push(SearchResult { vtype: VType::U8, ..hits[0] });
+    hits.push(SearchResult {
+        vtype: VType::U8,
+        ..hits[0]
+    });
     let mut ui = TrainerUi::new();
     ui.update_results(&hits, true);
     take_commands();
@@ -405,8 +472,15 @@ fn watch_controls_pause_browse_and_select_without_writing() {
     let _guard = INPUT_TEST_LOCK.lock().unwrap();
     let mut ui = TrainerUi::new();
     ui.open = true;
-    ui.activity = (0..12).map(|i| Change { addr: 0x1000 + 4 * i, vtype: VType::I32,
-        before: 30, after: 29, at: std::time::Instant::now() }).collect();
+    ui.activity = (0..12)
+        .map(|i| Change {
+            addr: 0x1000 + 4 * i,
+            vtype: VType::I32,
+            before: 30,
+            after: 29,
+            at: std::time::Instant::now(),
+        })
+        .collect();
     take_commands();
     activate_widget(&mut ui, W_WATCH);
     assert!(ui.watch_open && ui.open);
@@ -417,15 +491,27 @@ fn watch_controls_pause_browse_and_select_without_writing() {
     activate_widget(&mut ui, W_CHANGE_BASE);
     assert!(ui.open);
     assert_eq!(ui.watch_target, Some((0x1014, VType::I32)));
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]
+    ));
     activate_widget(&mut ui, W_WATCH_PAUSE);
     assert!(!ui.watch_paused);
     assert_eq!(ui.activity_scroll, 0);
     take_commands();
     activate_widget(&mut ui, W_MARK);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Mark]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk, TrainerCmd::Mark]
+    ));
     activate_widget(&mut ui, W_DECREASED);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Compare(WatchFilter::Decreased)]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [
+            TrainerCmd::CancelBulk,
+            TrainerCmd::Compare(WatchFilter::Decreased)
+        ]
+    ));
 }
 
 #[test]
@@ -434,8 +520,13 @@ fn watch_edit_is_pinned_and_independent_of_main_selection_and_live_feed() {
     let mut ui = TrainerUi::new();
     ui.selected = Some(0x9999);
     ui.selected_type = Some(VType::F32);
-    ui.activity.push(Change { addr: 0x1000, vtype: VType::I32,
-        before: 30, after: 29, at: std::time::Instant::now() });
+    ui.activity.push(Change {
+        addr: 0x1000,
+        vtype: VType::I32,
+        before: 30,
+        after: 29,
+        at: std::time::Instant::now(),
+    });
     take_commands();
     activate_widget(&mut ui, W_CHANGE_BASE);
     assert!(!ui.open, "WATCH must not open the main editor");
@@ -448,11 +539,16 @@ fn watch_edit_is_pinned_and_independent_of_main_selection_and_live_feed() {
     assert_eq!(ui.watch_text, "7");
     take_commands();
     activate_widget(&mut ui, W_WATCH_SET);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk,
-        TrainerCmd::WatchSet { addr: 0x1000, vtype: VType::I32, text }] if text == "7"));
+    assert!(
+        matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk,
+        TrainerCmd::WatchSet { addr: 0x1000, vtype: VType::I32, text }] if text == "7")
+    );
     ui.watch_current = None;
     activate_widget(&mut ui, W_WATCH_SET);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk]));
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk]
+    ));
     activate_widget(&mut ui, W_WATCH_DONE);
     assert_eq!(ui.watch_target, None);
     take_commands();
@@ -473,11 +569,22 @@ fn watch_inline_editor_fits_and_both_windows_have_distinct_hit_targets() {
                 assert!(panel.rect.x + panel.rect.w <= viewport.2 as f32);
                 for &(id, r) in &panel.widgets {
                     assert!(ids.insert(id), "duplicate id {id}");
-                    assert!(r.x >= panel.rect.x && r.x + r.w <= panel.rect.x + panel.rect.w + 0.001);
-                    assert!(r.y >= panel.rect.y && r.y + r.h <= panel.rect.y + panel.rect.h + 0.001);
+                    assert!(
+                        r.x >= panel.rect.x && r.x + r.w <= panel.rect.x + panel.rect.w + 0.001
+                    );
+                    assert!(
+                        r.y >= panel.rect.y && r.y + r.h <= panel.rect.y + panel.rect.h + 0.001
+                    );
                     let x = r.x + r.w / 2.0;
                     let y = r.y + r.h / 2.0;
-                    assert_eq!(layout.panels().flat_map(|p| &p.widgets).filter(|(_, rect)| rect.contains(x, y)).count(), 1);
+                    assert_eq!(
+                        layout
+                            .panels()
+                            .flat_map(|p| &p.widgets)
+                            .filter(|(_, rect)| rect.contains(x, y))
+                            .count(),
+                        1
+                    );
                 }
             }
             assert!(ids.contains(&W_WATCH_SET));

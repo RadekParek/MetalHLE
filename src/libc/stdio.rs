@@ -37,8 +37,8 @@ struct FILEHostObject {
 #[allow(clippy::upper_case_acronyms)]
 /// C `FILE` struct. This is an opaque type in C, so the definition here is our
 /// own.
-struct FILE {
-    fd: posix_io::FileDescriptor,
+pub(crate) struct FILE {
+    pub(crate) fd: posix_io::FileDescriptor,
 }
 unsafe impl SafeRead for FILE {}
 
@@ -100,16 +100,6 @@ impl State {
 type fpos_t = off_t;
 
 fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> MutPtr<FILE> {
-    // Geometry Dash music bypass: FMOD's streaming pipeline livelocks inside
-    // the emulator (see audio::music_bypass), so watch for the game opening
-    // its MP3 tracks and hand them to a host-side player instead.
-    let mut music_track = None;
-    if env.options.gd_music_bypass {
-        let guest_path = crate::fs::GuestPathBuf::from(
-            String::from_utf8_lossy(env.mem.cstr_at(filename)).into_owned(),
-        );
-        music_track = crate::audio::music_bypass::on_music_file_open(env, &guest_path);
-    }
     // Some testing on macOS suggests Apple's implementation will just ignore
     // flags it doesn't know about, and unfortunately real-world apps seem to
     // rely on this, e.g. using "wt" to mean open for writing in text mode,
@@ -179,9 +169,6 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
                     error: false,
                 },
             );
-            if let Some(name) = music_track {
-                crate::audio::music_bypass::register_music_file(res.to_bits(), name);
-            }
             res
         }
     }
@@ -287,8 +274,6 @@ fn fread(
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    crate::audio::music_bypass::note_stdio_activity(file_ptr.to_bits());
-
     if item_size == 0 {
         return 0;
     }
@@ -334,47 +319,19 @@ fn fread(
         0
     };
     let FILE { fd } = env.mem.read(file_ptr);
-    // Real stdio `fread` keeps issuing read(2) calls until it has satisfied the
-    // full request, hit end-of-file, or hit an error, and it sets the stream's
-    // EOF indicator when a read returns 0 before the request is filled. A
-    // single short read is therefore NOT reported as an error: the caller is
-    // expected to check feof()/ferror() to tell EOF from a real failure.
-    //
-    // We previously did just one posix_io::read(). For a regular file that
-    // returns fewer bytes than requested (the normal case near EOF), that left
-    // the stream's EOF indicator unset, because posix_io::read only marks EOF
-    // on a zero-length read. LevelDB's fread-based SequentialFile::Read relies
-    // on `if (bytes < wanted && !feof(f)) return IOError;`, so the unset EOF
-    // flag turned a perfectly good short read of a small file (e.g. a freshly
-    // written LevelDB `CURRENT`, 16 bytes) into an I/O error. That made
-    // Minecraft PE's `DB::Open` fail and fall back to repairing a doubled
-    // `db/db` path, so a newly created world could never be entered. Looping
-    // here — exactly like a real libc — issues the follow-up read that returns
-    // 0, sets the EOF indicator, and lets feof() report the truth.
-    let mut total_read: GuestUSize = 0;
-    let mut had_error = false;
-    while total_read < total_size {
-        let want = total_size - total_read;
-        let dst: MutVoidPtr = {
-            let base: MutPtr<u8> = buffer.cast();
-            (base + total_read).cast()
-        };
-        match posix_io::read(env, fd, dst, want) {
-            -1 => {
-                had_error = true;
-                break;
-            }
-            0 => break, // EOF; posix_io::read has set the fd's EOF indicator
-            n => total_read += n as GuestUSize,
+    match posix_io::read(env, fd, buffer, total_size) {
+        -1 => {
+            env.libc_state
+                .stdio
+                .get_file_host_obj_mut(&mut env.mem, file_ptr)
+                .error = true;
+            already_read / item_size
+        }
+        bytes_read => {
+            let bytes_read: GuestUSize = bytes_read.try_into().unwrap();
+            (bytes_read + already_read) / item_size
         }
     }
-    if had_error {
-        env.libc_state
-            .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr)
-            .error = true;
-    }
-    (total_read + already_read) / item_size
 }
 
 fn fgetc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
@@ -623,11 +580,6 @@ fn fseeko(env: &mut Environment, file_ptr: MutPtr<FILE>, offset: off_t, whence: 
         set_errno(env, EINVAL);
         return -1;
     }
-    if offset == 0 && whence == SEEK_SET {
-        // A music stream rewound to the start: GD restarted the track
-        // (death + respawn, level retry).
-        crate::audio::music_bypass::note_stdio_rewind(file_ptr.to_bits());
-    }
     match posix_io::lseek(env, fd, offset, whence) {
         -1 => -1,
         _cur_pos => {
@@ -711,7 +663,6 @@ fn fclose(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
         set_errno(env, EBADF);
         return EOF;
     }
-    crate::audio::music_bypass::unregister_music_file(file_ptr.to_bits());
 
     env.mem.free(file_ptr.cast());
 

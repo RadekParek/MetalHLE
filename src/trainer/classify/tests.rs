@@ -16,10 +16,15 @@ fn keywords_are_complete_case_insensitive_and_can_conflict() {
     assert_eq!(word_mask(b"\0cooldown\0"), 1 << Category::Timer.index());
     assert_eq!(word_mask(b"\0golden healthcare 123ammo ammunition123\0"), 0);
     assert_eq!(word_mask(b"ammo"), 0, "clipped tokens aren't evidence");
-    let utf16: Vec<u8> = "\0Money\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let utf16: Vec<u8> = "\0Money\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
     assert_eq!(word_mask(&utf16), 1 << Category::Money.index());
     let mut analysis = Analysis {
-        text_mask: word_mask(b"\0money health\0"), inspected: true, ..Analysis::default()
+        text_mask: word_mask(b"\0money health\0"),
+        inspected: true,
+        ..Analysis::default()
     };
     analysis.update_hint();
     assert_eq!(analysis.category, Category::Unknown);
@@ -67,12 +72,23 @@ fn unit_decrements_alone_are_ambiguous_but_reload_cycles_add_evidence() {
 #[test]
 fn timer_guess_needs_repeated_fractional_float_decreases() {
     let mut a = Analysis::default();
-    for (old, new) in [(3.5f32, 3.25f32), (3.25, 3.0), (3.0, 2.75), (2.75, 2.5), (2.5, 2.25), (2.25, 2.0)] {
+    for (old, new) in [
+        (3.5f32, 3.25f32),
+        (3.25, 3.0),
+        (3.0, 2.75),
+        (2.75, 2.5),
+        (2.5, 2.25),
+        (2.25, 2.0),
+    ] {
         a.observe(VType::F32, old.to_bits() as u64, new.to_bits() as u64);
     }
     assert_eq!(a.category, Category::Timer);
     assert_eq!(a.evidence, Evidence::SmoothDrops);
-    a.observe(VType::F32, 2.75f32.to_bits() as u64, f32::NAN.to_bits() as u64);
+    a.observe(
+        VType::F32,
+        2.75f32.to_bits() as u64,
+        f32::NAN.to_bits() as u64,
+    );
     assert_eq!(a.category, Category::Unknown);
 }
 
@@ -86,16 +102,25 @@ fn memory_inspection_is_bounded_read_only_and_does_not_cross_allocations() {
     let bytes = mem.bytes_at_mut(ptr.cast(), 128);
     bytes[8..14].copy_from_slice(b"money\0");
     let result = SearchResult {
-        addr: base + 32, vtype: VType::I32, bits: 135, changed: false,
+        addr: base + 32,
+        vtype: VType::I32,
+        bits: 135,
+        changed: false,
         analysis: Analysis::default(),
     };
     assert!(result.vtype.write_at(&mut mem, result.addr, result.bits));
-    let before = mem.get_bytes_fallible(ptr.cast_const(), 128).unwrap().to_vec();
+    let before = mem
+        .get_bytes_fallible(ptr.cast_const(), 128)
+        .unwrap()
+        .to_vec();
     let mut results = [result];
     let mut cursor = 0;
     analyze_batch(&mem, &mut results, &mut cursor);
     assert_eq!(results[0].analysis.category, Category::Money);
-    assert_eq!(mem.get_bytes_fallible(ptr.cast_const(), 128).unwrap(), before);
+    assert_eq!(
+        mem.get_bytes_fallible(ptr.cast_const(), 128).unwrap(),
+        before
+    );
 
     let other = mem.alloc(16);
     mem.bytes_at_mut(other.cast(), 16).fill(0);
@@ -113,14 +138,22 @@ fn large_searches_are_inspected_incrementally() {
     let mut mem = Mem::new();
     mem.set_null_segment_size(PAGE_SIZE);
     let base = mem.alloc(8192).to_bits();
-    let mut results: Vec<_> = (0..1325).map(|i| SearchResult {
-        addr: base + i * 4, vtype: VType::I32, bits: 0, changed: false,
-        analysis: Analysis::default(),
-    }).collect();
+    let mut results: Vec<_> = (0..1325)
+        .map(|i| SearchResult {
+            addr: base + i * 4,
+            vtype: VType::I32,
+            bits: 0,
+            changed: false,
+            analysis: Analysis::default(),
+        })
+        .collect();
     let mut cursor = 0;
     analyze_batch(&mem, &mut results, &mut cursor);
     assert_eq!(cursor, 1024);
-    assert_eq!(results.iter().filter(|r| r.analysis.inspected).count(), 1024);
+    assert_eq!(
+        results.iter().filter(|r| r.analysis.inspected).count(),
+        1024
+    );
     analyze_batch(&mem, &mut results, &mut cursor);
     assert!(results.iter().all(|r| r.analysis.inspected));
 }
@@ -144,8 +177,11 @@ fn field_names_are_stronger_than_unrelated_neighbouring_words() {
     assert_eq!(field_mask("currentAmmo"), 1 << Category::Ammo.index());
     assert_eq!(field_mask("currentHP"), 1 << Category::Health.index());
     assert_eq!(field_mask("healthPoints"), 1 << Category::Health.index());
-    let mut a = Analysis { field_mask: field_mask("_coins"),
-        text_mask: word_mask(b"\0health timer\0"), ..Analysis::default() };
+    let mut a = Analysis {
+        field_mask: field_mask("_coins"),
+        text_mask: word_mask(b"\0health timer\0"),
+        ..Analysis::default()
+    };
     a.update_hint();
     assert_eq!(a.category, Category::Money);
     assert_eq!(a.evidence, Evidence::ScalarField);
@@ -157,7 +193,12 @@ fn irregular_float_changes_do_not_look_like_a_steady_timer() {
     let mut value = 20.5f32;
     for step in 0..12 {
         let next = value - if step % 2 == 0 { 0.1 } else { 1.5 };
-        a.observe_timed(VType::F32, value.to_bits() as u64, next.to_bits() as u64, 0.25);
+        a.observe_timed(
+            VType::F32,
+            value.to_bits() as u64,
+            next.to_bits() as u64,
+            0.25,
+        );
         assert_eq!(a.category, Category::Unknown);
         value = next;
     }
