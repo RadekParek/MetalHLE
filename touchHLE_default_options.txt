@@ -219,8 +219,8 @@ com.ea.nfsucinc: --force-composition
 com.gameloft.BladesOfFury: --force-composition
 
 # MCPE LITE
-com.mojang.minecraftpe:
-com.mojang.minecraftpe-demo:
+com.mojang.minecraftpe: --allow-network-access
+com.mojang.minecraftpe-demo: --allow-network-access
 
 # Bruce Lee
 com.indiagames.brucelee:  --force-composition --ignore-gl-errors
