@@ -1164,6 +1164,12 @@ fn weight_stride_or(stride: GLint) -> usize {
 }
 
 impl GLES for GLES1OnGL2<'_> {
+    fn is_native_es1(&self) -> bool {
+        false
+    }
+    fn is_translator(&self) -> bool {
+        true
+    }
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gl21::GetString(gl21::VERSION) as *const _);
         let vendor = CStr::from_ptr(gl21::GetString(gl21::VENDOR) as *const _);

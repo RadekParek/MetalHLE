@@ -806,6 +806,9 @@ impl GLES for GLES1OnGLES2<'_> {
     fn is_es2(&self) -> bool {
         true
     }
+    fn is_translator(&self) -> bool {
+        true
+    }
 
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gl::GetString(gl::VERSION) as *const _);
@@ -2170,7 +2173,7 @@ impl GLES for GLES1OnGLES2<'_> {
         &mut self,
         target: GLenum,
         level: GLint,
-        internalformat: GLint,
+        mut internalformat: GLint,
         width: GLsizei,
         height: GLsizei,
         border: GLint,
@@ -2178,6 +2181,13 @@ impl GLES for GLES1OnGLES2<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
+        // BGRA guest uploads must also use a BGRA internal format: strict
+        // ES 2.0 front-ends (ANGLE) reject the RGBA/BGRA mismatch with
+        // GL_INVALID_OPERATION, leaving the texture uninitialised and every
+        // draw sampling it flat-coloured.
+        if format == es1::BGRA_EXT {
+            internalformat = es1::BGRA_EXT as GLint;
+        }
         let logger = GLES1to2Logger::new("glTexImage2D", "texture upload");
         logger.log_stage(
             "INPUT",
