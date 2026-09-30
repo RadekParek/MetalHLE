@@ -206,6 +206,10 @@ pub struct Environment {
     /// flooded the log with millions of repeated assertion lines). Once set,
     /// the main run loop stops instead of resuming the dead thread.
     pub(crate) main_thread_terminated: bool,
+    /// Synthetic host-to-guest call boundaries pushed by
+    /// [crate::abi] so C++ exception unwinding can stop before
+    /// resuming a suspended host callback.
+    host_to_guest_stack_frames: Vec<(ThreadId, u32)>,
 }
 
 /// What to do next when executing this thread.
@@ -933,6 +937,7 @@ let default_ipad = DeviceFamily::iPad2;
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
+            host_to_guest_stack_frames: Vec::new(),
             udf_bypass_count: 0,
             udf_log_counts: HashMap::new(),
             guest_termination_requested: false,
@@ -1109,6 +1114,7 @@ let default_ipad = DeviceFamily::iPad2;
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
+            host_to_guest_stack_frames: Vec::new(),
             udf_bypass_count: 0,
             udf_log_counts: HashMap::new(),
             scheduler_watchdog: SchedulerWatchdog::default(),
@@ -1185,6 +1191,7 @@ let default_ipad = DeviceFamily::iPad2;
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
+            host_to_guest_stack_frames: Vec::new(),
             udf_bypass_count: 0,
             udf_log_counts: HashMap::new(),
             scheduler_watchdog: SchedulerWatchdog::default(),
@@ -2041,6 +2048,38 @@ let default_ipad = DeviceFamily::iPad2;
         let old_thread = self.current_thread;
         self.run_inner();
         assert!(self.current_thread == old_thread);
+    }
+
+    pub(crate) fn push_host_to_guest_stack_frame(
+        &mut self,
+        frame_pointer: u32,
+    ) -> (ThreadId, u32) {
+        let frame = (self.current_thread, frame_pointer);
+        self.host_to_guest_stack_frames.push(frame);
+        frame
+    }
+
+    /// Remove a synthetic frame after its host-to-guest call has returned.
+    pub(crate) fn pop_host_to_guest_stack_frame(&mut self, frame: (ThreadId, u32)) {
+        if let Some(index) = self
+            .host_to_guest_stack_frames
+            .iter()
+            .rposition(|&candidate| candidate == frame)
+        {
+            self.host_to_guest_stack_frames.remove(index);
+        } else {
+            log_no_panic!(
+                "Warning: synthetic host-to-guest frame {:?} was not tracked.",
+                frame
+            );
+        }
+    }
+
+    /// Whether the current frame is a synthetic host-to-guest call boundary.
+    pub(crate) fn is_host_to_guest_stack_frame(&self, frame_pointer: u32) -> bool {
+        self.host_to_guest_stack_frames
+            .iter()
+            .any(|&(thread, fp)| thread == self.current_thread && fp == frame_pointer)
     }
 
     /// Switch the current thread, putting the old host context (if it exists)

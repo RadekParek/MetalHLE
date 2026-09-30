@@ -122,6 +122,12 @@ pub(crate) fn unwind_to_app_frame(env: &mut Environment) -> bool {
         if fp == 0 || fp == 0xffff_ffff || (fp & 3) != 0 {
             break;
         }
+        // Synthetic host-to-guest call boundary (see `abi`): its saved LR is
+        // the interrupted guest LR, not a trampoline sentinel, so check the
+        // tracked-frame list explicitly before resuming a host callback.
+        if env.is_host_to_guest_stack_frame(fp) {
+            break;
+        }
         if let Some(ref r) = stack_range {
             if !r.contains(&fp) {
                 break;

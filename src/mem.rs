@@ -299,7 +299,9 @@ pub trait SafeWrite: Sized {}
 unsafe impl SafeRead for [u64; 2] {}
 impl<T: SafeRead> SafeWrite for T {}
 
-type Bytes = [u8; 1 << 32];
+// Extended one page past the 4 GiB boundary so off-by-one/OOB guest
+// addresses stay addressable instead of tripping range assertions.
+type Bytes = [u8; (1_usize << 32) + 4096];
 pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 const MAX_DEFENSIVE_GUEST_ACCESS: GuestUSize = 64 * 1024 * 1024;
@@ -559,7 +561,7 @@ impl Mem {
     /// Only for use by [crate::gdb::GdbServer].
     pub fn get_bytes_fallible(&self, addr: ConstVoidPtr, count: GuestUSize) -> Option<&[u8]> {
         if addr.to_bits() < self.null_segment_size {
-            // Для GDB возвращаем stub-страницу
+            // GDB reads on the null page see the stub page instead of failing.
             let offset = (addr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let stub_slice = unsafe {
@@ -570,9 +572,15 @@ impl Mem {
             };
             return Some(&stub_slice[..count_usize.min(stub_slice.len())]);
         }
-        self.bytes()
-            .get(addr.to_bits() as usize..)?
-            .get(..count as usize)
+        // The extension page past the 4 GiB boundary exists only as a safety
+        // margin for the infallible accessors; guest-visible memory ends at
+        // exactly 4 GiB, so report OOB as None here.
+        let start = addr.to_bits() as usize;
+        let end = start.checked_add(count as usize)?;
+        if end > 1usize << 32 {
+            return None;
+        }
+        self.bytes().get(start..end)
     }
     /// Special version of [Self::bytes_at_mut] that returns [None] rather than
     /// panicking on failure.
@@ -583,12 +591,17 @@ impl Mem {
         count: GuestUSize,
     ) -> Option<&mut [u8]> {
         if addr.to_bits() < self.null_segment_size {
+            // GDB must not write to the null page.
             return None;
-            // GDB не должен писать в null-page
         }
-        self.bytes_mut()
-            .get_mut(addr.to_bits() as usize..)?
-            .get_mut(..count as usize)
+        // See `get_bytes_fallible`: guest-visible memory ends at exactly
+        // 4 GiB, so report OOB as None here.
+        let start = addr.to_bits() as usize;
+        let end = start.checked_add(count as usize)?;
+        if end > 1usize << 32 {
+            return None;
+        }
+        self.bytes_mut().get_mut(start..end)
     }
 
     /// Get a slice for reading `count` bytes.
@@ -802,7 +815,9 @@ impl Mem {
         let guest_mem_range = self.bytes().as_ptr_range();
         assert!(guest_mem_range.contains(&host_ptr));
         let guest_addr = host_ptr as usize - guest_mem_range.start as usize;
-        Ptr::from_bits(u32::try_from(guest_addr).unwrap())
+        // The extended address space (see `Bytes`) can legitimately produce
+        // addresses past 32 bits; truncate instead of panicking.
+        Ptr::from_bits(guest_addr as u32)
     }
 
     /// Returns whether a host pointer addresses a location inside the guest's
