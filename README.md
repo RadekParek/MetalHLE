@@ -18,20 +18,21 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 
 The titles below have been tested with HyperHLE-Fork and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works.
 
-- N.O.V.A. 3
-- Gangstar Vegas
-- Geometry Dash (2.11 and 1.0)
-- Terraria (1.0)
-- Modern Combat 3 (1.5.0)
-- Asphalt 7
-- Turbo Dismount
-- Scarface
-- Zombie Safari
-- Real Racing 1
-- Silent Ops
-- Need For Speed: Most Wanted (2012)
-- Minecraft 0.14.2-0.16.2
-- Oceanhorn
+- N.O.V.A. 3 (Playable)
+- Gangstar Vegas (Unplayable)
+- Geometry Dash (2.11 and 1.0 + Playable)
+- Terraria (1.0 + Playable)
+- Modern Combat 3 (1.5.0 + Playable)
+- Asphalt 7 (Playable)
+- Turbo Dismount (Pretty Playable)
+- Scarface (Playable)
+- Zombie Safari (Playable)
+- Real Racing 1 (Playable
+- Silent Ops (Playable
+- Need For Speed: Most Wanted (Unplayable)
+- Minecraft 0.14.2-0.16.2 (Playable)
+- Oceanhorn (Unplayable)
+- Asphalt 8 (1.0.0) (Maybe playable)
 - And more more games
 
 ## Build and documentation
