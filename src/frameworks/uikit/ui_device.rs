@@ -231,7 +231,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     ns_string::from_rust_string(env, format!("{major}.{minor}.{patch}"))
 }
 - (id)uniqueIdentifier {
-    ns_string::get_static_str(env, "touchHLEdevice..........................")
+    ns_string::get_static_str(env, "MetalHLEdevice..........................")
 }
 
 // `-identifierForVendor` (iOS 6.0+) — `NSUUID *` that uniquely identifies the

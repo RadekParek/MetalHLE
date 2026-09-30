@@ -428,7 +428,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow_mut::<AVCaptureSessionHostObject>(this);
         host.preset = preset;
     }
-    log!("[(AVCaptureSession*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} init] (MetalHLE stub)", this);
     this
 }
 
@@ -536,7 +536,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: Lifecycle
 
 - (())startRunning {
-    log!("[(AVCaptureSession*){:?} startRunning] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} startRunning] (MetalHLE stub)", this);
     env.objc.borrow_mut::<AVCaptureSessionHostObject>(this).running = true;
     if !env.framework_state.avfoundation.av_capture.running_sessions.contains(&this) {
         env.framework_state.avfoundation.av_capture.running_sessions.push(this);
@@ -548,7 +548,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())stopRunning {
-    log!("[(AVCaptureSession*){:?} stopRunning] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} stopRunning] (MetalHLE stub)", this);
     env.objc.borrow_mut::<AVCaptureSessionHostObject>(this).running = false;
     env.framework_state.avfoundation.av_capture.running_sessions.retain(|&s| s != this);
     let nc: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -725,7 +725,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    log!("[(AVCaptureVideoDataOutput*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureVideoDataOutput*){:?} init] (MetalHLE stub)", this);
     this
 }
 
@@ -789,7 +789,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    log!("[(AVCaptureMetadataOutput*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureMetadataOutput*){:?} init] (MetalHLE stub)", this);
     let host = env.objc.borrow_mut::<AVCaptureMetadataOutputHostObject>(this);
     host.rect_of_interest = CGRect {
         origin: crate::frameworks::core_graphics::CGPoint { x: 0.0, y: 0.0 },

@@ -77,7 +77,7 @@ const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init { this }
-- (id)name { metal_string(env, "HyperHLE Metal compatibility device") }
+- (id)name { metal_string(env, "MetalHLE Metal compatibility device") }
 - (bool)hasUnifiedMemory { true }
 - (NSUInteger)recommendedMaxWorkingSetSize { 0 }
 - (bool)supportsFamily:(NSUInteger)_family { true }

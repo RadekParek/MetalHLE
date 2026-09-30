@@ -63,7 +63,7 @@ impl FpsCounter {
         if duration >= Duration::from_secs(1) {
             self.time = now;
             let fps = std::mem::take(&mut self.frames) as f32 / duration.as_secs_f32();
-            echo!("touchHLE: {} FPS: {:.2}", label, fps);
+            echo!("MetalHLE: {} FPS: {:.2}", label, fps);
             if hud {
                 HUD_FPS_TENTHS.store((fps * 10.0).round() as u64, Ordering::Relaxed);
                 refresh_hud_metrics();

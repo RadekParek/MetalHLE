@@ -16,6 +16,7 @@ Changes are categorised as follows:
 ## NEXT
 
 - Rebrand completed: repository, release workflow, scripts, Android package and issue templates now say MetalHLE 2.0 (GitHub signing secrets keep their HYPERHLE_* names so existing CI credentials keep working). New iOS 26-style wallpaper and unofficial icon installed for every platform; app picker and its options sheet stretch to the full host display, with horizontal paging on the home screen and vertical scrolling in settings.
+- Restored the two features the reference-tree swap had dropped: Geometry Dash music bypass (FMOD stream hand-off to host player, `--fix-music`/`TOUCHHLE_GD_MUSIC_BYPASS`) and the Android in-emulator web view, both rebased on top of the latest upstream stdio fread/EOF fix. Renderer strings and Metal/GameCenter/AVFoundation banners now say MetalHLE 2.0 / metalhle.local instead of MetalHLE 1.0 / hyperhle.local.
 - The app picker now matches the legacy fork's home screen: scrolling icon grid, wallpaper, Add Game / Settings / Files / About buttons with their original icons, per-app context settings (device model, scale, GL driver, orientation), and full options surface (graphics API, render rotation, audio backend, memory model, texture filtering, PVRTC decoding and more).
 - User-facing branding is now "MetalHLE 2.0" (version 2.0.0): startup banner, window title, crash dialogs, picker error messages and the file-directory button label. Internal crate, binary and data-directory names remain `touchHLE` so existing installs, CI packaging and user data keep working.
 

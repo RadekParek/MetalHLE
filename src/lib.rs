@@ -31,6 +31,7 @@ mod android_media;
 mod env_flags;
 mod abi;
 mod arm64_runtime;
+mod android_web_view;
 mod audio;
 mod bundle;
 mod cpu;

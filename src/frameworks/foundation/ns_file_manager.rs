@@ -300,7 +300,7 @@ fn NSUserName(_env: &mut Environment) -> id {
 
 fn NSFullUserName(_env: &mut Environment) -> id {
     // Return a default full user name
-    let full_name = ns_string::from_rust_string(_env, String::from("touchHLE User"));
+    let full_name = ns_string::from_rust_string(_env, String::from("MetalHLE User"));
     autorelease(_env, full_name)
 }
 

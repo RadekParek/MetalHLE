@@ -422,6 +422,8 @@ pub struct Options {
     /// Fill the host display without preserving the emulated device aspect ratio.
     /// This is a presentation-only option; guest orientation and input geometry stay unchanged.
     pub fullscreen_stretched: bool,
+    /// Geometry Dash music bypass (host-side audio player for FMOD MP3 streams).
+    pub gd_music_bypass: bool,
     pub device_family: Option<DeviceFamily>,
     pub auto_device_family: bool,
     /// When set, the guest sees a screen of exactly this size (in points) and
@@ -577,6 +579,9 @@ impl Default for Options {
             trainer_disabled: true,
             corruption: CorruptionOptions::default(),
             custom_screen_size: None,
+            gd_music_bypass: std::env::var_os("TOUCHHLE_GD_MUSIC_BYPASS")
+                .map(|value| value != "0")
+                .unwrap_or(false),
             initial_orientation: DeviceOrientation::Portrait,
             render_rotation: RenderRotation::Default,
             revert_x_axis: false,
@@ -716,6 +721,8 @@ impl Options {
             self.corruption.max_offset = Some(off);
         } else if arg == "--fullscreen" {
             self.fullscreen = true;
+        } else if arg == "--fix-music" {
+            self.gd_music_bypass = true;
         } else if arg == "--fullscreen-stretched" {
             self.fullscreen = true;
             self.fullscreen_stretched = true;
