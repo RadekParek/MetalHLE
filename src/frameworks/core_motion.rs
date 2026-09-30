@@ -331,14 +331,18 @@ const ATTITUDE_EPSILON: f64 = 1.0e-9;
 /// +-0.02g even in a resting hand (and much more during normal handling);
 /// feeding that straight into a strong gravity correction shows up as
 /// visible camera jitter. The gravity anchor only needs the slow content.
-const ATTITUDE_ACCEL_LPF_TAU: f64 = 0.2;
+const ATTITUDE_ACCEL_LPF_TAU: f64 = 0.15;
 
 /// Time constant for learning the gyroscope bias while the device is
 /// evidently stationary. Host gyroscopes delivered through SDL can carry a
-/// constant offset large enough to spin a naive complementary filter away;
-/// whatever the gyroscope reports while the device is provably not rotating
-/// is, by definition, bias to subtract.
+/// constant offset large enough to spin a naive complementary filter away.
+/// Bias learning still requires a steady accelerometer reading, and the
+/// near-zero-rate guard prevents a deliberate slow turn from being learned
+/// as sensor drift.
 const ATTITUDE_BIAS_TAU: f64 = 2.0;
+/// Bias learning is limited to near-zero angular rates so a deliberate slow
+/// turn is not mistaken for sensor drift.
+const ATTITUDE_BIAS_MAX_RATE: f64 = 0.025;
 
 /// Gain [0..1] of the gravity correction applied per second of elapsed time
 /// while the (smoothed) accelerometer reading looks trustworthy. The anchor
@@ -354,7 +358,7 @@ const ATTITUDE_CORRECTION_PER_SEC: f64 = 6.0;
 const ATTITUDE_ACCEL_TRUST_BAND: f64 = 0.2;
 /// Gyroscope integration is skipped for steps larger than this: beyond it a
 /// stale rate sample would integrate garbage (e.g. after a suspended frame).
-const ATTITUDE_MAX_GYRO_DT: f64 = 0.1;
+const ATTITUDE_MAX_GYRO_DT: f64 = 0.25;
 
 #[inline]
 fn vec_len(v: (f64, f64, f64)) -> f64 {
@@ -429,7 +433,9 @@ impl MotionFilter {
         //     spinning the estimate forever.
         let raw_len = vec_len(accel);
         let recent_change = vec_len(vec_sub(accel, self.smoothed_accel));
-        let gyro_is_bias_evidence = (raw_len - 1.0).abs() < 0.05 && recent_change < 0.01;
+        let gyro_is_bias_evidence = (raw_len - 1.0).abs() < 0.05
+            && recent_change < 0.01
+            && vec_len(gyro) <= ATTITUDE_BIAS_MAX_RATE;
         if gyro_is_bias_evidence && dt > 0.0 {
             let bias_t = (dt / ATTITUDE_BIAS_TAU).clamp(0.0, 1.0);
             self.gyro_bias = vec_lerp(self.gyro_bias, gyro, bias_t);
@@ -439,14 +445,18 @@ impl MotionFilter {
         // 1. Integrate the (debiased) gyroscope: body-frame rate => right
         //    multiply. This is the smooth, low-latency part of the motion.
         if allow_gyro && dt > 0.0 && dt <= ATTITUDE_MAX_GYRO_DT {
-            let half_dt = dt * 0.5;
-            let dq = (
-                gyro_clean.0 * half_dt,
-                gyro_clean.1 * half_dt,
-                gyro_clean.2 * half_dt,
-                1.0,
-            );
-            self.q = quat_normalized(quat_mul(self.q, dq));
+            let angular_speed = vec_len(gyro_clean);
+            if angular_speed > ATTITUDE_EPSILON {
+                let half_angle = angular_speed * dt * 0.5;
+                let vector_scale = half_angle.sin() / angular_speed;
+                let dq = (
+                    gyro_clean.0 * vector_scale,
+                    gyro_clean.1 * vector_scale,
+                    gyro_clean.2 * vector_scale,
+                    half_angle.cos(),
+                );
+                self.q = quat_normalized(quat_mul(self.q, dq));
+            }
         }
 
         // 2. Gravity correction, from the *smoothed* samples; trust is
@@ -571,6 +581,60 @@ fn attitude_normalize_vec(v: (f64, f64, f64)) -> (f64, f64, f64) {
         (0.0, 0.0, -1.0)
     } else {
         (v.0 / len, v.1 / len, v.2 / len)
+    }
+}
+
+#[cfg(test)]
+mod motion_filter_tests {
+    use super::MotionFilter;
+    use std::time::Duration;
+
+    #[test]
+    fn slow_turn_is_not_learned_as_gyro_bias() {
+        let mut filter = MotionFilter::new((0.0, 0.0, -1.0));
+        let start = filter.last;
+        for i in 1..=200 {
+            filter.step(
+                (0.03, 0.0, 0.0),
+                (0.0, 0.0, -1.0),
+                start + Duration::from_millis(i * 10),
+                true,
+            );
+        }
+        assert_eq!(filter.gyro_bias.0, 0.0);
+    }
+
+    #[test]
+    fn stationary_small_gyro_bias_is_still_learned() {
+        let mut filter = MotionFilter::new((0.0, 0.0, -1.0));
+        let start = filter.last;
+        for i in 1..=200 {
+            filter.step(
+                (0.01, 0.0, 0.0),
+                (0.0, 0.0, -1.0),
+                start + Duration::from_millis(i * 10),
+                true,
+            );
+        }
+        assert!(filter.gyro_bias.0 > 0.006);
+    }
+
+    #[test]
+    fn gyro_integrates_a_200ms_poll_interval() {
+        let mut filter = MotionFilter::new((0.0, 0.0, -2.0));
+        let next = filter.last + Duration::from_millis(200);
+        filter.step((1.0, 0.0, 0.0), (0.0, 0.0, -2.0), next, true);
+        assert!((filter.q.0 - 0.1f64.sin()).abs() < 1.0e-9);
+        assert!((filter.q.3 - 0.1f64.cos()).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn accelerometer_filter_responds_faster_without_disabling_smoothing() {
+        let mut filter = MotionFilter::new((0.0, 0.0, -1.0));
+        let next = filter.last + Duration::from_millis(100);
+        filter.step((0.0, 0.0, 0.0), (0.2, 0.0, -1.0), next, true);
+        assert!(filter.smoothed_accel.0 > 0.09);
+        assert!(filter.smoothed_accel.0 < 0.11);
     }
 }
 
