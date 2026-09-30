@@ -12,8 +12,69 @@ use super::gles_generic::GLES;
 use super::util::{try_decode_pvrtc, try_decode_pvrtc_sub, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::sync::OnceLock;
+
+
+/// Hardcoded GPU identity strings matching the iPhone (2007) PowerVR MBX
+/// driver. The guest must never see the host desktop GPU, because games
+/// branch on these strings to pick render paths.
+static POWERVR_VENDOR: &[u8] = b"Imagination Technologies\0";
+static POWERVR_RENDERER: &[u8] = b"PowerVR MBXLite with VGPLite\0";
+static POWERVR_VERSION: &[u8] = b"OpenGL ES-CM 1.1 (76)\0";
+
+fn c_string_from_gl(pointer: *const GLubyte) -> String {
+    if pointer.is_null() {
+        return String::new();
+    }
+    unsafe {
+        CStr::from_ptr(pointer as *const _)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Texture parameters that only exist in OpenGL ES 2.0+ (or are otherwise
+/// invalid for ES 1.1). Games ported from other platforms routinely set them
+/// unconditionally (e.g. `GL_TEXTURE_WRAP_R` when refreshing a video texture
+/// every frame). Strict ES 1.1 front-ends (ANGLE) reject each call with a
+/// sticky `GL_INVALID_ENUM` that then pollutes the game's own error checks;
+/// lenient iOS-era drivers (PowerVR) silently accepted them. Since these
+/// parameters have no effect in an ES 1.1 pipeline, swallowing them matches
+/// the lenient behaviour and keeps the error queue clean.
+fn is_es2_only_texture_parameter(pname: GLenum) -> bool {
+    matches!(
+        pname,
+        0x8072 // GL_TEXTURE_WRAP_R
+        | 0x813A // GL_TEXTURE_MIN_LOD
+        | 0x813B // GL_TEXTURE_MAX_LOD
+        | 0x8136 // GL_TEXTURE_BASE_LEVEL
+        | 0x813D // GL_TEXTURE_MAX_LEVEL
+        | 0x84F9 // GL_DEPTH_STENCIL_TEXTURE_MODE
+        | 0x884C // GL_TEXTURE_COMPARE_MODE
+        | 0x884D // GL_TEXTURE_COMPARE_FUNC
+        | 0x912F // GL_TEXTURE_IMMUTABLE_FORMAT
+        | 0x8E42..=0x8E45 // GL_TEXTURE_SWIZZLE_R..GL_TEXTURE_SWIZZLE_RGBA
+        | 0x2804 // GL_TEXTURE_BORDER_COLOR
+        | 0x84FF // GL_TEXTURE_MAX_ANISOTROPY_EXT
+        | 0x85BC // GL_TEXTURE_STORAGE_HINT_APPLE
+    )
+}
+
+/// Whether the mipmapped-NPOT-texture workaround (see `TexImage2D`) is
+/// enabled. Defaults to `true` on Android, mirroring
+/// [crate::options::Options::fix_texture_min_filter]; the
+/// `--fix-texture-min-filter` / `--no-fix-texture-min-filter` flags and the
+/// `TOUCHHLE_FIX_TEXTURE_MIN_FILTER` environment variable override it.
+fn fix_texture_min_filter_enabled() -> bool {
+    static POLICY: OnceLock<bool> = OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => cfg!(target_os = "android"),
+    })
+}
 
 pub struct GLES1NativeContext {
     gl_ctx: GLContext,
@@ -296,26 +357,40 @@ impl GLES for GLES1Native<'_> {
         gles11::Flush()
     }
 
-    // MALI HACK: Прячем сломанные расширения
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte {
-        if name == gles11::EXTENSIONS {
-            static mut FILTERED_EXTS: *mut std::os::raw::c_char = std::ptr::null_mut();
-            if FILTERED_EXTS.is_null() {
-                let orig_ptr = gles11::GetString(name);
-                if !orig_ptr.is_null() {
-                    let orig_str = std::ffi::CStr::from_ptr(orig_ptr as *const _).to_string_lossy();
-                    // Вырезаем OES_matrix_palette чтобы заставить AC2
-                    // использовать CPU анимацию
-                    let filtered = orig_str.replace("GL_OES_matrix_palette", "");
-                    let c_str = std::ffi::CString::new(filtered).unwrap();
-                    FILTERED_EXTS = c_str.into_raw();
-                } else {
-                    return std::ptr::null();
-                }
-            }
-            return FILTERED_EXTS as *const GLubyte;
+        // Hardcoded GPU identity: report the iPhone (2007) PowerVR MBX stack
+        // instead of the host desktop GPU so guest drivers games that key
+        // behavior off renderer strings always take the well-tested path.
+        match name {
+            gles11::VENDOR => return POWERVR_VENDOR.as_ptr() as *const GLubyte,
+            gles11::RENDERER => return POWERVR_RENDERER.as_ptr() as *const GLubyte,
+            gles11::VERSION => return POWERVR_VERSION.as_ptr() as *const GLubyte,
+            _ => {}
         }
-        gles11::GetString(name)
+        if name != gles11::EXTENSIONS {
+            return gles11::GetString(name);
+        }
+
+        // Hide GL_OES_matrix_palette so games with broken software-skinned
+        // animation paths (Assassin's Creed 2-era engines) use CPU animation.
+        static FILTERED_EXTS: OnceLock<Option<CString>> = OnceLock::new();
+        FILTERED_EXTS
+            .get_or_init(|| {
+                let original = c_string_from_gl(gles11::GetString(name));
+                if original.is_empty() {
+                    return None;
+                }
+                let filtered = original
+                    .split_whitespace()
+                    .filter(|extension| *extension != "GL_OES_matrix_palette")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                CString::new(filtered).ok()
+            })
+            .as_ref()
+            .map_or(std::ptr::null(), |extensions| {
+                extensions.as_ptr() as *const GLubyte
+            })
     }
 
     // Other state manipulation
@@ -531,9 +606,25 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
+        if pointer.is_null() {
+            let mut bound_buffer: GLint = 0;
+            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
+            if bound_buffer == 0 {
+                gles11::DisableClientState(gles11::COLOR_ARRAY);
+                return;
+            }
+        }
         gles11::ColorPointer(size, type_, stride, pointer)
     }
     unsafe fn NormalPointer(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        if pointer.is_null() {
+            let mut bound_buffer: GLint = 0;
+            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
+            if bound_buffer == 0 {
+                gles11::DisableClientState(gles11::NORMAL_ARRAY);
+                return;
+            }
+        }
         gles11::NormalPointer(type_, stride, pointer)
     }
     unsafe fn TexCoordPointer(
@@ -543,6 +634,14 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
+        if pointer.is_null() {
+            let mut bound_buffer: GLint = 0;
+            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
+            if bound_buffer == 0 {
+                gles11::DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+                return;
+            }
+        }
         gles11::TexCoordPointer(size, type_, stride, pointer)
     }
     unsafe fn VertexPointer(
@@ -552,6 +651,14 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
+        if pointer.is_null() {
+            let mut bound_buffer: GLint = 0;
+            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
+            if bound_buffer == 0 {
+                gles11::DisableClientState(gles11::VERTEX_ARRAY);
+                return;
+            }
+        }
         gles11::VertexPointer(size, type_, stride, pointer)
     }
 
@@ -576,6 +683,13 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         indices: *const GLvoid,
     ) {
+        if indices.is_null() {
+            let mut bound_buffer: GLint = 0;
+            gles11::GetIntegerv(gles11::ELEMENT_ARRAY_BUFFER_BINDING, &mut bound_buffer);
+            if bound_buffer == 0 {
+                return;
+            }
+        }
         gles11::DrawElements(mode, count, type_, indices)
     }
 
@@ -683,21 +797,39 @@ impl GLES for GLES1Native<'_> {
         gles11::BindTexture(target, texture)
     }
     unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, param: GLint) {
+                if is_es2_only_texture_parameter(pname) {
+            return;
+        }
         gles11::TexParameteri(target, pname, param)
     }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) {
+                if is_es2_only_texture_parameter(pname) {
+            return;
+        }
         gles11::TexParameterf(target, pname, param)
     }
     unsafe fn TexParameterx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) {
+                if is_es2_only_texture_parameter(pname) {
+            return;
+        }
         gles11::TexParameterx(target, pname, param)
     }
     unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) {
+                if is_es2_only_texture_parameter(pname) {
+            return;
+        }
         gles11::TexParameteriv(target, pname, params)
     }
     unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
+                if is_es2_only_texture_parameter(pname) {
+            return;
+        }
         gles11::TexParameterfv(target, pname, params)
     }
     unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
+                if is_es2_only_texture_parameter(pname) {
+            return;
+        }
         gles11::TexParameterxv(target, pname, params)
     }
 
@@ -713,8 +845,41 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
+        // Strict drivers (ANGLE, Adreno's native ES 1.1) default to
+        // `UNPACK_ALIGNMENT` = 4. Guest uploads whose row stride isn't a
+        // multiple of 4 bytes (RGB/RGB565 textures whose width isn't
+        // divisible by 4 — common in 2D games) then get their rows shifted,
+        // which renders as scrambled / magenta ("pink") texture garbage.
+        // Upload with tightly-packed rows, then restore the host state.
+        let mut old_alignment: GLint = 4;
+        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
+        if old_alignment != 1 {
+            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
+        }
         if format == gles11::BGRA_EXT {
             internalformat = gles11::BGRA_EXT as GLint;
+        }
+        // Strict ES 1.1 drivers (ANGLE's GLES1 front-end, Adreno's native
+        // ES 1.1) reject non-power-of-two uploads unless the texture samples
+        // with CLAMP_TO_EDGE and a non-mipmap filter: the upload fails with
+        // GL_INVALID_ENUM and every draw sampling the texture shows garbage
+        // / black. Guest UI surfaces are typically NPOT (320x480 video
+        // planes, 640x1136 compositor framebuffers), and guests routinely
+        // leave GL_REPEAT as the wrap mode. Force CLAMP_TO_EDGE on the
+        // current binding for NPOT uploads; wrap is per-texture-object
+        // state, so other textures are unaffected.
+        let npot = !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0);
+        if level == 0 && fix_texture_min_filter_enabled() && npot {
+            gles11::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_S,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+            gles11::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_T,
+                gles11::CLAMP_TO_EDGE as _,
+            );
         }
         gles11::TexImage2D(
             target,
@@ -726,7 +891,20 @@ impl GLES for GLES1Native<'_> {
             format,
             type_,
             pixels,
-        )
+        );
+        if old_alignment != 1 {
+            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
+        }
+        // A guest-set mipmapped `TEXTURE_MIN_FILTER` on a non-power-of-two
+        // level-0 texture makes the texture incomplete on strict drivers:
+        // sampled texels come back undefined (pink/black garbage) instead of
+        // falling back to base-level sampling like lenient drivers do.
+        // Degrade the mipmap filter to its base filtering mode (preserving
+        // the guest's nearest/linear intent). Only for non-power-of-two
+        // dimensions; power-of-two textures support mipmaps everywhere.
+        if level == 0 && fix_texture_min_filter_enabled() && npot {
+            self.fix_mipmap_min_filter(target);
+        }
     }
 
     unsafe fn TexSubImage2D(
@@ -1688,5 +1866,28 @@ impl<'gl_ctx> GLES1Native<'gl_ctx> {
                 fn_name
             );
         }
+    }
+}
+
+impl GLES1Native<'_> {
+    /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound
+    /// texture to its base filtering mode, preserving the guest's
+    /// nearest/linear intent. See `TexImage2D` for why.
+    unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
+        let mut min_filter: GLint = 0;
+        gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
+        // 0x2700 NEAREST_MIPMAP_NEAREST, 0x2701 LINEAR_MIPMAP_NEAREST,
+        // 0x2702 NEAREST_MIPMAP_LINEAR, 0x2703 LINEAR_MIPMAP_LINEAR
+        let replacement: GLint = match min_filter {
+            0x2700 | 0x2702 => gles11::NEAREST as GLint,
+            0x2701 | 0x2703 => gles11::LINEAR as GLint,
+            _ => return,
+        };
+        let p_target = if (0x8515..=0x851A).contains(&target) {
+            0x8513
+        } else {
+            target
+        };
+        gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, replacement as _);
     }
 }
