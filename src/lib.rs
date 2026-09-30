@@ -42,7 +42,7 @@ mod environment;
 mod environment64;
 mod crash_handler;
 mod fastmap;
-mod font;
+pub mod font;
 mod frameworks;
 mod guest_clock;
 mod fs;
