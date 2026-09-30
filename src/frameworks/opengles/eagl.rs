@@ -846,7 +846,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             .count_frame(format_args!("EAGLContext {this:?}"));
     }
 
-    let fullscreen_layer = find_fullscreen_eagl_layer(env);
+    let mut fullscreen_layer = find_fullscreen_eagl_layer(env);
 
     // Unclear from documentation if this method requires the context to be
     // current, but it would be weird if it didn't?
@@ -936,6 +936,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     };
     drop(bindings);
+    if fullscreen_layer != drawable && attach_orphaned_eagl_view_to_root(env, drawable) {
+        fullscreen_layer = find_fullscreen_eagl_layer(env);
+    }
 
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
@@ -3385,3 +3388,92 @@ pub fn EAGLGetVersion(env: &mut Environment, major: MutPtr<u32>, minor: MutPtr<u
 }
 
 pub const FUNCTIONS: FunctionExports = &[export_c_func!(EAGLGetVersion(_, _))];
+
+// Attach a full-screen EAGLView that an app created but left detached, so the
+// window compositor and UIKit hit-testing both see the app's actual surface.
+fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> bool {
+    if drawable == nil {
+        return false;
+    }
+    let drawable_class: crate::objc::Class = msg![env; drawable class];
+    if env.objc.get_class_name(drawable_class) != "CAEAGLLayer" {
+        return false;
+    }
+    let view: id = msg![env; drawable delegate];
+    if view == nil {
+        return false;
+    }
+    let view_class: crate::objc::Class = msg![env; view class];
+    let view_class_name = env.objc.get_class_name(view_class).to_owned();
+    let ui_view_class = env.objc.get_known_class("UIView", &mut env.mem);
+    if !view_class_name.contains("EAGLView")
+        || !env.objc.class_is_subclass_of(view_class, ui_view_class)
+    {
+        return false;
+    }
+    let view_layer: id = msg![env; view layer];
+    let view_superview: id = msg![env; view superview];
+    let drawable_superlayer: id = msg![env; drawable superlayer];
+    let view_hidden: bool = msg![env; view isHidden];
+    if view_layer != drawable
+        || view_superview != nil
+        || drawable_superlayer != nil
+        || view_hidden
+    {
+        return false;
+    }
+    let mut windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    if let Some(key_window) = env.framework_state.uikit.ui_view.ui_window.key_window {
+        windows.retain(|&window| window != key_window);
+        windows.push(key_window);
+    }
+    for window in windows.into_iter().rev() {
+        let window_hidden: bool = msg![env; window isHidden];
+        if window_hidden {
+            continue;
+        }
+        let root_view_controller: id = msg![env; window rootViewController];
+        let root_view: id = if root_view_controller != nil {
+            msg![env; root_view_controller view]
+        } else {
+            window
+        };
+        let root_hidden: bool = msg![env; root_view isHidden];
+        if root_view == nil || root_hidden {
+            continue;
+        }
+        let parent: id = if root_view == view { window } else { root_view };
+        let parent_class: crate::objc::Class = msg![env; parent class];
+        if !env.objc.class_is_subclass_of(parent_class, ui_view_class) {
+            continue;
+        }
+        let parent_bounds: CGRect = msg![env; parent bounds];
+        let view_bounds: CGRect = msg![env; view bounds];
+        let drawable_bounds: CGRect = msg![env; drawable bounds];
+        let parent_width = parent_bounds.size.width;
+        let parent_height = parent_bounds.size.height;
+        let view_width = view_bounds.size.width;
+        let view_height = view_bounds.size.height;
+        let same_orientation =
+            (parent_width - view_width).abs() <= 1.0 && (parent_height - view_height).abs() <= 1.0;
+        let rotated_orientation =
+            (parent_width - view_height).abs() <= 1.0 && (parent_height - view_width).abs() <= 1.0;
+        if parent_bounds.origin.x.abs() > 1.0
+            || parent_bounds.origin.y.abs() > 1.0
+            || view_bounds.origin.x.abs() > 1.0
+            || view_bounds.origin.y.abs() > 1.0
+            || (!same_orientation && !rotated_orientation)
+            || (view_width - drawable_bounds.size.width).abs() > 1.0
+            || (view_height - drawable_bounds.size.height).abs() > 1.0
+        {
+            continue;
+        }
+        let _: () = msg![env; parent addSubview:view];
+        let attached_superview: id = msg![env; view superview];
+        if attached_superview == parent {
+            log!("Attached detached full-screen EAGLView {:?} to window hierarchy.", view);
+            return true;
+        }
+    }
+    false
+}
