@@ -15,6 +15,7 @@ Changes are categorised as follows:
 
 ## NEXT
 
+- Fixed the desktop release bundles: the Linux, Windows and macOS bundle scripts referenced a root-level `touchHLE_wallpaper.png` that never existed in this repository, so every "Create bundle" CI job failed. They now ship `res/MetalHLE_v7_wallpaper.png` (the first name the app picker searches for).
 - Merged KlugKlugTG upstream `trunk` (Asphalt 8 detached-EAGL-view fix re-applied on top of the rewritten present path, README refresh, CI merge): orphaned EAGL drawables now re-attach to the root layer, with the fullscreen-layer fallback the rework needed.
 
 - Rebrand completed: repository, release workflow, scripts, Android package and issue templates now say MetalHLE 2.0 (GitHub signing secrets keep their HYPERHLE_* names so existing CI credentials keep working). New iOS 26-style wallpaper and unofficial icon installed for every platform; app picker and its options sheet stretch to the full host display, with horizontal paging on the home screen and vertical scrolling in settings.
