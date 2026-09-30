@@ -584,10 +584,24 @@ fn caf_read_format_id(bytes: &[u8]) -> Option<[u8; 4]> {
 }
 
 fn is_adts_aac(bytes: &[u8]) -> bool {
-    if bytes.len() < 2 {
+    if bytes.len() < 7 {
         return false;
     }
-    (bytes[0] == 0xFF) && ((bytes[1] & 0xF0) == 0xF0)
+    // ADTS has layer bits 00. MPEG-2 Layer III frames can also start with
+    // FF F2, so checking only the sync nibble mistakes MP3 for AAC.
+    (bytes[0] == 0xFF) && ((bytes[1] & 0xF6) == 0xF0)
+}
+
+#[cfg(test)]
+mod adts_detection_tests {
+    use super::is_adts_aac;
+
+    #[test]
+    fn distinguishes_adts_from_mpeg_2_layer_3() {
+        assert!(is_adts_aac(&[0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC]));
+        assert!(!is_adts_aac(&[0xFF, 0xF2, 0x83, 0x4C, 0xB6, 0xF2, 0x00]));
+        assert!(!is_adts_aac(&[0xFF, 0xF1]));
+    }
 }
 
 fn parse_adts_aac(bytes: Vec<u8>) -> Result<AacPackets, ()> {
