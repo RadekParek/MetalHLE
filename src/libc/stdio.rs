@@ -842,7 +842,7 @@ fn putchar(env: &mut Environment, c: u8) -> i32 {
 
     // putchar() returns the written character (as unsigned char cast to
     // int) on success, or EOF when the write fails.
-    match std::io::stdout().write(std::slice::from_ref(&c)) {
+    match std::io::stdout().write_all(std::slice::from_ref(&c)) {
         Ok(_) => c as i32,
         Err(_) => {
             log!("Warning: putchar() failed to write to stdout; returning EOF.");

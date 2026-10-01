@@ -389,3 +389,7 @@ Other:
 ## v0.1.0 (2023-02-02)
 
 First release.
+
+## v2.0.0 hotfix (unreleased)
+
+- Remaining "MetalHLE 1.0" user-facing strings are gone: the ARM64 window title, the MTLDevice registry name reported to guests, and the app picker version label now all read "MetalHLE 2.0".
