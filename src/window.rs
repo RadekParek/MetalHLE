@@ -2279,14 +2279,22 @@ impl Window {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
-                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    let abs_coords = self.mouse_drawable_coords((x, y));
+                    if crate::trainer_ui::touch_down(abs_coords, self.viewport()) {
+                        continue;
+                    }
+                    let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseMotion {
                     x, y, mousestate, ..
                 } if mousestate.left() => {
-                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    let abs_coords = self.mouse_drawable_coords((x, y));
+                    if crate::trainer_ui::touch_motion(abs_coords, self.viewport()) {
+                        continue;
+                    }
+                    let coords = transform_input_coords(self, abs_coords, false);
                     log_sampled!(256, "MouseMotion x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesMove(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -2296,7 +2304,11 @@ impl Window {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
-                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    let abs_coords = self.mouse_drawable_coords((x, y));
+                    if crate::trainer_ui::touch_up(abs_coords, self.viewport()) {
+                        continue;
+                    }
+                    let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
                 }

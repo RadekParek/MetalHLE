@@ -123,6 +123,32 @@ impl GLES for RecordingGles {
 }
 
 #[test]
+fn desktop_pointer_tap_opens_trainer_button_and_preserves_game_touches() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    set_hardware_enabled(true);
+    reset_for_app(Some("desktop-pointer-test"));
+    take_commands();
+
+    let viewport = (0, 0, 640, 480);
+    let button = compute_layout(&UI.lock().unwrap(), viewport).button;
+    let point = (button.x + button.w / 2.0, button.y + button.h / 2.0);
+    assert!(touch_down(point, viewport));
+    assert!(touch_motion(point, viewport));
+    assert!(touch_up(point, viewport));
+    assert!(UI.lock().unwrap().open);
+    assert!(matches!(
+        take_commands().as_slice(),
+        [TrainerCmd::CancelBulk]
+    ));
+
+    let outside = (20.0, 200.0);
+    assert!(!touch_down(outside, viewport));
+    assert!(!touch_motion(outside, viewport));
+    assert!(!touch_up(outside, viewport));
+    reset_for_app(None);
+}
+
+#[test]
 fn gles1_overlay_does_not_sample_the_presented_game_frame() {
     const GAME_TEXTURE: GLuint = 7;
     const ATLAS_TEXTURE: GLuint = 8;
