@@ -135,22 +135,20 @@ pub struct Environment {
     // Sadly, setting ticks to 1 does not step properly, so Option is required.
     remaining_ticks: Option<u64>,
     panic_cell: Rc<Cell<Option<Environment>>>,
-    /// Tracks repeated UndefinedInstruction bypasses. See `debug_cpu_error`.
-    udf_bypass_last: Option<(u32, u32)>,
-    udf_bypass_count: u32,
-    /// Total number of UndefinedInstruction bypasses, independent of the call
-    /// site. Logging is keyed on this so a guest that cycles through many
-    /// different `(pc, lr)` pairs (each with a pair count of 1) cannot flood
+    /// Tracks repeated guest CPU-trap bypasses. See `debug_cpu_error`.
+    cpu_error_bypass_last: Option<(u32, u32)>,
+    cpu_error_bypass_count: u32,
+    /// Total guest CPU-trap bypasses, independent of the call site. Logging is
+    /// keyed on this so cycling through many `(pc, lr)` pairs cannot flood
     /// the log with one "occurrence 1" line per pair. See `debug_cpu_error`.
-    udf_bypass_total: u32,
-    /// Tracks consecutive UndefinedInstruction bypasses that all fake-return
-    /// to the *same* LR, regardless of the faulting PC. This catches runaway
-    /// loops where the faulting PC alternates between several bogus addresses
-    /// (so the `(pc, lr)` key above keeps resetting) but the guest keeps
-    /// bouncing back to a single return site — e.g. a game that called
-    /// through a nil/garbage function pointer. See `debug_cpu_error`.
-    udf_bypass_last_lr: Option<u32>,
-    udf_bypass_lr_count: u32,
+    cpu_error_bypass_total: u32,
+    /// Tracks consecutive guest CPU-trap bypasses that fake-return to the same
+    /// LR, regardless of the faulting PC. This catches runaway loops where the
+    /// faulting PC alternates between bogus addresses but the guest keeps
+    /// bouncing back to one return site, e.g. through a nil/garbage function
+    /// pointer. See `debug_cpu_error`.
+    cpu_error_bypass_last_lr: Option<u32>,
+    cpu_error_bypass_lr_count: u32,
     /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
     /// at the existing return-to-host boundary so it cannot terminate the host
     /// process from inside a linked libc function.
@@ -879,11 +877,11 @@ impl Environment {
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
-            udf_bypass_last: None,
-            udf_bypass_count: 0,
-            udf_bypass_total: 0,
-            udf_bypass_last_lr: None,
-            udf_bypass_lr_count: 0,
+            cpu_error_bypass_last: None,
+            cpu_error_bypass_count: 0,
+            cpu_error_bypass_total: 0,
+            cpu_error_bypass_last_lr: None,
+            cpu_error_bypass_lr_count: 0,
             guest_termination_requested: false,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
@@ -1047,11 +1045,11 @@ impl Environment {
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
-            udf_bypass_last: None,
-            udf_bypass_count: 0,
-            udf_bypass_total: 0,
-            udf_bypass_last_lr: None,
-            udf_bypass_lr_count: 0,
+            cpu_error_bypass_last: None,
+            cpu_error_bypass_count: 0,
+            cpu_error_bypass_total: 0,
+            cpu_error_bypass_last_lr: None,
+            cpu_error_bypass_lr_count: 0,
             guest_termination_requested: false,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
@@ -1118,11 +1116,11 @@ impl Environment {
             yielder: std::ptr::null(),
             remaining_ticks: None,
             panic_cell: Rc::new(Cell::new(None)),
-            udf_bypass_last: None,
-            udf_bypass_count: 0,
-            udf_bypass_total: 0,
-            udf_bypass_last_lr: None,
-            udf_bypass_lr_count: 0,
+            cpu_error_bypass_last: None,
+            cpu_error_bypass_count: 0,
+            cpu_error_bypass_total: 0,
+            cpu_error_bypass_last_lr: None,
+            cpu_error_bypass_lr_count: 0,
             guest_termination_requested: false,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
@@ -2052,10 +2050,16 @@ impl Environment {
         self.current_thread = new_thread;
     }
 
+    fn is_recoverable_guest_cpu_error(error: &cpu::CpuError) -> bool {
+        matches!(
+            error,
+            cpu::CpuError::UndefinedInstruction | cpu::CpuError::Breakpoint
+        )
+    }
+
     #[cold]
-    /// Let the debugger handle a CPU error, or panic if there's no debugger
-    /// connected. Returns [true] if the CPU should step and then resume
-    /// debugging, or [false] if it should resume normal execution.
+    /// Let the debugger handle a CPU error. Without one, use bounded
+    /// best-effort recovery for guest traps; unhandled cases panic.
     fn debug_cpu_error(&mut self, error: cpu::CpuError) {
         let instruction_len = if (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0 {
             2
@@ -2063,9 +2067,8 @@ impl Environment {
             4
         };
 
-        if matches!(error, cpu::CpuError::UndefinedInstruction)
-            || matches!(error, cpu::CpuError::Breakpoint)
-        {
+        let is_undefined_instruction = matches!(error, cpu::CpuError::UndefinedInstruction);
+        if Self::is_recoverable_guest_cpu_error(&error) {
             // Rewind the PC so that it's at the instruction where the error
             // occurred, rather than the next instruction. This is necessary for
             // GDB to detect its software breakpoints. For some reason this
@@ -2074,25 +2077,28 @@ impl Environment {
         }
 
         if self.gdb_server.is_none() {
-            // Bypass crashes without implementing stubs for every framework.
-            // Games often trigger UndefinedInstruction (abort/__builtin_trap)
-            // when an API returns nil or an otherwise unexpected value.
-            // Fake a function return to LR to keep execution going.
+            // Bypass guest traps without framework stubs. Games can hit an
+            // UndefinedInstruction (abort/__builtin_trap) or a Breakpoint
+            // (`bkpt`) when an API returns nil or unexpected data. Fake a
+            // function return to LR to keep execution going.
             //
             // However: if we hit the SAME (PC,LR) pair too many times in a row
             // this indicates we are looping forever (LR itself points back
-            // through an infinite chain of UDF instructions). In that case
-            // panic with a clear message instead of wedging the emulator.
-            if matches!(error, cpu::CpuError::UndefinedInstruction) {
+            // through an infinite chain of guest traps). In that case, the
+            // recovery logic below skips the faulting instruction.
+            if Self::is_recoverable_guest_cpu_error(&error) {
                 let pc = self.cpu.regs()[cpu::Cpu::PC];
                 let lr = self.cpu.regs()[cpu::Cpu::LR];
-                // Potato Story Android hard fallback:
+                // Potato Story Android hard fallback applies only to UDFs:
                 //
                 // The generic decoder did not match on-device, but Android
                 // repeatedly reports UDF at these exact Thumb-2 sites while
-                // desktop runs through them. Force the known constant-load
-                // results and advance PC like the desktop path effectively does.
-                if cfg!(target_os = "android") && (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0 {
+                // desktop runs through them. Force the constant-load results
+                // and advance PC like the desktop path effectively does.
+                if is_undefined_instruction
+                    && cfg!(target_os = "android")
+                    && (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0
+                {
                     match pc {
                         // 0x9ec2: MOVW r0, #0xa136
                         // 0x9ec6: MOVT r0, #0x0030
@@ -2106,8 +2112,8 @@ impl Environment {
                             );
                             self.cpu.regs_mut()[0] = new_value;
                             self.cpu.regs_mut()[cpu::Cpu::PC] = 0x9eca;
-                            self.udf_bypass_last = None;
-                            self.udf_bypass_count = 0;
+                            self.cpu_error_bypass_last = None;
+                            self.cpu_error_bypass_count = 0;
                             return;
                         }
 
@@ -2118,8 +2124,8 @@ impl Environment {
                             );
                             self.cpu.regs_mut()[1] = 0x0000_a0ea;
                             self.cpu.regs_mut()[cpu::Cpu::PC] = 0xabd2;
-                            self.udf_bypass_last = None;
-                            self.udf_bypass_count = 0;
+                            self.cpu_error_bypass_last = None;
+                            self.cpu_error_bypass_count = 0;
                             return;
                         }
 
@@ -2135,8 +2141,8 @@ impl Environment {
                             );
                             self.cpu.regs_mut()[12] = new_value;
                             self.cpu.regs_mut()[cpu::Cpu::PC] = 0xacd8;
-                            self.udf_bypass_last = None;
-                            self.udf_bypass_count = 0;
+                            self.cpu_error_bypass_last = None;
+                            self.cpu_error_bypass_count = 0;
                             return;
                         }
 
@@ -2148,8 +2154,8 @@ impl Environment {
                                 "Potato Story Android hard fallback: skipping trapped Thumb-2 instruction at 0xadae; PC=0xadb2"
                             );
                             self.cpu.regs_mut()[cpu::Cpu::PC] = 0xadb2;
-                            self.udf_bypass_last = None;
-                            self.udf_bypass_count = 0;
+                            self.cpu_error_bypass_last = None;
+                            self.cpu_error_bypass_count = 0;
                             return;
                         }
 
@@ -2169,7 +2175,10 @@ impl Environment {
                 // The PC we log here has already been rewound by the generic
                 // Thumb path above, which assumes 2-byte Thumb instructions.
                 // Thumb-2 instructions are 4 bytes, so try both PC and PC-2.
-                if cfg!(target_os = "android") && (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0 {
+                if is_undefined_instruction
+                    && cfg!(target_os = "android")
+                    && (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0
+                {
                     // Android/Dynarmic sometimes reports the fault PC a few
                     // bytes before/after the real 32-bit Thumb-2 instruction.
                     // Scan nearby even halfword starts instead of only pc/pc-2.
@@ -2207,8 +2216,8 @@ impl Environment {
                             );
 
                             self.cpu.regs_mut()[cpu::Cpu::PC] = start.wrapping_add(4);
-                            self.udf_bypass_last = None;
-                            self.udf_bypass_count = 0;
+                            self.cpu_error_bypass_last = None;
+                            self.cpu_error_bypass_count = 0;
                             return;
                         }
 
@@ -2255,8 +2264,8 @@ impl Environment {
 
                             self.cpu.regs_mut()[rd] = new_value;
                             self.cpu.regs_mut()[cpu::Cpu::PC] = start.wrapping_add(4);
-                            self.udf_bypass_last = None;
-                            self.udf_bypass_count = 0;
+                            self.cpu_error_bypass_last = None;
+                            self.cpu_error_bypass_count = 0;
                             return;
                         }
                     }
@@ -2266,16 +2275,16 @@ impl Environment {
                 const BYPASS_LIMIT: u32 = 256;
                 const LOG_RATE: u32 = 32;
                 let key = (pc, lr);
-                let count = if self.udf_bypass_last == Some(key) {
-                    self.udf_bypass_count = self.udf_bypass_count.saturating_add(1);
-                    self.udf_bypass_count
+                let count = if self.cpu_error_bypass_last == Some(key) {
+                    self.cpu_error_bypass_count = self.cpu_error_bypass_count.saturating_add(1);
+                    self.cpu_error_bypass_count
                 } else {
-                    self.udf_bypass_last = Some(key);
-                    self.udf_bypass_count = 1;
+                    self.cpu_error_bypass_last = Some(key);
+                    self.cpu_error_bypass_count = 1;
                     1
                 };
-                self.udf_bypass_total = self.udf_bypass_total.saturating_add(1);
-                let total = self.udf_bypass_total;
+                self.cpu_error_bypass_total = self.cpu_error_bypass_total.saturating_add(1);
+                let total = self.cpu_error_bypass_total;
 
                 // Independently track how many times in a row we've faked a
                 // return to the SAME LR, ignoring the faulting PC. The `(pc,
@@ -2296,18 +2305,18 @@ impl Environment {
                 // (which do make forward progress and eventually settle on a
                 // stable LR) are unaffected.
                 const LR_BYPASS_LIMIT: u32 = 4096;
-                let lr_count = if self.udf_bypass_last_lr == Some(lr) {
-                    self.udf_bypass_lr_count = self.udf_bypass_lr_count.saturating_add(1);
-                    self.udf_bypass_lr_count
+                let lr_count = if self.cpu_error_bypass_last_lr == Some(lr) {
+                    self.cpu_error_bypass_lr_count = self.cpu_error_bypass_lr_count.saturating_add(1);
+                    self.cpu_error_bypass_lr_count
                 } else {
-                    self.udf_bypass_last_lr = Some(lr);
-                    self.udf_bypass_lr_count = 1;
+                    self.cpu_error_bypass_last_lr = Some(lr);
+                    self.cpu_error_bypass_lr_count = 1;
                     1
                 };
 
                 if lr_count >= LR_BYPASS_LIMIT {
                     panic!(
-                        "UndefinedInstruction bypass faked a return to LR={:#x} \
+                        "{error:?} bypass faked a return to LR={:#x} \
                          {} times in a row (most recent faulting PC {:#x}); \
                          giving up to avoid hanging. The guest is repeatedly \
                          calling through a bad/nil function pointer from a \
@@ -2323,10 +2332,11 @@ impl Environment {
                 // (PC, LR) pairs stop flooding the log after LOG_RATE lines.
                 if total <= LOG_RATE && (count == 1 || count % LOG_RATE == 0) {
                     log_no_panic!(
-                        "Warning: Ignored UndefinedInstruction at {:#x}. \
-                         Faking function return to LR ({:#x}) to bypass crash! \
+                        "Warning: Ignored {:?} at {:#x}. \
+                         Faking function return to LR ({:#x}) to bypass the guest trap. \
                          cpsr={:#x} thumb={} instruction_len={} \
                          (occurrence {} of at most {})",
+                        error,
                         pc,
                         lr,
                         self.cpu.cpsr(),
@@ -2337,7 +2347,7 @@ impl Environment {
                     );
                 } else if total == LOG_RATE + 1 {
                     log_no_panic!(
-                        "Warning: Ignored UndefinedInstruction bypass still active \
+                        "Warning: Ignored guest-trap bypass still active \
                          ({} total so far); suppressing further per-site lines until \
                          a new call site appears. Latest PC {:#x}, LR {:#x}.",
                         total,
@@ -2353,7 +2363,7 @@ impl Environment {
                     // stub that returned bogus data the guest re-calls into).
                     // Rather than killing the whole emulator, degrade
                     // gracefully: skip past the faulting instruction (treat
-                    // the UDF as a no-op) so execution continues in the
+                    // the trap as a no-op) so execution continues in the
                     // caller's body, and reset the counters so a later,
                     // different loop still gets a fresh budget. A genuine
                     // infinite hang is still bounded by LR_BYPASS_LIMIT
@@ -2361,46 +2371,45 @@ impl Environment {
                     // `handle_cpu_state`.
                     if count == BYPASS_LIMIT || count % (BYPASS_LIMIT * 4) == 0 {
                         log_no_panic!(
-                            "Warning: UndefinedInstruction at {:#x} looped {} \
-                             times with LR={:#x}. Faking returns is not making \
-                             progress, so skipping the faulting instruction \
-                             instead. This usually means a framework stub \
-                             returned data the guest keeps re-trapping on.",
+                            "Warning: {:?} at {:#x} looped {} times with LR={:#x}. \
+                             Faking returns is not making progress, so skipping \
+                             the faulting instruction instead. This usually means \
+                             a framework stub returned data the guest keeps \
+                             re-trapping on.",
+                            error,
                             pc,
                             count,
                             lr
                         );
                     }
                     self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
-                    self.udf_bypass_last = None;
-                    self.udf_bypass_count = 0;
-                    self.udf_bypass_last_lr = None;
-                    self.udf_bypass_lr_count = 0;
+                    self.cpu_error_bypass_last = None;
+                    self.cpu_error_bypass_count = 0;
+                    self.cpu_error_bypass_last_lr = None;
+                    self.cpu_error_bypass_lr_count = 0;
                     return;
                 }
 
                 // Pathological self-loop: when LR (with Thumb bit cleared)
-                // points right back at the UDF we just trapped on, branching
-                // to LR would re-enter the trap and burn through BYPASS_LIMIT
-                // until the emulator panics. This shape shows up when a
-                // framework stub returns the address of its own UDF as the
-                // return target (e.g. PC=0x5cc86, LR=0x5cc87). Skip past the
-                // faulting instruction instead so the guest makes forward
+                // points right back at the trap we just hit, branching to LR
+                // would re-enter it and burn through BYPASS_LIMIT. Skip past
+                // the faulting instruction instead so the guest makes forward
                 // progress, and clear the bypass counter since we're no
                 // longer bypassing the same site.
                 if (lr & !1) == pc {
                     log_no_panic!(
-                        "Warning: UndefinedInstruction self-loop at {:#x} \
-                         (LR={:#x} re-enters the same UDF). Advancing past \
-                         the faulting instruction instead of branching to LR.",
+                        "Warning: {:?} self-loop at {:#x} (LR={:#x} re-enters the \
+                         same instruction). Advancing past it instead of \
+                         branching to LR.",
+                        error,
                         pc,
                         lr
                     );
                     self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
-                    self.udf_bypass_last = None;
-                    self.udf_bypass_count = 0;
-                    self.udf_bypass_last_lr = None;
-                    self.udf_bypass_lr_count = 0;
+                    self.cpu_error_bypass_last = None;
+                    self.cpu_error_bypass_count = 0;
+                    self.cpu_error_bypass_last_lr = None;
+                    self.cpu_error_bypass_lr_count = 0;
                     return;
                 }
 
@@ -2448,10 +2457,10 @@ impl Environment {
                 // runaway counter so an earlier, since-recovered burst of
                 // fake returns can't accumulate toward a false-positive
                 // panic. (The genuine runaway loop never reaches this state:
-                // it produces back-to-back UndefinedInstruction errors with
-                // no Normal batch in between.)
-                self.udf_bypass_last_lr = None;
-                self.udf_bypass_lr_count = 0;
+                // it produces back-to-back guest-trap errors with no Normal
+                // batch in between.)
+                self.cpu_error_bypass_last_lr = None;
+                self.cpu_error_bypass_lr_count = 0;
                 ThreadNextAction::Continue
             }
             cpu::CpuState::Svc(svc) => {
@@ -2480,8 +2489,8 @@ impl Environment {
                             // Successfully dispatching a host/linked function
                             // is real forward progress, so clear the same-LR
                             // bypass runaway counter (see `debug_cpu_error`).
-                            self.udf_bypass_last_lr = None;
-                            self.udf_bypass_lr_count = 0;
+                            self.cpu_error_bypass_last_lr = None;
+                            self.cpu_error_bypass_lr_count = 0;
                             f.call_from_guest(self);
 
                             let guest_control_flow_redirected =
@@ -3165,6 +3174,28 @@ impl Drop for Environment {
             *self = env;
         }
         ENVIRONMENT_INSTANCE_EXISTS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod guest_cpu_error_tests {
+    use super::*;
+
+    #[test]
+    fn guest_traps_are_recoverable_without_a_debugger() {
+        assert!(Environment::is_recoverable_guest_cpu_error(
+            &cpu::CpuError::UndefinedInstruction
+        ));
+        assert!(Environment::is_recoverable_guest_cpu_error(
+            &cpu::CpuError::Breakpoint
+        ));
+    }
+
+    #[test]
+    fn memory_errors_are_not_recoverable_without_a_debugger() {
+        assert!(!Environment::is_recoverable_guest_cpu_error(
+            &cpu::CpuError::MemoryError
+        ));
     }
 }
 
