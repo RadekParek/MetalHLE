@@ -1713,25 +1713,53 @@ impl Dyld {
             (stub_function_ptr, la_symbol_ptr)
         }
 
-        let (stubs, pic_offset) = bins
-            .iter()
-            .find_map(|bin| {
-                let stubs = bin.get_section(SectionType::SymbolStubs)?;
-                if !(stubs.addr..(stubs.addr + stubs.size)).contains(&svc_pc) {
-                    return None;
-                }
-                let pic_offset = bin
-                    .get_section(SectionType::LazySymbolPointers)
-                    .map_or(0, |lazy_ptrs| lazy_ptrs.addr - stubs.addr);
-                Some((stubs, pic_offset))
-            })
-            .unwrap();
-        let info = stubs.dyld_indirect_symbol_info.as_ref().unwrap();
-
-        let offset = svc_pc - stubs.addr;
-        assert!(offset.is_multiple_of(info.entry_size));
+        let Some((stubs, pic_offset, offset)) = bins.iter().find_map(|bin| {
+            let stubs = bin.get_section(SectionType::SymbolStubs)?;
+            let offset = lazy_stub_section_offset(stubs.addr, stubs.size, svc_pc)?;
+            let pic_offset = bin
+                .get_section(SectionType::LazySymbolPointers)
+                .map_or(0, |lazy_ptrs| lazy_ptrs.addr - stubs.addr);
+            Some((stubs, pic_offset, offset))
+        }) else {
+            return fallback_for_unmapped_lazy_link(
+                cpu,
+                svc_pc,
+                "address is outside loaded symbol stub sections",
+            );
+        };
+        let Some(info) = stubs.dyld_indirect_symbol_info.as_ref() else {
+            return fallback_for_unmapped_lazy_link(
+                cpu,
+                svc_pc,
+                "symbol stub section has no indirect-symbol metadata",
+            );
+        };
+        if !matches!(info.entry_size, 4 | 12 | 16) {
+            return fallback_for_unmapped_lazy_link(
+                cpu,
+                svc_pc,
+                "symbol stub section has an unsupported entry size",
+            );
+        }
+        if !offset.is_multiple_of(info.entry_size) {
+            return fallback_for_unmapped_lazy_link(
+                cpu,
+                svc_pc,
+                "SVC address is not aligned to a symbol stub",
+            );
+        }
         let idx = (offset / info.entry_size) as usize;
-        let symbol = info.indirect_undef_symbols[idx].as_deref().unwrap();
+        let Some(symbol) = info
+            .indirect_undef_symbols
+            .get(idx)
+            .and_then(|symbol| symbol.as_deref())
+        else {
+            return fallback_for_unmapped_lazy_link(
+                cpu,
+                svc_pc,
+                "symbol stub has no indirect undefined symbol",
+            );
+        };
 
         if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(symbol) {
             if let Some(&addr) = bins
@@ -2099,6 +2127,28 @@ fn unimplemented_function_stub(_env: &mut Environment) -> i32 {
     0
 }
 
+fn lazy_stub_section_offset(section_addr: u32, section_size: u32, svc_pc: u32) -> Option<u32> {
+    let offset = svc_pc.checked_sub(section_addr)?;
+    (offset < section_size).then_some(offset)
+}
+
+fn fallback_for_unmapped_lazy_link(
+    cpu: &mut Cpu,
+    svc_pc: u32,
+    reason: &str,
+) -> Option<HostFunction> {
+    let lr = cpu.regs()[Cpu::LR];
+    log_once!("Warning: lazy-link SVC could not be matched to a symbol stub; returning 0 to the caller.");
+    log_dbg!(
+        "Unmapped lazy-link SVC at {:#x} ({}); returning to LR {:#x}.",
+        svc_pc,
+        reason,
+        lr
+    );
+    cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
+    Some(&(unimplemented_function_stub as fn(&mut Environment) -> i32))
+}
+
 fn has_guest_sjlj_runtime(mut has_symbol: impl FnMut(&str) -> bool) -> bool {
     has_symbol("___cxa_throw")
         && has_symbol("___gxx_personality_sj0")
@@ -2232,5 +2282,35 @@ mod cxxabi_runtime_detection_tests {
             assert!(is_guest_cxxabi_symbol(symbol));
         }
         assert!(!is_guest_cxxabi_symbol("___objc_msgSend"));
+    }
+}
+
+#[cfg(test)]
+mod lazy_link_recovery_tests {
+    use super::{fallback_for_unmapped_lazy_link, lazy_stub_section_offset};
+    use crate::cpu::Cpu;
+
+    #[test]
+    fn lazy_stub_section_offset_checks_boundaries_without_overflow() {
+        assert_eq!(lazy_stub_section_offset(0x1000, 0x10, 0x1000), Some(0));
+        assert_eq!(lazy_stub_section_offset(0x1000, 0x10, 0x100f), Some(0xf));
+        assert_eq!(lazy_stub_section_offset(0x1000, 0x10, 0x1010), None);
+        assert_eq!(lazy_stub_section_offset(0x1000, 0x10, 0x0fff), None);
+        assert_eq!(
+            lazy_stub_section_offset(u32::MAX - 7, 0x10, u32::MAX),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn unmapped_lazy_link_returns_to_arm_or_thumb_link_register() {
+        let mut cpu = Cpu::new(None);
+
+        for (lr, expected_pc, expected_thumb) in [(0x1000, 0x1000, false), (0x2001, 0x2000, true)] {
+            cpu.regs_mut()[Cpu::LR] = lr;
+            assert!(fallback_for_unmapped_lazy_link(&mut cpu, 0x3000, "test").is_some());
+            assert_eq!(cpu.regs()[Cpu::PC], expected_pc);
+            assert_eq!(cpu.cpsr() & Cpu::CPSR_THUMB != 0, expected_thumb);
+        }
     }
 }
