@@ -417,14 +417,16 @@ Other options:
         need this behaviour.
 
     --trace-gl-errors
-        For diagnostic builds. After every guest GL call dispatched through
-        the GLES wrapper, also log the host driver's glGetError() value when
-        non-zero. The log line includes the name of the offending entry
-        point so that constant 0x500 (GL_INVALID_ENUM) / 0x501
-        (GL_INVALID_VALUE) noise can be traced back to a specific call.
-        This option exists for debugging black-screen / wrong-render bugs
-        and adds a glGetError() round-trip per call, so it should not be
-        left on for normal use.
+        After every guest GL call dispatched through the GLES wrapper, also
+        log the host driver's glGetError() value when non-zero. The log line
+        includes the name of the offending entry point so that constant 0x500
+        (GL_INVALID_ENUM) / 0x501 (GL_INVALID_VALUE) noise can be traced back
+        to a specific call. Enabled by default; this adds a glGetError()
+        round-trip per call, so it can be disabled for maximum performance.
+
+    --disable-trace-gl-errors
+        Turn GL error tracing back off (removes the per-call glGetError()
+        round-trip).
 
     --gles-native / --no-gles-native
         Android only. OFF by default (and exposed as the "GLES Native" switch

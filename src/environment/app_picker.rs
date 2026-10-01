@@ -1201,7 +1201,7 @@ fn app_picker_inner(
     let mut quick_options_log_file = true;
     // Mirror the actual launch default (`Options::default()` enables GL error
     // tracing) so the toggle reflects reality instead of showing OFF.
-    let mut quick_options_trace_gl_errors = env.options.trace_gl_errors && quick_options_log_file;
+    let mut quick_options_trace_gl_errors = env.options.trace_gl_errors;
     let mut quick_options_fast_memory = crate::options::DEFAULT_FAST_MEMORY;
     let mut quick_options_force_32_bit = false;
     let mut quick_options_force_64_bit = false;
@@ -1446,8 +1446,6 @@ fn app_picker_inner(
         setEnabled:quick_options_log_file];
     () = msg![env; (quick_options_stuff.trace_gl_errors_switch)
         setOn:quick_options_trace_gl_errors];
-    () = msg![env; (quick_options_stuff.trace_gl_errors_switch)
-        setEnabled:quick_options_log_file];
     () = msg![env; (quick_options_stuff.fix_texture_min_filter_switch)
         setOn:quick_options_fix_texture_min_filter];
     () = msg![env; (quick_options_stuff.force_composition_switch)
@@ -1985,15 +1983,12 @@ fn app_picker_inner(
             quick_options_log_file = enabled;
             () = msg![env; (quick_options_stuff.log_file_switch) setOn:enabled];
             () = msg![env; (quick_options_stuff.verbose_logging_switch) setEnabled:enabled];
-            () = msg![env; (quick_options_stuff.trace_gl_errors_switch) setEnabled:enabled];
             if !enabled {
                 quick_options_verbose_logging = false;
-                quick_options_trace_gl_errors = false;
                 () = msg![env; (quick_options_stuff.verbose_logging_switch) setOn:false];
-                () = msg![env; (quick_options_stuff.trace_gl_errors_switch) setOn:false];
             }
         } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_errors) {
-            quick_options_trace_gl_errors = enabled && quick_options_log_file;
+            quick_options_trace_gl_errors = enabled;
             () = msg![env; (quick_options_stuff.trace_gl_errors_switch) setOn:quick_options_trace_gl_errors];
         } else if let Some(enabled) = std::mem::take(&mut host_obj.fast_memory) {
             quick_options_fast_memory = enabled;

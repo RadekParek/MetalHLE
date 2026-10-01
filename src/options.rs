@@ -692,7 +692,10 @@ impl Default for Options {
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
-            trace_gl_errors: false,
+            // On by default: guest GLES calls that would otherwise silently
+            // swallow a GL error get logged with the host call site instead.
+            // Turn off with --disable-trace-gl-errors.
+            trace_gl_errors: true,
             verbose_gles: false,
             gles_native: false,
             // On Android the host GLES driver is essentially always
@@ -941,11 +944,11 @@ impl Options {
             self.memory_management = MemoryManagement::parse(value)?;
         } else if arg == "--high-performance" {
             self.high_performance = true;
-        } else if arg == "--no-high-performance" {
+        } else if arg == "--no-high-performance" || arg == "--disable-high-performance" {
             self.high_performance = false;
         } else if arg == "--force-max-clocks" {
             self.force_max_clocks = true;
-        } else if arg == "--no-force-max-clocks" {
+        } else if arg == "--no-force-max-clocks" || arg == "--disable-force-max-clocks" {
             self.force_max_clocks = false;
         } else if arg == "--fast-memory" {
             self.fast_memory = true;
@@ -953,8 +956,12 @@ impl Options {
             self.fast_memory = false;
         } else if arg == "--angle-driver" {
             self.angle_driver = true;
+        } else if arg == "--disable-angle-driver" {
+            self.angle_driver = false;
         } else if arg == "--llvmpipe-fallback" {
             self.llvmpipe_fallback = true;
+        } else if arg == "--disable-llvmpipe-fallback" {
+            self.llvmpipe_fallback = false;
         } else if let Some(value) = arg.strip_prefix("--custom-driver=") {
             self.custom_driver = Some(std::path::PathBuf::from(value));
         } else if arg == "--disable-metal-translator" {
@@ -1030,6 +1037,8 @@ impl Options {
             self.ignore_gl_errors = true;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
+        } else if arg == "--disable-trace-gl-errors" {
+            self.trace_gl_errors = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
         } else if arg == "--gles-native" {
