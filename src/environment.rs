@@ -523,7 +523,7 @@ let default_ipad = DeviceFamily::iPad2;
                     // From testing, it seems to correspond to left.
                     "UIInterfaceOrientationLandscape" => window::DeviceOrientation::LandscapeLeft,
 
-                    // ДОБАВЛЯЕМ СЮДА ПРИВЯЗКУ К ОБЫЧНОМУ ПОРТРЕТУ:
+                    // Bind the accelerometer axes to plain portrait.
                     "UIInterfaceOrientationPortraitUpsideDown" => {
                         window::DeviceOrientation::PortraitUpsideDown
                     }
@@ -656,7 +656,7 @@ let default_ipad = DeviceFamily::iPad2;
                 let dylib_slide = match name {
                     "libstdc++.6.dylib" | "libstdc++.6.0.9.dylib" => 0x3748a000,
 
-                    // ДОБАВИТЬ ЭТО: Честный базовый адрес для libc++ (iOS 5.0+)
+                    // A fair base address for libc++ (iOS 5.0+)
                     "libc++.1.dylib" => 0x38000000,
                     // На случай, если игра также потянет за собой libc++abi
                     "libc++abi.dylib" => 0x38100000,
