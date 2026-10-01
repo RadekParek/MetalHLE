@@ -2850,7 +2850,7 @@ fn objc_send(
             state.metal_commands = state.metal_commands.saturating_add(1);
             0
         }
-        "name" => objc_string(mem, "MetalHLE 1.0 Metal device")?,
+        "name" => objc_string(mem, "MetalHLE 2.0 Metal device")?,
         "UTF8String" => objc_field(mem, receiver, 56),
         "length"
             if objc_is_string_kind(kind) || kind == A64_KIND_BUFFER || kind == A64_KIND_DATA =>
