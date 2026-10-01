@@ -372,6 +372,7 @@ struct AppPickerDelegateHostObject {
     fullscreen: Option<bool>,
     fullscreen_stretched: Option<bool>,
     angle_driver: Option<bool>,
+    gles_native: Option<bool>,
     log_file: Option<bool>,
     trace_gl_errors: Option<bool>,
     verbose_logging: Option<bool>,
@@ -662,6 +663,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())angleDriver:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).angle_driver = Some(switch_state);
+}
+- (())glesNative:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_native = Some(switch_state);
 }
 - (())logFile:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1198,6 +1203,7 @@ fn app_picker_inner(
     let mut quick_options_fix_texture_min_filter = cfg!(target_os = "android");
     let mut quick_options_force_composition = false;
     let mut quick_options_angle_driver = false;
+    let mut quick_options_gles_native = false;
     let mut quick_options_log_file = true;
     // Mirror the actual launch default (`Options::default()` enables GL error
     // tracing) so the toggle reflects reality instead of showing OFF.
@@ -1979,6 +1985,8 @@ fn app_picker_inner(
             quick_options_show_fps = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.angle_driver) {
             quick_options_angle_driver = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.gles_native) {
+            quick_options_gles_native = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.log_file) {
             quick_options_log_file = enabled;
             () = msg![env; (quick_options_stuff.log_file_switch) setOn:enabled];
@@ -2431,6 +2439,14 @@ fn app_picker_inner(
             "--angle-driver"
         } else {
             "--disable-angle-driver"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if quick_options_gles_native {
+            "--gles-native"
+        } else {
+            "--no-gles-native"
         }
         .to_string(),
     );
@@ -3700,6 +3716,8 @@ fn setup_quick_options(
         RowKind::Subsection("Graphics compatibility"),
         RowKind::Label("GLES override version"),
         RowKind::GlesOverrideDropdown,
+        RowKind::Label("GLES Native"),
+        RowKind::Switch("glesNative:", false),
         RowKind::Label("Shader compatibility fixes"),
         RowKind::Switch("shaderCompatibilityFixes:", true),
         RowKind::Label("Fix texture mipmap filter"),

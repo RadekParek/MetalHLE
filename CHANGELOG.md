@@ -14,6 +14,7 @@ Changes are categorised as follows:
 * Other: when none of the above seem to fit.
 
 ## NEXT
+- Fixed the "GLES Native" quick option: the flag is now wired to the ANGLE driver setup (enabling it skips ANGLE and uses the vendor's native GLES driver) and it gained a "GLES Native" switch in the app-picker settings, placed above "Shader compatibility fixes".
 
 - Merged the latest KlugKlugTG `trunk` commits (GLES 1.1 strict-driver workarounds, EAGL present policy, fixed-function readback flags for the GLES1-on-GLES2/GLES3 translators) on top of the MetalHLE sensor-fusion work: the complementary gyro+accelerometer attitude filter (smooth deviceMotion cameras, learned gyro bias) is kept, and trunk's synthesized-magnetometer support (`magnetometerData` now returns a stable Earth-field reading instead of `nil`, `isMagnetometerAvailable` reports YES) is wired into `CMMotionManager`.
 - `Options` regained the `--gles-native` / `--no-gles-native` and `--verbose-gles` flags (with `verbose_gles`/`gles_native` struct fields restored) alongside trunk's `--shader-compatibility-fixes` and `--verbose-logging`; a duplicate `--render-rotation=` parse arm was removed.

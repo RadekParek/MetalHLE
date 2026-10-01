@@ -1514,7 +1514,12 @@ impl Window {
         crate::gles::configure_pvrtc_decoding(options.pvrtc_decoding);
         let cpu_only_requested = options.software_rendering
             || matches!(options.graphics_api, crate::options::GraphicsApi::Software);
-        let angle_driver_active = crate::gles::configure_angle_driver(options.angle_driver);
+        // "GLES Native" deliberately overrides ANGLE: selecting it skips the
+        // bundled ANGLE backend entirely and lets SDL pick up the vendor's
+        // native OpenGL ES driver, which is the lenient behaviour some apps
+        // need (`configure_angle_driver(false)` clears any stale overrides).
+        let angle_driver_active =
+            crate::gles::configure_angle_driver(options.angle_driver && !options.gles_native);
         let custom_driver_active = if angle_driver_active {
             if options.custom_driver.is_some() {
                 log!("ANGLE is enabled; ignoring the custom/native vendor driver selection");
