@@ -4124,6 +4124,1111 @@ fn normalize_shader_preprocessor_whitespace(source: &str) -> String {
     out
 }
 
+fn normalize_asphalt8_shader_source(source: &str) -> String {
+    source
+        .replace("#endif]", "#endif")
+        .replace("||\r\n", "|| ")
+        .replace("||\n", "|| ")
+        .replace("|| \r\n", "|| ")
+        .replace("|| \n", "|| ")
+        .replace("&&\r\n", "&& ")
+        .replace("&&\n", "&& ")
+        .replace("&& \r\n", "&& ")
+        .replace("&& \n", "&& ")
+        .replace("vec3(1,1,1)", "vec3(1.0, 1.0, 1.0)")
+        .replace("vec4(0.5, 0, 0, 0)", "vec4(0.5, 0.0, 0.0, 0.0)")
+        .replace("vec4(0, 0.5, 0, 0)", "vec4(0.0, 0.5, 0.0, 0.0)")
+        .replace("vec4(0, 0, 0.5, 0)", "vec4(0.0, 0.0, 0.5, 0.0)")
+        .replace("vec4(0.5, 0.5, 0.5, 1)", "vec4(0.5, 0.5, 0.5, 1.0)")
+}
+
+/// Move every `#extension` directive to the top of the shader source (right
+/// after the `#version` line, if any). GLSL ES requires extension directives
+/// to appear before any non-preprocessor tokens; strict compilers (ANGLE,
+/// Adreno, Mali) reject shaders that violate this — e.g. Gangstar's fragment
+/// shaders, which the lenient PowerVR drivers of real iPhone-era hardware
+/// accepted. Also normalizes whitespace between `#` and the directive name
+/// (`#  extension` → `#extension`) so such lines are recognized. Lines that
+/// merely contain the word "extension" as part of a longer identifier are
+/// left alone.
+fn hoist_shader_extension_directives(source: &str) -> String {
+    let mut version_line: Option<&str> = None;
+    let mut extension_lines: Vec<String> = Vec::new();
+    let mut body_lines: Vec<&str> = Vec::new();
+    for line in source.split('\n') {
+        let trimmed = line.trim_start();
+        // Recognize `#extension` even with whitespace after `#`.
+        let normalized: Option<String> = trimmed.strip_prefix('#').and_then(|after_hash| {
+            let dir = after_hash.trim_start();
+            if dir.starts_with("extension") {
+                let after_kw = &dir["extension".len()..];
+                if after_kw.is_empty()
+                    || !after_kw
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    Some(format!("#extension{}", after_kw))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        if let Some(norm) = normalized {
+            extension_lines.push(norm);
+            continue;
+        }
+        if version_line.is_none() && trimmed.starts_with("#version") {
+            version_line = Some(line);
+        } else if trimmed.starts_with("#extension") {
+            extension_lines.push(line.to_string());
+        } else {
+            body_lines.push(line);
+        }
+    }
+    if extension_lines.is_empty() {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len() + 32);
+    if let Some(v) = version_line {
+        out.push_str(v);
+        out.push('\n');
+    }
+    for ext in &extension_lines {
+        out.push_str(ext);
+        out.push('\n');
+    }
+    for (i, line) in body_lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if source.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Strip `//` and `/* */` comments from GLSL source so declaration scanning
+/// never sees commented-out code (Gameloft's shader generator emits the full
+/// varying block in both stages but comments unused entries out — a
+/// comment-blind parser would treat `/* varying float vAlpha; */` in the
+/// vertex shader as a real declaration and skip the fix-up).
+fn strip_glsl_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                out.push('\n');
+            }
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && matches!(chars.peek(), Some('/')) {
+                chars.next();
+                in_block_comment = false;
+                out.push(' ');
+            }
+            continue;
+        }
+        if c == '/' {
+            if matches!(chars.peek(), Some('/')) {
+                chars.next();
+                in_line_comment = true;
+                continue;
+            }
+            if matches!(chars.peek(), Some('*')) {
+                chars.next();
+                in_block_comment = true;
+                out.push(' ');
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Parse top-level `varying` declarations from a GLSL ES 1.00 / desktop GLSL
+/// 1.20 shader source, returning `(type, name)` pairs. Comments are stripped
+/// first; the whole source is scanned token-wise, so declarations anywhere on
+/// a line and several declarations per line (`varying vec2 a, b; varying
+/// float c;`) are all found. Handles precision qualifiers and (by skipping
+/// bracketed parts) array declarators.
+fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
+    let src = strip_glsl_comments(source);
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(rel) = src[search_start..].find("varying") {
+        let start = search_start + rel;
+        let end = start + "varying".len();
+        let before_ok = start == 0 || {
+            let b = bytes[start - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after_ok = end >= src.len() || {
+            let b = bytes[end];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        if !before_ok || !after_ok {
+            search_start = end;
+            continue;
+        }
+        // Scan tokens up to the first ';' (declarations after it will be
+        // picked up by the next outer-loop iteration).
+        let rest = &src[end..];
+        let semi = rest.find(';').unwrap_or(rest.len());
+        let body = &rest[..semi];
+        let mut items: Vec<(String, bool)> = Vec::new(); // (token, comma-followed)
+        let mut cur = String::new();
+        let mut comma = false;
+        let mut in_brackets = false;
+        for ch in body.chars() {
+            if ch == '[' {
+                in_brackets = true;
+            } else if ch == ']' {
+                in_brackets = false;
+            }
+            if in_brackets {
+                continue;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                cur.push(ch);
+            } else {
+                if !cur.is_empty() {
+                    items.push((cur.clone(), comma));
+                    cur.clear();
+                    comma = false;
+                }
+                if ch == ',' {
+                    comma = true;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            items.push((cur, comma));
+        }
+        if !items.is_empty() {
+            let mut idx = 0usize;
+            if matches!(items[0].0.as_str(), "highp" | "mediump" | "lowp") && items.len() >= 2 {
+                idx = 1;
+            }
+            let ty = items[idx].0.clone();
+            let mut k = idx + 1;
+            while k < items.len() {
+                let had_comma = items[k].1;
+                if k > idx + 1 && !had_comma {
+                    break;
+                }
+                let name = items[k].0.clone();
+                if !name.is_empty() {
+                    out.push((ty.clone(), name));
+                }
+                k += 1;
+            }
+        }
+        search_start = end;
+    }
+    out
+}
+
+/// Guest-side bookkeeping of the ES 2.0 shader/program graph: which type each
+/// shader object has, the (normalized) source last submitted for it, and
+/// which shaders are attached to each program. Populated by the
+/// `glCreateShader` / `glShaderSource` / `glAttachShader` / `glDetachShader` /
+/// `glDeleteShader` / `glDeleteProgram` hooks below. `fix_fragment_only_varyings`
+/// reads this instead of calling `glGetAttachedShaders` / `glGetShaderSource`
+/// on the host backend — those entry points are optional and some backends
+/// (notably `GLES2Native`, whose `GetAttachedShaders` default panics) do not
+/// implement them.
+#[derive(Default)]
+struct ShaderBookkeeping {
+    shader_types: HashMap<GLuint, GLuint>,
+    shader_sources: HashMap<GLuint, String>,
+    program_attachments: HashMap<GLuint, Vec<GLuint>>,
+}
+static SHADER_BOOKKEEPING: std::sync::Mutex<Option<ShaderBookkeeping>> =
+    std::sync::Mutex::new(None);
+
+fn with_shader_bookkeeping<R>(f: impl FnOnce(&mut ShaderBookkeeping) -> R) -> R {
+    let mut guard = SHADER_BOOKKEEPING.lock().unwrap();
+    f(guard.get_or_insert_with(ShaderBookkeeping::default))
+}
+
+fn record_shader_type(shader: GLuint, type_: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_types.insert(shader, type_);
+    });
+}
+
+fn record_shader_source(shader: GLuint, source: String) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_sources.insert(shader, source);
+    });
+}
+
+fn record_shader_attach(program: GLuint, shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        let list = bk.program_attachments.entry(program).or_default();
+        if !list.contains(&shader) {
+            list.push(shader);
+        }
+    });
+}
+
+fn record_shader_detach(program: GLuint, shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            list.retain(|s| *s != shader);
+        }
+    });
+}
+
+fn record_shader_deleted(shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_types.remove(&shader);
+        bk.shader_sources.remove(&shader);
+        for list in bk.program_attachments.values_mut() {
+            list.retain(|s| *s != shader);
+        }
+    });
+}
+
+fn record_program_deleted(program: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.program_attachments.remove(&program);
+    });
+}
+
+/// Some apps (e.g. Gangstar) declare `varying` variables in the fragment
+/// shader that the vertex shader never declares. GLSL ES 1.00 tolerates this
+/// (the varying gets an undefined value), and so did the PowerVR drivers of
+/// real devices, but strict linkers — notably ANGLE's — fail the whole
+/// program link with "FRAGMENT varying X does not match any VERTEX varying",
+/// leaving the app drawing with a stale program and producing garbage
+/// (magenta) geometry. Fix it generically: re-declare the fragment-only
+/// varyings at the end of the vertex shader source (top-level declarations
+/// are legal after `main()`), swap in a recompiled vertex shader, and let the
+/// link proceed. Shader/program relationships come from the guest-side
+/// [ShaderBookkeeping], never from optional backend entry points.
+unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let Some((vertex_shader, vertex_src, fragment_src)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        if attached.len() < 2 {
+            return None;
+        }
+        let mut vertex: Option<(GLuint, String)> = None;
+        let mut fragment_src: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        vertex = Some((shader, src.clone()));
+                    }
+                }
+                Some(FRAGMENT_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        fragment_src = Some(src.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        match (vertex, fragment_src) {
+            (Some(vertex), Some(fragment_src)) => Some((vertex.0, vertex.1, fragment_src)),
+            _ => None,
+        }
+    }) else {
+        return;
+    };
+    let vertex_varyings = parse_varying_declarations(&vertex_src);
+    let fragment_varyings = parse_varying_declarations(&fragment_src);
+    if fragment_varyings.is_empty() {
+        return;
+    }
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for (ty, name) in fragment_varyings {
+        if vertex_varyings.iter().any(|(_, n)| n == &name) {
+            continue;
+        }
+        if missing.iter().any(|(_, n)| n == &name) {
+            continue;
+        }
+        missing.push((ty, name));
+    }
+    if missing.is_empty() {
+        return;
+    }
+    if swap_in_patched_vertex_shader(gles, program, vertex_shader, &vertex_src, &missing) {
+        log!(
+            "Program {}: injected {} fragment-only varying declaration(s) ({}) \
+             into the vertex shader so strict linkers accept the program",
+            program,
+            missing.len(),
+            missing
+                .iter()
+                .map(|(_, n)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+/// Append `missing` varying declarations to the program's current vertex
+/// shader source, compile the result and swap it in (updating the guest-side
+/// bookkeeping). Returns `false` (leaving everything as-is) if the patched
+/// shader fails to compile.
+unsafe fn swap_in_patched_vertex_shader(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    vertex_shader: GLuint,
+    vertex_src: &str,
+    missing: &[(String, String)],
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const COMPILE_STATUS: GLenum = 0x8B81;
+
+    let mut patched = vertex_src.to_string();
+    if !patched.ends_with('\n') {
+        patched.push('\n');
+    }
+    for (ty, name) in missing {
+        patched.push_str(&format!("varying {} {};\n", ty, name));
+    }
+    let Ok(csrc) = std::ffi::CString::new(patched.clone()) else {
+        return false;
+    };
+    let new_shader = gles.CreateShader(VERTEX_SHADER as GLenum);
+    if new_shader == 0 {
+        return false;
+    }
+    let ptr = csrc.as_ptr();
+    gles.ShaderSource(new_shader, 1, &ptr, std::ptr::null());
+    gles.CompileShader(new_shader);
+    let mut ok: GLint = 0;
+    gles.GetShaderiv(new_shader, COMPILE_STATUS, &mut ok);
+    if ok == 0 {
+        gles.DeleteShader(new_shader);
+        return false;
+    }
+    gles.DetachShader(program, vertex_shader);
+    gles.AttachShader(program, new_shader);
+    // Keep the guest-side bookkeeping in sync (the Attach/Detach calls above
+    // go straight to the backend, bypassing the glAttachShader hook).
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            if let Some(slot) = list.iter_mut().find(|s| **s == vertex_shader) {
+                *slot = new_shader;
+            } else {
+                list.push(new_shader);
+            }
+        }
+        bk.shader_types.insert(new_shader, VERTEX_SHADER);
+        bk.shader_sources.insert(new_shader, patched);
+        // The old vertex shader's type/source entries stay in the maps until
+        // the guest deletes it — it may still be attached to other programs.
+    });
+    true
+}
+
+/// A `uniform … name[N]` declaration: the uniform's name, the declared
+/// element count (None for unsized `name[]`), the raw text found between
+/// the brackets (for diagnostics) and the byte span of the bracket
+/// interior so the source can be rewritten in place.
+struct UniformArrayDecl {
+    name: String,
+    size: Option<u32>,
+    raw_size: String,
+    /// Type token preceding the name (e.g. `vec4`, or a user struct name).
+    ty: String,
+    digits_span: (usize, usize),
+}
+
+/// Collect `#define NAME <integer>` (optionally wrapped in parentheses)
+/// macro definitions so uniform array sizes written through macros can be
+/// resolved to numbers.
+fn collect_int_defines(source: &str) -> std::collections::HashMap<String, u32> {
+    let mut out = std::collections::HashMap::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let mut tokens = rest.split_whitespace();
+        if tokens.next() != Some("define") {
+            continue;
+        }
+        let Some(name) = tokens.next() else { continue };
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let Some(value) = tokens.next() else { continue };
+        let value = value.trim_matches(|c| c == '(' || c == ')');
+        if let Ok(n) = value.parse::<u32>() {
+            out.insert(name.to_string(), n);
+        }
+    }
+    out
+}
+
+/// Parse top-level `uniform` declarations that carry an `[N]` array size.
+/// The input must already have comments stripped (see
+/// [strip_glsl_comments]) so byte spans line up with the string being
+/// rewritten. Integer macros from `defines` are resolved; `[]` (unsized)
+/// declarations are reported with `size: None` so the caller can fill in
+/// the other stage's size. Only the common single-declarator form is
+/// handled; exotic layouts are skipped rather than misparsed.
+fn parse_uniform_array_declarations(
+    source: &str,
+    defines: &std::collections::HashMap<String, u32>,
+) -> Vec<UniformArrayDecl> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(rel) = source[search_start..].find("uniform") {
+        let start = search_start + rel;
+        let kw_end = start + "uniform".len();
+        let before_ok = start == 0 || {
+            let b = bytes[start - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after_ok = kw_end >= source.len() || {
+            let b = bytes[kw_end];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        if !before_ok || !after_ok {
+            search_start = kw_end;
+            continue;
+        }
+        let rest = &source[kw_end..];
+        let semi = rest.find(';').unwrap_or(rest.len());
+        let body = &rest[..semi];
+        search_start = (kw_end + semi + 1).min(source.len());
+        let Some(open_bracket) = body.find('[') else {
+            continue;
+        };
+        let Some(close_rel) = body[open_bracket..].find(']') else {
+            continue;
+        };
+        let inner = &body[open_bracket + 1..open_bracket + close_rel];
+        let trimmed = inner.trim();
+        // Sized literally, through an integer macro, or unsized (`[]`).
+        let size = if trimmed.is_empty() {
+            None
+        } else if let Ok(n) = trimmed.parse::<u32>() {
+            Some(n)
+        } else if trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            defines.get(trimmed).copied()
+        } else {
+            None
+        };
+        // The declarator's name is the identifier token right before '['.
+        let before = body[..open_bracket].trim_end();
+        // take_while on the reversed iterator yields the trailing identifier
+        // run right-to-left; .last() is therefore its leftmost character.
+        let name_start = before
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| c.is_ascii_alphanumeric() || c == '_')
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let name = &before[name_start..];
+        if name.is_empty() || name.bytes().next().map_or(true, |b| b.is_ascii_digit()) {
+            continue;
+        }
+        // The type token is the last whitespace-separated token before the
+        // name (precision qualifiers sit further left).
+        let ty = before[..name_start]
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_string();
+        let digits_start = kw_end + open_bracket + 1;
+        let digits_end = kw_end + open_bracket + close_rel;
+        out.push(UniformArrayDecl {
+            name: name.to_string(),
+            size,
+            raw_size: trimmed.to_string(),
+            ty,
+            digits_span: (digits_start, digits_end),
+        });
+    }
+    out
+}
+
+/// Rewrite every declaration whose name appears in `fixes` (name → new
+/// element count), applying replacements from the end of the source so
+/// earlier byte spans stay valid.
+fn rewrite_uniform_array_sizes(
+    source: &str,
+    decls: &[UniformArrayDecl],
+    fixes: &[(String, u32)],
+) -> String {
+    let mut spans: Vec<((usize, usize), u32)> = decls
+        .iter()
+        .filter_map(|d| {
+            fixes
+                .iter()
+                .find(|(n, _)| n == &d.name)
+                .map(|(_, size)| (d.digits_span, *size))
+        })
+        .collect();
+    spans.sort_by(|a, b| b.0.0.cmp(&a.0.0));
+    let mut out = source.to_string();
+    for ((s, e), size) in spans {
+        out.replace_range(s..e, &size.to_string());
+    }
+    out
+}
+
+unsafe fn compile_shader_source(gles: &mut dyn GLES, type_: GLuint, src: &str) -> Option<GLuint> {
+    const COMPILE_STATUS: GLenum = 0x8B81;
+    let cs = std::ffi::CString::new(src.as_bytes().to_vec()).ok()?;
+    let ptr = cs.as_ptr();
+    let shader = gles.CreateShader(type_);
+    if shader == 0 {
+        return None;
+    }
+    gles.ShaderSource(shader, 1, &ptr, std::ptr::null());
+    gles.CompileShader(shader);
+    let mut ok: GLint = 0;
+    gles.GetShaderiv(shader, COMPILE_STATUS, &mut ok);
+    if ok == 0 {
+        gles.DeleteShader(shader);
+        None
+    } else {
+        Some(shader)
+    }
+}
+
+/// Lenient iPhone-era drivers (PowerVR) accepted a uniform array declared
+/// with *different* element counts in the vertex and fragment shaders;
+/// strict linkers fail the whole program with "Field numbers of uniform
+/// 'X' differ between VERTEX and FRAGMENT shaders" (Gangstar Rio e.g.
+/// declares `light` with a per-stage element count). Mirror the lenient
+/// hardware: before linking, rewrite both stages so every shared uniform
+/// array uses the maximum of the two declared sizes.
+unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let Some((vertex_shader, vertex_src, fragment_shader, fragment_src)) =
+        with_shader_bookkeeping(|bk| {
+            let attached = bk.program_attachments.get(&program)?.clone();
+            let mut vertex: Option<(GLuint, String)> = None;
+            let mut fragment: Option<(GLuint, String)> = None;
+            for shader in attached {
+                match bk.shader_types.get(&shader).copied() {
+                    Some(VERTEX_SHADER) => {
+                        if let Some(src) = bk.shader_sources.get(&shader) {
+                            vertex = Some((shader, src.clone()));
+                        }
+                    }
+                    Some(FRAGMENT_SHADER) => {
+                        if let Some(src) = bk.shader_sources.get(&shader) {
+                            fragment = Some((shader, src.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match (vertex, fragment) {
+                (Some(v), Some(f)) => Some((v.0, v.1, f.0, f.1)),
+                _ => None,
+            }
+        })
+    else {
+        return;
+    };
+
+    // Comments are stripped so the parser's byte spans match the string
+    // being rewritten; dropping them from the patched source is harmless.
+    let vertex_stripped = strip_glsl_comments(&vertex_src);
+    let fragment_stripped = strip_glsl_comments(&fragment_src);
+    let vertex_defines = collect_int_defines(&vertex_stripped);
+    let fragment_defines = collect_int_defines(&fragment_stripped);
+    let vertex_uniforms = parse_uniform_array_declarations(&vertex_stripped, &vertex_defines);
+    let fragment_uniforms =
+        parse_uniform_array_declarations(&fragment_stripped, &fragment_defines);
+    if vertex_uniforms.is_empty() || fragment_uniforms.is_empty() {
+        return;
+    }
+    let mut fixes: Vec<(String, u32)> = Vec::new();
+    for vd in &vertex_uniforms {
+        if fixes.iter().any(|(n, _)| n == &vd.name) {
+            continue;
+        }
+        if let Some(fd) = fragment_uniforms.iter().find(|fd| fd.name == vd.name) {
+            match (vd.size, fd.size) {
+                (Some(a), Some(b)) if a != b => fixes.push((vd.name.clone(), a.max(b))),
+                // Unsized / unresolvable on one side: adopt the other's size.
+                (Some(a), None) => fixes.push((vd.name.clone(), a)),
+                (None, Some(b)) => fixes.push((vd.name.clone(), b)),
+                _ => {}
+            }
+        }
+    }
+    if fixes.is_empty() {
+        return;
+    }
+
+    let patched_vertex = rewrite_uniform_array_sizes(&vertex_stripped, &vertex_uniforms, &fixes);
+    let patched_fragment =
+        rewrite_uniform_array_sizes(&fragment_stripped, &fragment_uniforms, &fixes);
+    if !swap_both_patched_shaders(
+        gles,
+        program,
+        vertex_shader,
+        fragment_shader,
+        &patched_vertex,
+        &patched_fragment,
+    ) {
+        return;
+    }
+    log!(
+        "Program {}: reconciled {} uniform array size difference(s) ({}) \\\
+         between vertex and fragment shaders so strict linkers accept the \\\
+         program",
+        program,
+        fixes.len(),
+        fixes
+            .iter()
+            .map(|(n, size)| format!("{}[{}]", n, size))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// Compile `patched_vertex`/`patched_fragment` and replace the stage shaders
+/// attached to `program` with the new objects, updating all bookkeeping.
+/// Returns false (and leaves the program untouched) if either compilation
+/// failed.
+unsafe fn swap_both_patched_shaders(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    vertex_shader: GLuint,
+    fragment_shader: GLuint,
+    patched_vertex: &str,
+    patched_fragment: &str,
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let Some(new_vertex) = compile_shader_source(gles, VERTEX_SHADER, patched_vertex) else {
+        return false;
+    };
+    let Some(new_fragment) = compile_shader_source(gles, FRAGMENT_SHADER, patched_fragment) else {
+        gles.DeleteShader(new_vertex);
+        return false;
+    };
+    gles.DetachShader(program, vertex_shader);
+    gles.AttachShader(program, new_vertex);
+    gles.DetachShader(program, fragment_shader);
+    gles.AttachShader(program, new_fragment);
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            for (old, new) in [(vertex_shader, new_vertex), (fragment_shader, new_fragment)] {
+                if let Some(slot) = list.iter_mut().find(|s| **s == old) {
+                    *slot = new;
+                } else {
+                    list.push(new);
+                }
+            }
+        }
+        bk.shader_types.insert(new_vertex, VERTEX_SHADER);
+        bk.shader_types.insert(new_fragment, FRAGMENT_SHADER);
+        bk.shader_sources
+            .insert(new_vertex, patched_vertex.to_string());
+        bk.shader_sources
+            .insert(new_fragment, patched_fragment.to_string());
+    });
+    true
+}
+
+/// Types that can never be user-defined structs.
+const GLSL_BUILTIN_TYPES: &[&str] = &[
+    "float",
+    "int",
+    "bool",
+    "vec2",
+    "vec3",
+    "vec4",
+    "ivec2",
+    "ivec3",
+    "ivec4",
+    "bvec2",
+    "bvec3",
+    "bvec4",
+    "mat2",
+    "mat3",
+    "mat4",
+    "sampler2D",
+    "samplerCube",
+    "samplerExternalOES",
+    "highp",
+    "mediump",
+    "lowp",
+];
+
+struct StructDefinition {
+    name: String,
+    /// Span of the body between `{` and `}` inclusive.
+    body_span: (usize, usize),
+    /// Members as (type text, name, full declaration text).
+    members: Vec<(String, String, String)>,
+}
+
+/// Parse `struct NAME { … };` definitions out of GLSL source (comments must
+/// already be stripped). Struct bodies cannot nest braces, so the first `}`
+/// ends the body.
+fn parse_struct_definitions(source: &str) -> Vec<StructDefinition> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    for (idx, _) in source.match_indices("struct") {
+        let prev_ok =
+            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        let next = idx + "struct".len();
+        let next_ok = next >= bytes.len()
+            || !(bytes[next].is_ascii_alphanumeric() || bytes[next] == b'_');
+        if !prev_ok || !next_ok {
+            continue;
+        }
+        let rest = &source[next..];
+        let Some(name_off) = rest.find(|c: char| c.is_ascii_alphanumeric() || c == '_') else {
+            continue;
+        };
+        let name_end = rest[name_off..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|e| name_off + e)
+            .unwrap_or(rest.len());
+        let name = &rest[name_off..name_end];
+        if name.is_empty() {
+            continue;
+        }
+        let Some(brace_off) = rest[name_end..].find('{') else {
+            continue;
+        };
+        let brace = next + name_end + brace_off;
+        let Some(close) = source[brace..].find('}') else {
+            continue;
+        };
+        let body = &source[brace + 1..brace + close];
+        let mut members = Vec::new();
+        for member in body.split(';') {
+            let m = member.trim();
+            if m.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = m.split_whitespace().collect();
+            if tokens.len() < 2 {
+                continue;
+            }
+            let member_name = tokens[tokens.len() - 1]
+                .trim_end_matches(|c: char| c.is_ascii_digit() || c == '[' || c == ']')
+                .to_string();
+            let member_type = tokens[..tokens.len() - 1].join(" ");
+            members.push((member_type, member_name, m.to_string()));
+        }
+        out.push(StructDefinition {
+            name: name.to_string(),
+            body_span: (brace, brace + close + 1),
+            members,
+        });
+    }
+    out
+}
+
+/// Build the union of two struct bodies: same order as `a`, with members
+/// present only in `b` appended. Returns None if a member exists in both
+/// with a different type (that is a genuine program error, not a linker
+/// quirk).
+fn merged_struct_body(a: &StructDefinition, b: &StructDefinition) -> Option<String> {
+    let mut members: Vec<(String, String, String)> = a.members.clone();
+    for (ty, name, raw) in &b.members {
+        match members.iter().find(|(_, n, _)| n == name) {
+            Some((existing_ty, _, _)) if existing_ty == ty => {}
+            Some(_) => return None,
+            None => members.push((ty.clone(), name.clone(), raw.clone())),
+        }
+    }
+    Some(
+        members
+            .iter()
+            .map(|(_, _, raw)| format!("{};", raw))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Some strict desktop GL linkers reject a program when the vertex and
+/// fragment stages define the *same struct type with different member lists*
+/// (even if each stage only touches its own subset):
+/// "Field numbers of uniform 'X' differ between VERTEX and FRAGMENT shaders".
+/// Detect shared struct types used by array uniforms in both stages, unify
+/// their definitions to the member union, and swap in recompiled stages.
+/// Returns true if the program's shaders were replaced.
+unsafe fn reconcile_uniform_struct_definitions(gles: &mut dyn GLES, program: GLuint) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let Some((vertex_shader, fragment_shader, vertex_source, fragment_source)) =
+        with_shader_bookkeeping(|bk| {
+            let attached = bk.program_attachments.get(&program)?;
+            let vertex_shader = attached
+                .iter()
+                .find(|shader| bk.shader_types.get(*shader) == Some(&VERTEX_SHADER))
+                .copied()?;
+            let fragment_shader = attached
+                .iter()
+                .find(|shader| bk.shader_types.get(*shader) == Some(&FRAGMENT_SHADER))
+                .copied()?;
+            let vertex_source = bk.shader_sources.get(&vertex_shader)?.clone();
+            let fragment_source = bk.shader_sources.get(&fragment_shader)?.clone();
+            Some((
+                vertex_shader,
+                fragment_shader,
+                vertex_source,
+                fragment_source,
+            ))
+        })
+    else {
+        return false;
+    };
+    let defines_v = collect_int_defines(&vertex_source);
+    let defines_f = collect_int_defines(&fragment_source);
+    let uniforms_v = parse_uniform_array_declarations(&vertex_source, &defines_v);
+    let uniforms_f = parse_uniform_array_declarations(&fragment_source, &defines_f);
+    let mut structs_v = parse_struct_definitions(&vertex_source);
+    let mut structs_f = parse_struct_definitions(&fragment_source);
+    // Struct types used by array uniforms in both stages.
+    let mut shared_types: Vec<String> = Vec::new();
+    for dv in &uniforms_v {
+        if GLSL_BUILTIN_TYPES.contains(&dv.ty.as_str()) || dv.ty.is_empty() {
+            continue;
+        }
+        if uniforms_f
+            .iter()
+            .any(|df| df.name == dv.name && df.ty == dv.ty)
+        {
+            if !shared_types.contains(&dv.ty) {
+                shared_types.push(dv.ty.clone());
+            }
+        }
+    }
+    let mut patched_vertex = vertex_source.clone();
+    let mut patched_fragment = fragment_source.clone();
+    let mut changed = Vec::new();
+    for ty in shared_types {
+        let Some(sv) = structs_v.iter().find(|s| s.name == ty) else {
+            continue;
+        };
+        let Some(sf) = structs_f.iter().find(|s| s.name == ty) else {
+            continue;
+        };
+        // Only act when the member lists actually differ.
+        let same = sv.members.len() == sf.members.len()
+            && sv
+                .members
+                .iter()
+                .zip(&sf.members)
+                .all(|(a, b)| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+        if same {
+            continue;
+        }
+        let Some(merged) = merged_struct_body(sv, sf) else {
+            log!(
+                "Program {}: struct {} has conflicting member types between \\\
+                 vertex and fragment shaders; leaving as-is",
+                program,
+                ty
+            );
+            return false;
+        };
+        // body_span includes the braces, so re-wrap the merged members.
+        // Spans shift as the source is edited, so re-parse after each edit.
+        let merged_braced = format!("{{ {} }}", merged);
+        let new_vertex = format!(
+            "{}{}{}",
+            &patched_vertex[..sv.body_span.0],
+            merged_braced,
+            &patched_vertex[sv.body_span.1..]
+        );
+        patched_vertex = new_vertex;
+        let new_fragment = format!(
+            "{}{}{}",
+            &patched_fragment[..sf.body_span.0],
+            merged_braced,
+            &patched_fragment[sf.body_span.1..]
+        );
+        patched_fragment = new_fragment;
+        changed.push(ty);
+        // Spans moved: re-parse the patched sources for the next iteration.
+        structs_v = parse_struct_definitions(&patched_vertex);
+        structs_f = parse_struct_definitions(&patched_fragment);
+    }
+    if changed.is_empty() {
+        return false;
+    }
+    if !swap_both_patched_shaders(
+        gles,
+        program,
+        vertex_shader,
+        fragment_shader,
+        &patched_vertex,
+        &patched_fragment,
+    ) {
+        return false;
+    }
+    log!(
+        "Program {}: unified struct definition(s) ({}) between vertex and \\\
+         fragment shaders so strict linkers accept the program",
+        program,
+        changed.join(", ")
+    );
+    true
+}
+
+/// Dump the `uniform …[N]` declarations parsed from each stage attached to
+/// `program` (name, raw bracket text, resolved size). Diagnostic for
+/// strict-linker uniform mismatches the pre-link reconciliation could not
+/// fix; the next user log then shows exactly what the shaders declare.
+fn log_uniform_array_declarations(program: GLuint) {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+    let Some((vertex_src, fragment_src)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        let mut vertex: Option<String> = None;
+        let mut fragment: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => vertex = bk.shader_sources.get(&shader).cloned(),
+                Some(FRAGMENT_SHADER) => fragment = bk.shader_sources.get(&shader).cloned(),
+                _ => {}
+            }
+        }
+        Some((vertex?, fragment?))
+    }) else {
+        return;
+    };
+    let fmt = |src: &str| -> String {
+        let stripped = strip_glsl_comments(src);
+        let defines = collect_int_defines(&stripped);
+        let decls = parse_uniform_array_declarations(&stripped, &defines);
+        if decls.is_empty() {
+            return "<none>".to_string();
+        }
+        decls
+            .iter()
+            .map(|d| format!("{}[{}] as {:?}", d.name, d.raw_size, d.size))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    log!(
+        "Program {} uniform array declarations - vertex: {}; fragment: {}",
+        program,
+        fmt(&vertex_src),
+        fmt(&fragment_src)
+    );
+}
+
+/// Last-resort fix-up: if a link still failed, parse varying names reported
+/// by the driver (ANGLE: `FRAGMENT varying <name> does not match any VERTEX
+/// varying`; Mesa: `fragment shader input '<name>' has no matching output in
+/// the previous stage`), look their types up in the recorded fragment source
+/// and inject them into the vertex shader. The caller re-links afterwards.
+fn parse_driver_reported_varying_names(info_log: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in info_log.lines() {
+        let marker = if line.contains("FRAGMENT varying")
+            && line.contains("does not match any VERTEX varying")
+        {
+            "FRAGMENT varying"
+        } else if line.contains("fragment shader input")
+            && line.contains("has no matching output in the previous stage")
+        {
+            "fragment shader input"
+        } else {
+            continue;
+        };
+        let Some(index) = line.find(marker) else {
+            continue;
+        };
+        let rest = line[index + marker.len()..].trim_start();
+        let rest = rest.trim_start_matches(|c| matches!(c, '\'' | '"' | '`'));
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+unsafe fn inject_driver_reported_varyings(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    info_log: &str,
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let names = parse_driver_reported_varying_names(info_log);
+    if names.is_empty() {
+        return false;
+    }
+    let Some((vertex_shader, vertex_src, missing)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        let mut vertex: Option<(GLuint, String)> = None;
+        let mut fragment_src: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        vertex = Some((shader, src.clone()));
+                    }
+                }
+                Some(FRAGMENT_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        fragment_src = Some(src.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (vertex_shader, vertex_src) = vertex?;
+        let fragment_src = fragment_src?;
+        let fs_decls = parse_varying_declarations(&fragment_src);
+        let missing: Vec<(String, String)> = names
+            .iter()
+            .filter_map(|name| fs_decls.iter().find(|(_, n)| n == name).cloned())
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        Some((vertex_shader, vertex_src, missing))
+    }) else {
+        return false;
+    };
+    swap_in_patched_vertex_shader(gles, program, vertex_shader, &vertex_src, &missing)
+}
+
 fn glShaderSource(
     env: &mut Environment,
     shader: GLuint,
@@ -6625,5 +7730,205 @@ mod shader_preprocessor_normalization_tests {
         let out = normalize_shader_preprocessor_whitespace(&joined);
         assert!(out.contains("#endif //trailing comment"));
         assert!(!out.contains("#endif//trailing comment"));
+    }
+}
+
+#[cfg(test)]
+mod shader_extension_hoisting_tests {
+    use super::hoist_shader_extension_directives;
+
+    #[test]
+    fn hoists_late_extension_before_code() {
+        // Mirrors the Gangstar shader layout that fails on ANGLE with
+        // "extension directive must occur before any non-preprocessor tokens".
+        let src = "precision mediump float;\nuniform sampler2D t;\n#extension GL_OES_texture_3D : enable\nvarying vec2 vUV;\nvoid main() {}\n";
+        let out = hoist_shader_extension_directives(src);
+        assert!(
+            out.starts_with("#extension GL_OES_texture_3D : enable\n"),
+            "hoisted source must start with the extension directive, got: {out}"
+        );
+        assert!(out.find("#extension").unwrap() < out.find("precision").unwrap());
+    }
+
+    #[test]
+    fn keeps_version_first_and_normalizes_whitespace() {
+        let src = "#version 100\nvoid main() {}\n#  extension GL_OES_standard_derivatives : enable\n";
+        let out = hoist_shader_extension_directives(src);
+        assert!(
+            out.starts_with("#version 100\n#extension GL_OES_standard_derivatives : enable\n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn leaves_sources_without_extensions_untouched() {
+        let src = "void main() { gl_FragColor = vec4(1.0); }\n";
+        assert_eq!(hoist_shader_extension_directives(src), src);
+    }
+
+    #[test]
+    fn does_not_misfire_on_extension_identifiers() {
+        let src = "float extensionFlag = 1.0;\nvoid main() {}\n";
+        assert_eq!(hoist_shader_extension_directives(src), src);
+    }
+}
+
+#[cfg(test)]
+mod varying_declaration_parsing_tests {
+    use super::parse_varying_declarations;
+
+    #[test]
+    fn parses_precision_and_declarator_lists() {
+        let frag = "precision mediump float;\nvarying lowp vec4 vAlpha;\nvarying vec2 vUV, vUV2;\nvarying highp vec3 vNormal; // lit\nvoid main() {}\n";
+        let v = parse_varying_declarations(frag);
+        assert!(v.contains(&("vec4".to_string(), "vAlpha".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV2".to_string())));
+        assert!(v.contains(&("vec3".to_string(), "vNormal".to_string())));
+        assert_eq!(v.len(), 4);
+    }
+
+    #[test]
+    fn fragment_only_varyings_detected_as_missing() {
+        // The Gangstar case: fragment declares vAlpha, vertex does not.
+        let vert = parse_varying_declarations("varying vec2 vUV;\nvoid main() {}\n");
+        let frag = parse_varying_declarations("varying vec4 vAlpha;\nvarying vec2 vUV;\nvoid main() {}\n");
+        let missing: Vec<_> = frag
+            .into_iter()
+            .filter(|(_, n)| !vert.iter().any(|(_, vn)| vn == n))
+            .collect();
+        assert_eq!(missing, vec![("vec4".to_string(), "vAlpha".to_string())]);
+    }
+
+    #[test]
+    fn commented_out_varyings_are_ignored() {
+        // Gameloft's generator emits the full varying block in both stages
+        // but comments unused entries out; these must not count as declared.
+        let vert = parse_varying_declarations(
+            "varying vec2 vUV;\n/* varying float vAlpha; */\n// varying vec3 vNormal;\nvoid main() {}\n",
+        );
+        assert_eq!(vert, vec![("vec2".to_string(), "vUV".to_string())]);
+    }
+
+    #[test]
+    fn multiple_declarations_per_line_and_mid_line() {
+        let src = "varying vec2 vUV, vUV2; varying float vAlpha;\nuniform varying_less;\nvoid main() { varying_not_keyword(); }\n";
+        let v = parse_varying_declarations(src);
+        assert!(v.contains(&("vec2".to_string(), "vUV".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV2".to_string())));
+        assert!(v.contains(&("float".to_string(), "vAlpha".to_string())));
+        assert!(!v.iter().any(|(_, n)| n == "varying_not_keyword"));
+        assert_eq!(v.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod uniform_array_reconciliation_tests {
+    use super::{
+        merged_struct_body, parse_struct_definitions, parse_uniform_array_declarations,
+        rewrite_uniform_array_sizes,
+    };
+
+    #[test]
+    fn parses_array_sizes_and_rewrites_both_stages_to_max() {
+        let vertex = "uniform vec4 light[4];\nuniform float pad;\nvoid main() {}\n";
+        let fragment =
+            "precision mediump float;\nuniform highp vec4 light[2];\nvoid main() {}\n";
+        let defines = std::collections::HashMap::new();
+        let vd = parse_uniform_array_declarations(vertex, &defines);
+        let fd = parse_uniform_array_declarations(fragment, &defines);
+        assert_eq!(vd.len(), 1);
+        assert_eq!(fd.len(), 1);
+        assert_eq!(vd[0].name, "light");
+        assert_eq!(vd[0].size, Some(4));
+        assert_eq!(fd[0].name, "light");
+        assert_eq!(fd[0].size, Some(2));
+
+        let fixes = vec![("light".to_string(), 4u32)];
+        let patched_vertex = rewrite_uniform_array_sizes(vertex, &vd, &fixes);
+        let patched_fragment = rewrite_uniform_array_sizes(fragment, &fd, &fixes);
+        assert!(patched_vertex.contains("light[4]"), "{patched_vertex}");
+        assert!(patched_fragment.contains("light[4]"), "{patched_fragment}");
+        assert!(!patched_fragment.contains("light[2]"), "{patched_fragment}");
+        // Untouched declarations stay as they were.
+        assert!(patched_vertex.contains("uniform float pad;"));
+    }
+
+    #[test]
+    fn non_array_uniforms_and_commented_ones_are_ignored() {
+        let raw = "uniform vec4 nolit;\nuniform float lit2;\n\
+                   /* uniform vec4 light[3]; */\nvoid main() {}\n";
+        // Callers strip comments before parsing (as the link fix-up does).
+        let src = super::strip_glsl_comments(raw);
+        let defines = std::collections::HashMap::new();
+        assert!(parse_uniform_array_declarations(&src, &defines).is_empty());
+    }
+
+    #[test]
+    fn struct_definitions_are_parsed_and_merged() {
+        let v = "struct Light { vec4 pos; float r; };\n\
+                 uniform Light light[MAX_LIGHT];\nvoid main() {}\n";
+        let f = "struct Light { vec4 pos; float r; vec3 color; };\n\
+                 uniform Light light[MAX_LIGHT];\nvoid main() {}\n";
+        let sv = parse_struct_definitions(v);
+        let sf = parse_struct_definitions(f);
+        assert_eq!(sv.len(), 1);
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sv[0].name, "Light");
+        assert_eq!(sv[0].members.len(), 2);
+        assert_eq!(sf[0].members.len(), 3);
+        let merged = merged_struct_body(&sv[0], &sf[0]).unwrap();
+        assert_eq!(merged, "vec4 pos; float r; vec3 color;");
+        // Reverse order: union follows the first struct's order.
+        let merged2 = merged_struct_body(&sf[0], &sv[0]).unwrap();
+        assert_eq!(merged2, "vec4 pos; float r; vec3 color;");
+        // Conflicting types for the same member abort the merge.
+        let conflict = parse_struct_definitions("struct Light { vec4 pos; int r; };\n");
+        assert!(merged_struct_body(&sv[0], &conflict[0]).is_none());
+    }
+
+    #[test]
+    fn struct_spans_cover_braces_for_replacement() {
+        let src = "// c\nstruct S { float a; };\nuniform S s[2];\n";
+        let defs = parse_struct_definitions(src);
+        assert_eq!(defs.len(), 1);
+        let (start, end) = defs[0].body_span;
+        assert_eq!(&src[start..end], "{ float a; }");
+    }
+
+    #[test]
+    fn fragment_varying_link_errors_are_parsed_for_angle_and_mesa() {
+        let log = "FRAGMENT varying vTexCoord does not match any VERTEX varying\n\
+                   error: fragment shader input `vAlpha` has no matching output in the previous stage\n\
+                   error: fragment shader input `vAlpha` has no matching output in the previous stage";
+        assert_eq!(
+            super::parse_driver_reported_varying_names(log),
+            vec!["vTexCoord".to_string(), "vAlpha".to_string()]
+        );
+    }
+
+    #[test]
+    fn unrelated_link_errors_do_not_trigger_varying_repair() {
+        let log = "error: fragment shader input `vAlpha` has an unsupported type";
+        assert!(super::parse_driver_reported_varying_names(log).is_empty());
+    }
+
+    #[test]
+    fn macro_sized_and_unsized_arrays_are_resolved() {
+        let vertex = "#define MAX_LIGHTS 4\nuniform vec4 light[MAX_LIGHTS];\n\
+                      void main() {}\n";
+        let fragment = "uniform vec4 light[];\nvoid main() {}\n";
+        let vdefs = super::collect_int_defines(vertex);
+        let fdefs = std::collections::HashMap::new();
+        let vd = parse_uniform_array_declarations(vertex, &vdefs);
+        let fd = parse_uniform_array_declarations(fragment, &fdefs);
+        assert_eq!(vd.len(), 1);
+        assert_eq!(vd[0].size, Some(4));
+        assert_eq!(fd.len(), 1);
+        assert_eq!(fd[0].size, None);
+        // The unsized side adopts the resolved size of the other stage.
+        let fixes = vec![("light".to_string(), 4u32)];
+        let patched = rewrite_uniform_array_sizes(fragment, &fd, &fixes);
+        assert!(patched.contains("light[4]"), "{patched}");
     }
 }

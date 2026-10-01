@@ -11,7 +11,9 @@ use crate::libc::mach::core_types::{integer_t, natural_t};
 use crate::libc::mach::init::MACH_TASK_SELF;
 use crate::libc::mach::policy::policy_t;
 use crate::libc::mach::port::mach_port_t;
-use crate::libc::mach::thread_info::{kern_return_t, mach_msg_type_number_t, KERN_SUCCESS};
+use crate::libc::mach::thread_info::{
+    kern_return_t, mach_msg_type_number_t, KERN_INVALID_ARGUMENT, KERN_INVALID_TASK, KERN_SUCCESS,
+};
 use crate::libc::mach::time_value::time_value_t;
 use crate::mem::{guest_size_of, MutPtr, SafeRead};
 use crate::Environment;
@@ -44,6 +46,26 @@ const POLICY_RR: policy_t = 2;
 #[allow(dead_code)]
 const POLICY_FIFO: policy_t = 4;
 
+fn validate_task_info_request(
+    target_task: task_name_t,
+    flavor: task_flavor_t,
+    out_size_available: mach_msg_type_number_t,
+) -> Result<mach_msg_type_number_t, kern_return_t> {
+    if target_task != MACH_TASK_SELF {
+        return Err(KERN_INVALID_TASK);
+    }
+    if flavor != TASK_BASIC_INFO {
+        return Err(KERN_INVALID_ARGUMENT);
+    }
+    let expected = (guest_size_of::<task_basic_info>() / guest_size_of::<integer_t>())
+        as mach_msg_type_number_t;
+    if expected > out_size_available {
+        Err(KERN_INVALID_ARGUMENT)
+    } else {
+        Ok(expected)
+    }
+}
+
 fn task_info(
     env: &mut Environment,
     target_task: task_name_t,
@@ -58,11 +80,24 @@ fn task_info(
         task_info_out,
         task_info_out_cnt
     );
-    assert_eq!(target_task, MACH_TASK_SELF);
-    assert_eq!(flavor, TASK_BASIC_INFO);
+    if task_info_out.is_null() || task_info_out_cnt.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
     let out_size_available = env.mem.read(task_info_out_cnt);
-    let out_size_expected = guest_size_of::<task_basic_info>() / guest_size_of::<integer_t>();
-    assert!(out_size_expected <= out_size_available);
+    let out_size_expected =
+        match validate_task_info_request(target_task, flavor, out_size_available) {
+            Ok(count) => count,
+            Err(error) => {
+                log!(
+                    "Warning: task_info({:?}, flavor={}, count={}): returning Mach error {}.",
+                    target_task,
+                    flavor,
+                    out_size_available,
+                    error
+                );
+                return error;
+            }
+        };
     // Per Apple documentation, write back the number of elements actually returned.
     env.mem.write(task_info_out_cnt, out_size_expected);
     // Values taken from an iPod Touch 4 running iOS 6.1
@@ -87,3 +122,44 @@ fn task_info(
 }
 
 pub const FUNCTIONS: FunctionExports = &[export_c_func!(task_info(_, _, _, _))];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_info_rejects_non_self_task_without_panicking() {
+        assert_eq!(
+            validate_task_info_request(MACH_TASK_SELF.wrapping_add(1), TASK_BASIC_INFO, u32::MAX,),
+            Err(KERN_INVALID_TASK)
+        );
+    }
+
+    #[test]
+    fn task_info_rejects_unsupported_flavors() {
+        assert_eq!(
+            validate_task_info_request(MACH_TASK_SELF, TASK_BASIC_INFO + 1, u32::MAX),
+            Err(KERN_INVALID_ARGUMENT)
+        );
+    }
+
+    #[test]
+    fn task_info_rejects_undersized_output_buffers() {
+        let expected = (guest_size_of::<task_basic_info>() / guest_size_of::<integer_t>())
+            as mach_msg_type_number_t;
+        assert_eq!(
+            validate_task_info_request(MACH_TASK_SELF, TASK_BASIC_INFO, expected - 1),
+            Err(KERN_INVALID_ARGUMENT)
+        );
+    }
+
+    #[test]
+    fn task_info_accepts_a_valid_basic_info_request() {
+        let expected = (guest_size_of::<task_basic_info>() / guest_size_of::<integer_t>())
+            as mach_msg_type_number_t;
+        assert_eq!(
+            validate_task_info_request(MACH_TASK_SELF, TASK_BASIC_INFO, expected),
+            Ok(expected)
+        );
+    }
+}

@@ -610,7 +610,7 @@ let default_ipad = DeviceFamily::iPad2;
                 launch_image.map(|image| (image, false)),
                 &options,
                 Some(gles_api_usage),
-            )))
+            )?))
         };
 
         let mut mem = mem::Mem::new();
@@ -1052,7 +1052,7 @@ let default_ipad = DeviceFamily::iPad2;
             launch_image,
             &options,
             None,
-        )));
+        )?));
 
         let mut mem = mem::Mem::new();
         mem.set_null_segment_size(mem::PAGE_SIZE);

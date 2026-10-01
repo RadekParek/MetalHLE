@@ -34,6 +34,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub(crate) fn calculate_letterboxed_viewport(
@@ -84,6 +85,18 @@ struct FrameGenerationState {
 const FRAME_GENERATION_BUDGET: Duration = Duration::from_millis(10);
 /// Sustained overruns before frame generation is disabled automatically.
 const FRAME_GENERATION_OVERRUN_LIMIT: u32 = 20;
+
+static ANDROID_ANGLE_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether Quick Options may offer ANGLE; unknown support stays enabled until a context probe fails.
+pub fn angle_backend_available() -> bool {
+    !cfg!(target_os = "android") || !ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "android")]
+fn should_attempt_android_angle(gles_native: bool, angle_unavailable: bool) -> bool {
+    !gles_native && !angle_unavailable
+}
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -1489,13 +1502,121 @@ impl Window {
         }
     }
 
+    /// Create the window, retrying with native GLES if bundled ANGLE fails.
     pub fn new(
         title: &str,
         icon: Option<Image>,
         launch_image: Option<(Image, bool)>,
         options: &Options,
         app_gles_usage: Option<crate::mach_o::GlesApiUsage>,
-    ) -> Window {
+    ) -> Result<Window, String> {
+        #[cfg(target_os = "android")]
+        {
+            let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
+            if should_attempt_android_angle(options.gles_native, angle_unavailable) {
+                if configure_android_angle_driver(true) {
+                    match Self::new_with_configured_driver(
+                        title,
+                        icon.clone(),
+                        launch_image.clone(),
+                        options,
+                        app_gles_usage,
+                        false,
+                    ) {
+                        Ok(window) if window.is_angle_backend() => {
+                            ANDROID_ANGLE_UNAVAILABLE.store(false, Ordering::Relaxed);
+                            return Ok(window);
+                        }
+                        Ok(window) => {
+                            let driver = window.gl_driver_description().to_owned();
+                            ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+                            log!(
+                                "ANGLE was requested, but SDL activated a non-ANGLE driver ({}). Retrying with native GLES.",
+                                driver
+                            );
+                            drop(window);
+                            configure_android_angle_driver(false);
+                            return Self::new_with_configured_driver(
+                                title,
+                                icon,
+                                launch_image,
+                                options,
+                                app_gles_usage,
+                                true,
+                            )
+                            .map_err(|native_error| {
+                                format!(
+                                    "ANGLE activated a non-ANGLE driver ({}); native GLES fallback failed ({})",
+                                    driver, native_error
+                                )
+                            });
+                        }
+                        Err(angle_error) => {
+                            ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+                            log!(
+                                "Bundled ANGLE initialization failed: {}. Retrying with the Android native GLES driver.",
+                                angle_error
+                            );
+                            configure_android_angle_driver(false);
+                            return Self::new_with_configured_driver(
+                                title,
+                                icon,
+                                launch_image,
+                                options,
+                                app_gles_usage,
+                                true,
+                            )
+                            .map_err(|native_error| {
+                                format!(
+                                    "Bundled ANGLE initialization failed ({}); native GLES fallback failed ({})",
+                                    angle_error, native_error
+                                )
+                            });
+                        }
+                    }
+                }
+
+                ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+                return Self::new_with_configured_driver(
+                    title,
+                    icon,
+                    launch_image,
+                    options,
+                    app_gles_usage,
+                    true,
+                )
+                .map_err(|native_error| {
+                    format!(
+                        "Bundled ANGLE is unavailable and native GLES initialization failed: {}",
+                        native_error
+                    )
+                });
+            }
+
+            if !options.gles_native && angle_unavailable {
+                log!(
+                    "Bundled ANGLE was previously unavailable; using the Android native GLES driver."
+                );
+            }
+            configure_android_angle_driver(false);
+        }
+
+        Self::new_with_configured_driver(title, icon, launch_image, options, app_gles_usage, false)
+    }
+
+    fn new_with_configured_driver(
+        title: &str,
+        icon: Option<Image>,
+        launch_image: Option<(Image, bool)>,
+        options: &Options,
+        app_gles_usage: Option<crate::mach_o::GlesApiUsage>,
+        prefer_native_gles: bool,
+    ) -> Result<Window, String> {
+        let sdl_ctx = sdl2::init().map_err(|err| format!("SDL initialization failed: {}", err))?;
+        let video_ctx = sdl_ctx
+            .video()
+            .map_err(|err| format!("SDL video initialization failed: {}", err))?;
+
         // Decide the GLES profile up front from the app's own imports, so
         // both the SDL context attributes and the backend match it.
         if let Some(usage) = app_gles_usage {
@@ -1518,8 +1639,12 @@ impl Window {
         // bundled ANGLE backend entirely and lets SDL pick up the vendor's
         // native OpenGL ES driver, which is the lenient behaviour some apps
         // need (`configure_angle_driver(false)` clears any stale overrides).
-        let angle_driver_active =
-            crate::gles::configure_angle_driver(options.angle_driver && !options.gles_native);
+        // `prefer_native_gles` is set by the Android ANGLE-to-native retry in
+        // [Window::new] so a failed ANGLE attempt is not silently re-staged
+        // here and reverted to ANGLE.
+        let angle_driver_active = crate::gles::configure_angle_driver(
+            options.angle_driver && !options.gles_native && !prefer_native_gles,
+        );
         let custom_driver_active = if angle_driver_active {
             if options.custom_driver.is_some() {
                 log!("ANGLE is enabled; ignoring the custom/native vendor driver selection");
@@ -1587,8 +1712,6 @@ impl Window {
         } else if frame_generation {
             log!("Frame generation enabled for the GPU renderer");
         }
-        let sdl_ctx = sdl2::init().unwrap();
-        let video_ctx = sdl_ctx.video().unwrap();
         let display_refresh_rate = video_ctx
             .current_display_mode(0)
             .ok()
@@ -1674,7 +1797,10 @@ impl Window {
         let mut window = if Self::rotatable_fullscreen() {
             // Without this, SDL will force fullscreen mode to be portrait.
             set_sdl2_orientation(device_orientation);
-            let screen_size = video_ctx.display_bounds(0).unwrap().size();
+            let screen_size = video_ctx
+                .display_bounds(0)
+                .map_err(|err| format!("Could not query the display bounds: {}", err))?
+                .size();
             let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
             let mut builder = video_ctx.window(title, width, height);
             if !software_presentation {
@@ -1718,11 +1844,17 @@ impl Window {
             window.set_icon(surface_from_image(&icon));
         }
 
-        let event_pump = sdl_ctx.event_pump().unwrap();
+        let event_pump = sdl_ctx
+            .event_pump()
+            .map_err(|err| format!("Could not initialize the SDL event pump: {}", err))?;
 
-        let controller_ctx = sdl_ctx.game_controller().unwrap();
+        let controller_ctx = sdl_ctx
+            .game_controller()
+            .map_err(|err| format!("Could not initialize SDL game controllers: {}", err))?;
 
-        let sensor_ctx = sdl_ctx.sensor().unwrap();
+        let sensor_ctx = sdl_ctx
+            .sensor()
+            .map_err(|err| format!("Could not initialize SDL sensors: {}", err))?;
         let mut accelerometer: Option<sdl2::sensor::Sensor> = None;
         let mut gyroscope: Option<sdl2::sensor::Sensor> = None;
         if let Ok(num_sensors) = sensor_ctx.num_sensors() {
@@ -1874,24 +2006,27 @@ impl Window {
                 .construct(&mut window)
                 .expect("Could not create software GLES context")
         } else {
-            match effective_graphics_api {
+            // Helpers returning `Box<dyn GLESContext>` are infallible
+            // (they panic on failure); Result-returning helpers propagate
+            // their error so `new_with_configured_driver` can report it.
+            let mapped = match effective_graphics_api {
                 crate::options::GraphicsApi::Translator => {
-                    create_gles1_translator_ctx_no_parent_stack(&mut window)
+                    Ok(create_gles1_translator_ctx_no_parent_stack(&mut window))
                 }
                 crate::options::GraphicsApi::TranslatorGLES30 => {
-                    create_gles1_gles3_translator_ctx_no_parent_stack(&mut window)
+                    Ok(create_gles1_gles3_translator_ctx_no_parent_stack(&mut window))
                 }
                 crate::options::GraphicsApi::GLES20 => {
                     create_gles2_ctx_no_parent_stack(&mut window)
                 }
                 crate::options::GraphicsApi::GLES30 => {
-                    create_gles3_ctx_no_parent_stack(&mut window)
+                    Ok(create_gles3_ctx_no_parent_stack(&mut window))
                 }
                 crate::options::GraphicsApi::GLES10 | crate::options::GraphicsApi::GLES11 => {
                     create_gles1_ctx_no_parent_stack(&mut window, options)
                 }
                 crate::options::GraphicsApi::Software => {
-                    create_host_gles1_ctx_no_parent_stack(&mut window)
+                    Ok(create_host_gles1_ctx_no_parent_stack(&mut window))
                 }
                 crate::options::GraphicsApi::Metal
                 | crate::options::GraphicsApi::Wgpu
@@ -1906,14 +2041,15 @@ impl Window {
                     // user/driver signals; the usage scan is still logged
                     // for diagnostics.
                     if llvmpipe_active {
-                        create_gles1_translator_ctx_no_parent_stack(&mut window)
+                        Ok(create_gles1_translator_ctx_no_parent_stack(&mut window))
                     } else if options.prefer_gles2_context || angle_driver_active {
                         create_gles2_ctx_no_parent_stack(&mut window)
                     } else {
                         create_gles1_ctx_no_parent_stack(&mut window, options)
                     }
                 }
-            }
+            };
+            mapped?
         };
         {
             let gl_ctx = gl_ins.make_current(&mut window);
@@ -1948,7 +2084,7 @@ impl Window {
             window.display_splash();
         }
 
-        window
+        Ok(window)
     }
 
     /// Poll for events from the OS. This needs to be done reasonably often

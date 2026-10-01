@@ -657,6 +657,43 @@ fn pthread_mach_thread_np(env: &mut Environment, thread: pthread_t) -> mach_port
     }
 }
 
+fn thread_id_from_mach_thread_port(port: mach_port_t, thread_count: usize) -> Option<ThreadId> {
+    let thread_id = port.checked_sub(1)? as ThreadId;
+    (thread_id < thread_count).then_some(thread_id)
+}
+
+fn _pthread_from_mach_thread_np(env: &mut Environment, port: mach_port_t) -> pthread_t {
+    let Some(thread_id) = thread_id_from_mach_thread_port(port, env.threads.len()) else {
+        return Ptr::null();
+    };
+    if let Some((&thread, _)) = State::get(env)
+        .threads
+        .iter()
+        .find(|&(_, host_object)| host_object.thread_id == thread_id)
+    {
+        return thread;
+    }
+    if thread_id == env.current_thread {
+        return pthread_self(env);
+    }
+    let opaque = env.mem.alloc_and_write(OpaqueThread {
+        magic: MAGIC_THREAD,
+    });
+    State::get(env)
+        .threads
+        .insert(opaque, ThreadHostObject::new(thread_id, DEFAULT_ATTR));
+    if thread_id == 0 {
+        State::get(env).main_thread_object_created = true;
+    }
+    log_dbg!(
+        "_pthread_from_mach_thread_np({}) created pthread handle {:?} for thread {}",
+        port,
+        opaque,
+        thread_id
+    );
+    opaque
+}
+
 fn pthread_get_stackaddr_np(env: &mut Environment, thread: pthread_t) -> MutVoidPtr {
     if let Some(thread_id) = State::get(env).threads.get(&thread).map(|t| t.thread_id) {
         Ptr::from_bits(*env.threads[thread_id].stack.as_ref().unwrap().end())
@@ -847,6 +884,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_kill(_, _)),
     // Darwin extensions
     export_c_func!(pthread_mach_thread_np(_)),
+    export_c_func!(_pthread_from_mach_thread_np(_)),
     export_c_func!(pthread_get_stackaddr_np(_)),
     export_c_func!(pthread_get_stacksize_np(_)),
     export_c_func!(pthread_getschedparam(_, _, _)),
@@ -855,3 +893,28 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_setname_np(_)),
     export_c_func!(pthread_threadid_np(_, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mach_thread_ports_use_one_based_thread_ids() {
+        assert_eq!(thread_id_from_mach_thread_port(1, 2), Some(0));
+        assert_eq!(thread_id_from_mach_thread_port(2, 2), Some(1));
+    }
+
+    #[test]
+    fn invalid_mach_thread_ports_do_not_map_to_pthreads() {
+        assert_eq!(thread_id_from_mach_thread_port(0, 2), None);
+        assert_eq!(thread_id_from_mach_thread_port(3, 2), None);
+        assert_eq!(thread_id_from_mach_thread_port(u32::MAX, 2), None);
+    }
+
+    #[test]
+    fn private_reverse_mapping_symbol_is_exported() {
+        assert!(FUNCTIONS
+            .iter()
+            .any(|(symbol, _)| *symbol == "__pthread_from_mach_thread_np"));
+    }
+}

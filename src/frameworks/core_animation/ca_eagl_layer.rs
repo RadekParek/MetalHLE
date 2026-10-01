@@ -9,7 +9,7 @@ use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_graphics::cg_affine_transform::{
     CGAffineTransform, CGAffineTransformIdentity,
 };
-use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, Class, ClassExports};
 use crate::Environment;
@@ -18,13 +18,13 @@ use crate::Environment;
 //
 // These are the keys apps put in the drawableProperties dictionary.
 // We export them as static strings so other modules can reference them.
-pub const kEAGLDrawablePropertyRetainedBacking: &str = "kEAGLDrawablePropertyRetainedBacking";
-pub const kEAGLDrawablePropertyColorFormat: &str = "kEAGLDrawablePropertyColorFormat";
+pub const kEAGLDrawablePropertyRetainedBacking: &str = "RetainedBacking";
+pub const kEAGLDrawablePropertyColorFormat: &str = "ColorFormat";
 
 // kEAGLColorFormat values
-pub const kEAGLColorFormatRGBA8: &str = "kEAGLColorFormatRGBA8";
-pub const kEAGLColorFormatRGB565: &str = "kEAGLColorFormatRGB565";
-pub const kEAGLColorFormatSRGBA8: &str = "kEAGLColorFormatSRGBA8";
+pub const kEAGLColorFormatRGBA8: &str = "RGBA8";
+pub const kEAGLColorFormatRGB565: &str = "RGB565";
+pub const kEAGLColorFormatSRGBA8: &str = "SRGBA8";
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -115,25 +115,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Scale / Retina Support
 
-- (CGFloat)contentScaleFactor {
-    // Жестко задаем масштаб 1.0 (стандартный не-Retina экран)
-    1.0
-}
-
-- (())setContentScaleFactor:(CGFloat)scale {
-    // Заглушка, чтобы игра не упала, если попытается сама установить масштаб
-    log_dbg!("CAEAGLLAYER setContentScaleFactor: {} (stubbed)", scale);
-}
-
-- (CGFloat)contentsScale {
-    // Жестко задаем масштаб 1.0 (стандартный не-Retina экран)
-    1.0
-}
-
-- (())setContentsScale:(CGFloat)scale {
-    // Заглушка, чтобы игра не упала, если попытается сама установить масштаб
-    log_dbg!("CAEAGLLAYER setContentsScale: {} (stubbed)", scale);
-}
+// NOTE: unlike the previous hardcoded-1.0 stubs, contentsScale is NOT
+// overridden here. It is inherited from CALayer, whose host object stores a
+// real `contents_scale` field. `UIView.init_common` seeds every view's
+// backing layer with the main screen's scale, so on retina devices (iPhone
+// 4/4s/5/5c, iPod touch 4/5, iPad 3/4/5/mini 2/3) the EAGL renderbuffer is
+// allocated at bounds * 2.0 and games render at native resolution instead of
+// being zoomed/cropped into a half-size framebuffer. Apps that explicitly
+// call setContentScaleFactor: / setContentsScale: round-trip correctly.
 
 - (id)initWithLayer:(id)layer {
     let _: () = msg![env; this setOpaque:true];
@@ -183,17 +172,38 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+// Zero-area UIKit layers do not cover the fullscreen EAGL surface.
+fn layer_has_visible_area(hidden: bool, opacity: f32, bounds: CGRect) -> bool {
+    !hidden && opacity > 0.0 && bounds.size.width > 0.0 && bounds.size.height > 0.0
+}
+
+fn layer_subtree_may_draw_pixels(env: &Environment, layer: id, depth: usize) -> bool {
+    const MAX_DEPTH: usize = 128;
+    if depth >= MAX_DEPTH {
+        return true;
+    }
+    let (hidden, opacity, bounds, sublayers) = {
+        let host = env.objc.borrow::<CALayerHostObject>(layer);
+        (host.hidden, host.opacity, host.bounds, host.sublayers.clone())
+    };
+    if hidden || opacity <= 0.0 {
+        return false;
+    }
+    if layer_has_visible_area(hidden, opacity, bounds) {
+        return true;
+    }
+    sublayers
+        .into_iter()
+        .any(|child| layer_subtree_may_draw_pixels(env, child, depth + 1))
+}
+
 // =========================================================================
 // MARK: - find_fullscreen_eagl_layer
 // =========================================================================
 
-/// Finds the largest visible, opaque `CAEAGLLayer` that exactly covers the screen.
-/// Otherwise, returns [nil] so the compositor can use its general path.
 /// Layer transforms that can still be presented directly to the host window.
 /// The only non-identity transform UIKit applies to a fullscreen app view in
-/// our compatibility layer is the device-orientation rotation (iOS 5-style
-/// autorotation rotates the root view instead of swapping drawables).
-/// (Ported from HyperHLE's landscape EAGL fast path.)
+/// our compatibility layer is the device-orientation rotation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum FullscreenLayerTransform {
     Identity,
@@ -205,8 +215,22 @@ fn nearly_equal(a: f32, b: f32, tolerance: f32) -> bool {
 }
 
 fn nearly_equal_transform(a: CGAffineTransform, b: CGAffineTransform) -> bool {
-    let CGAffineTransform { a: aa, b: ab, c: ac, d: ad, tx: atx, ty: aty } = a;
-    let CGAffineTransform { a: ba, b: bb, c: bc, d: bd, tx: btx, ty: bty } = b;
+    let CGAffineTransform {
+        a: aa,
+        b: ab,
+        c: ac,
+        d: ad,
+        tx: atx,
+        ty: aty,
+    } = a;
+    let CGAffineTransform {
+        a: ba,
+        b: bb,
+        c: bc,
+        d: bd,
+        tx: btx,
+        ty: bty,
+    } = b;
     const TOLERANCE: f32 = 1.0e-5;
     nearly_equal(aa, ba, TOLERANCE)
         && nearly_equal(ab, bb, TOLERANCE)
@@ -252,6 +276,8 @@ fn fullscreen_frame_matches_screen(frame: CGRect, screen: CGRect) -> bool {
         && nearly_equal(frame_size.height, screen_size.height, TOLERANCE)
 }
 
+/// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
+/// returns a pointer to it. Otherwise, it returns [nil].
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
     if env.options.force_composition {
         return nil;
@@ -284,8 +310,10 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // assert!(layer != nil);
 
         let layer_host_obj: &CALayerHostObject = env.objc.borrow(layer);
-        let transform_kind =
-            classify_fullscreen_layer_transform(layer_host_obj.affine_transform, orientation);
+        let transform_kind = classify_fullscreen_layer_transform(
+            layer_host_obj.affine_transform,
+            orientation,
+        );
         let layer_bounds = layer_host_obj.bounds;
         let layer_to_screen = layer_host_obj
             .superlayer_to_layer_transform()
@@ -323,8 +351,11 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             return nil;
         }
 
+        let sublayers = layer_host_obj.sublayers.clone();
         parent_to_screen = layer_to_screen;
-        if let Some(&next) = layer_host_obj.sublayers.last() {
+        if let Some(next) = sublayers.into_iter().rev().find(|&candidate| {
+            layer_subtree_may_draw_pixels(env, candidate, 0)
+        }) {
             layer = next;
         } else {
             break;
@@ -341,6 +372,190 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
     }
 
     layer
+}
+
+#[cfg(test)]
+mod fullscreen_layer_tests {
+    use super::*;
+    use crate::window::DeviceOrientation;
+
+    #[test]
+    fn accepts_identity_and_the_current_device_rotation_only() {
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                CGAffineTransformIdentity,
+                DeviceOrientation::LandscapeLeft,
+            ),
+            Some(FullscreenLayerTransform::Identity),
+        );
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
+                DeviceOrientation::LandscapeLeft,
+            ),
+            Some(FullscreenLayerTransform::DeviceRotation),
+        );
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
+                DeviceOrientation::LandscapeLeft,
+            ),
+            None,
+        );
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
+                DeviceOrientation::LandscapeRight,
+            ),
+            Some(FullscreenLayerTransform::DeviceRotation),
+        );
+    }
+
+    #[test]
+    fn rejects_transforms_that_change_fullscreen_coverage() {
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_4),
+                DeviceOrientation::LandscapeLeft,
+            ),
+            None,
+        );
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                CGAffineTransform::make_scale(0.9, 1.0),
+                DeviceOrientation::LandscapeLeft,
+            ),
+            None,
+        );
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                CGAffineTransform::make_translation(1.0, 0.0),
+                DeviceOrientation::LandscapeLeft,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn autorotated_child_eagl_layer_covers_a_portrait_uikit_screen() {
+        let screen = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 320.0,
+                height: 568.0,
+            },
+        };
+        let mut window_layer = CALayerHostObject::default();
+        window_layer.bounds = screen;
+        window_layer.position = CGPoint { x: 160.0, y: 284.0 };
+        window_layer.anchor_point = CGPoint { x: 0.5, y: 0.5 };
+        window_layer.affine_transform = CGAffineTransformIdentity;
+        let window_to_screen = window_layer.superlayer_to_layer_transform();
+
+        let mut root_view_layer = CALayerHostObject::default();
+        root_view_layer.bounds = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 568.0,
+                height: 320.0,
+            },
+        };
+        root_view_layer.position = CGPoint { x: 160.0, y: 284.0 };
+        root_view_layer.anchor_point = CGPoint { x: 0.5, y: 0.5 };
+        root_view_layer.affine_transform =
+            CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2);
+        let root_view_to_screen = root_view_layer
+            .superlayer_to_layer_transform()
+            .concat(window_to_screen);
+
+        let mut eagl_layer = CALayerHostObject::default();
+        eagl_layer.bounds = root_view_layer.bounds;
+        eagl_layer.position = CGPoint { x: 284.0, y: 160.0 };
+        eagl_layer.anchor_point = CGPoint { x: 0.5, y: 0.5 };
+        eagl_layer.affine_transform = CGAffineTransformIdentity;
+        let eagl_to_parent = eagl_layer.superlayer_to_layer_transform();
+        let eagl_to_screen = eagl_to_parent.concat(root_view_to_screen);
+        let eagl_bounds = eagl_layer.bounds;
+        let eagl_bounds_rect = CGRect {
+            origin: eagl_bounds.origin,
+            size: eagl_bounds.size,
+        };
+        let local_frame = eagl_to_parent.apply_to_rect(eagl_bounds_rect);
+        let screen_frame = eagl_to_screen.apply_to_rect(eagl_bounds_rect);
+
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                root_view_layer.affine_transform,
+                DeviceOrientation::LandscapeLeft,
+            ),
+            Some(FullscreenLayerTransform::DeviceRotation),
+        );
+        assert_eq!(
+            classify_fullscreen_layer_transform(
+                eagl_layer.affine_transform,
+                DeviceOrientation::LandscapeLeft,
+            ),
+            Some(FullscreenLayerTransform::Identity),
+        );
+        assert!(!fullscreen_frame_matches_screen(local_frame, screen));
+        assert!(fullscreen_frame_matches_screen(screen_frame, screen));
+    }
+
+    #[test]
+    fn rejects_frames_that_do_not_cover_the_screen() {
+        let screen = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 320.0,
+                height: 568.0,
+            },
+        };
+        let almost_fullscreen = CGRect {
+            origin: CGPoint { x: -0.002, y: 0.003 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 320.001,
+                height: 567.999,
+            },
+        };
+        let partial = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 319.0,
+                height: 568.0,
+            },
+        };
+
+        assert!(fullscreen_frame_matches_screen(almost_fullscreen, screen));
+        assert!(!fullscreen_frame_matches_screen(partial, screen));
+    }
+}
+
+#[cfg(test)]
+mod layer_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn treats_zero_sized_and_invisible_layers_as_non_occluding() {
+        let no_bounds = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 0.0,
+                height: 480.0,
+            },
+        };
+        let fullscreen = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 320.0,
+                height: 480.0,
+            },
+        };
+
+        assert!(!layer_has_visible_area(false, 1.0, no_bounds));
+        assert!(!layer_has_visible_area(true, 1.0, fullscreen));
+        assert!(!layer_has_visible_area(false, 0.0, fullscreen));
+        assert!(layer_has_visible_area(false, 1.0, fullscreen));
+    }
 }
 
 // =========================================================================

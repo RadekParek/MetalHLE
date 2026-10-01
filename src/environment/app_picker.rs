@@ -1169,8 +1169,20 @@ fn app_picker_inner(
     let mut copyright_info_page_idx = 0;
 
     let host_resolutions = crate::window::host_screen_resolutions();
-    let quick_options_stuff =
-        setup_quick_options(env, delegate, main_view, app_frame, &host_resolutions);
+    let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
+    let angle_backend_available = crate::window::angle_backend_available();
+    let (mut quick_options_gles_native, quick_options_gles_native_switch_enabled) =
+        quick_options_gles_native_state(&env.options, angle_backend_available);
+    let quick_options_stuff = setup_quick_options(
+        env,
+        delegate,
+        main_view,
+        app_frame,
+        &host_resolutions,
+        quick_options_cheat_engine,
+        quick_options_gles_native,
+        quick_options_gles_native_switch_enabled,
+    );
     // The on/off switch was removed from the UI; the driver pipeline is
     // always considered enabled so a selected driver is honoured at launch.
     let mut quick_options_custom_driver_enabled = true;
@@ -1983,88 +1995,10 @@ fn app_picker_inner(
             quick_options_rtcs = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.angle_driver) {
-            quick_options_angle_driver = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.gles_native) {
-            quick_options_gles_native = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.log_file) {
-            quick_options_log_file = enabled;
-            () = msg![env; (quick_options_stuff.log_file_switch) setOn:enabled];
-            () = msg![env; (quick_options_stuff.verbose_logging_switch) setEnabled:enabled];
-            if !enabled {
-                quick_options_verbose_logging = false;
-                () = msg![env; (quick_options_stuff.verbose_logging_switch) setOn:false];
-            }
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_errors) {
-            quick_options_trace_gl_errors = enabled;
-            () = msg![env; (quick_options_stuff.trace_gl_errors_switch) setOn:quick_options_trace_gl_errors];
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.fast_memory) {
-            quick_options_fast_memory = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_32_bit) {
-            quick_options_force_32_bit = enabled;
-            if enabled {
-                quick_options_force_64_bit = false;
-            }
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_64_bit) {
-            quick_options_force_64_bit = enabled;
-            if enabled {
-                quick_options_force_32_bit = false;
-            }
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.frame_pacing) {
-            quick_options_frame_pacing = enabled;
-        } else if let Some(limit) = std::mem::take(&mut host_obj.fps_limit) {
-            quick_options_fps_limit = limit;
-            update_fps_limit_buttons(
-                env,
-                &quick_options_stuff.fps_limit_buttons,
-                quick_options_fps_limit,
-            );
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.vsync) {
-            quick_options_vsync = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.battery_saver) {
-            quick_options_battery_saver = enabled;
-            if enabled {
-                quick_options_high_performance = false;
-                quick_options_force_max_clocks = false;
-            }
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.ultra_battery_saver) {
-            quick_options_ultra_battery_saver = enabled;
-            if enabled {
-                quick_options_battery_saver = true;
-                quick_options_high_performance = false;
-                quick_options_force_max_clocks = false;
-                () = msg![env; (quick_options_stuff.battery_saver_switch) setOn:true];
-            }
-            () = msg![env; (quick_options_stuff.ultra_battery_saver_switch) setOn:enabled];
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.verbose_logging) {
-            quick_options_verbose_logging = enabled && quick_options_log_file;
-            () = msg![env; (quick_options_stuff.verbose_logging_switch) setOn:quick_options_verbose_logging];
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.shader_compatibility_fixes) {
-            quick_options_shader_compatibility_fixes = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.fix_texture_min_filter) {
-            quick_options_fix_texture_min_filter = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_composition) {
-            quick_options_force_composition = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.frame_generation) {
-            quick_options_frame_generation = enabled;
-            () = msg![env; (quick_options_stuff.frame_generation_switch) setOn:enabled];
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.skip_intros) {
-            quick_options_skip_intros = enabled;
-            () = msg![env; (quick_options_stuff.skip_intros_switch) setOn:enabled];
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.high_performance) {
-            quick_options_high_performance = enabled;
-            () = msg![env; (quick_options_stuff.high_performance_switch) setOn:enabled];
-            if !enabled {
-                quick_options_force_max_clocks = false;
-                () = msg![env; (quick_options_stuff.force_max_clocks_switch) setOn:false];
-            }
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_max_clocks) {
-            quick_options_force_max_clocks = enabled;
-            () = msg![env; (quick_options_stuff.force_max_clocks_switch) setOn:enabled];
-            if enabled {
-                quick_options_high_performance = true;
-                () = msg![env; (quick_options_stuff.high_performance_switch) setOn:true];
-            }
+        } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
+            quick_options_trace_gl_errors = trace_gl_errors;
+        } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
+            quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
@@ -3490,6 +3424,9 @@ fn setup_quick_options(
     super_view: id,
     app_frame: CGRect,
     host_resolutions: &[(u32, u32)],
+    cheat_engine_enabled: bool,
+    gles_native_enabled: bool,
+    gles_native_switch_enabled: bool,
 ) -> QuickOptionsStuff {
     // UIView*
     let visible_frame = CGRect {
@@ -3646,25 +3583,25 @@ fn setup_quick_options(
         MemoryManagementDropdown,
         AudioBackendDropdown,
         CustomDriverDropdown,
-        Switch(&'static str, bool),
+        Switch(&'static str, bool, bool),
     }
     let rows = [
         RowKind::Section("PERFORMANCE & GRAPHICS"),
         RowKind::Subsection("Performance"),
         RowKind::Label("High performance mode"),
-        RowKind::Switch("highPerformance:", crate::options::DEFAULT_HIGH_PERFORMANCE),
+        RowKind::Switch("highPerformance:", crate::options::DEFAULT_HIGH_PERFORMANCE, false),
         RowKind::LabelWithWarning("Force maximum GPU clocks"),
-        RowKind::Switch("forceMaxClocks:", crate::options::DEFAULT_FORCE_MAX_CLOCKS),
+        RowKind::Switch("forceMaxClocks:", crate::options::DEFAULT_FORCE_MAX_CLOCKS, false),
         RowKind::Label("Battery saver"),
-        RowKind::Switch("batterySaver:", false),
+        RowKind::Switch("batterySaver:", false, false),
         RowKind::Label("Ultra battery saver"),
-        RowKind::Switch("ultraBatterySaver:", false),
+        RowKind::Switch("ultraBatterySaver:", false, false),
         RowKind::Label("Fast memory"),
-        RowKind::Switch("fastMemory:", crate::options::DEFAULT_FAST_MEMORY),
+        RowKind::Switch("fastMemory:", crate::options::DEFAULT_FAST_MEMORY, false),
         RowKind::Label("Memory management"),
         RowKind::MemoryManagementDropdown,
         RowKind::Label("Frame pacing"),
-        RowKind::Switch("framePacing:", true),
+        RowKind::Switch("framePacing:", true, false),
         RowKind::Label("FPS limit"),
         RowKind::Buttons(&[
             ("Dynamic", "fpsLimitDynamic"),
@@ -3673,14 +3610,14 @@ fn setup_quick_options(
             ("120", "fpsLimit120"),
         ]),
         RowKind::Label("Frame generation"),
-        RowKind::Switch("frameGeneration:", false),
+        RowKind::Switch("frameGeneration:", false, false),
         RowKind::Label("Skip intro movies (off by default)"),
-        RowKind::Switch("skipIntros:", false),
+        RowKind::Switch("skipIntros:", false, false),
         RowKind::Subsection("Graphics quality"),
         RowKind::Label("Graphics API"),
         RowKind::GraphicsApiDropdown,
         RowKind::Label("Vsync"),
-        RowKind::Switch("vsync:", false),
+        RowKind::Switch("vsync:", false, false),
         RowKind::Label("Anisotropic filtering"),
         RowKind::Buttons(&[
             ("1×", "anisotropicFiltering1"),
@@ -3712,29 +3649,29 @@ fn setup_quick_options(
             ("Host driver", "pvrtcDecodingDriver"),
         ]),
         RowKind::Label("No texture compression"),
-        RowKind::Switch("noTextureCompression:", false),
+        RowKind::Switch("noTextureCompression:", false, false),
         RowKind::Subsection("Graphics compatibility"),
         RowKind::Label("GLES override version"),
         RowKind::GlesOverrideDropdown,
         RowKind::Label("GLES Native"),
-        RowKind::Switch("glesNative:", false),
+        RowKind::Switch("glesNative:", false, false),
         RowKind::Label("Shader compatibility fixes"),
-        RowKind::Switch("shaderCompatibilityFixes:", true),
+        RowKind::Switch("shaderCompatibilityFixes:", true, false),
         RowKind::Label("Fix texture mipmap filter"),
-        RowKind::Switch("fixTextureMinFilter:", cfg!(target_os = "android")),
+        RowKind::Switch("fixTextureMinFilter:", cfg!(target_os = "android"), false),
         RowKind::Label("Force Core Animation composition"),
-        RowKind::Switch("forceComposition:", false),
+        RowKind::Switch("forceComposition:", false, false),
         RowKind::Label("Metal translator"),
-        RowKind::Switch("metalTranslator:", cfg!(target_arch = "aarch64")),
+        RowKind::Switch("metalTranslator:", cfg!(target_arch = "aarch64"), false),
         RowKind::Subsection("GPU / driver"),
         RowKind::Label("Custom driver files"),
         RowKind::Buttons(&[("Select ZIP file", "openCustomDriverFolder")]),
         RowKind::Label("Installed custom drivers"),
         RowKind::CustomDriverDropdown,
         RowKind::Label("LLVMPipe fallback"),
-        RowKind::Switch("llvmpipeFallback:", false),
+        RowKind::Switch("llvmpipeFallback:", false, false),
         RowKind::Label("ANGLE driver"),
-        RowKind::Switch("angleDriver:", false),
+        RowKind::Switch("angleDriver:", false, false),
         RowKind::Section("SYSTEM & COMPATIBILITY"),
         RowKind::Subsection("iOS / device"),
         RowKind::Label("iOS version"),
@@ -3742,24 +3679,24 @@ fn setup_quick_options(
         RowKind::Label("Device model"),
         RowKind::DeviceDropdown,
         RowKind::Label("Force 32-bit"),
-        RowKind::Switch("force32Bit:", false),
+        RowKind::Switch("force32Bit:", false, false),
         RowKind::Label("Force 64-bit"),
-        RowKind::Switch("force64Bit:", false),
+        RowKind::Switch("force64Bit:", false, false),
         RowKind::Subsection("CPU / ARM"),
         RowKind::Label("ARM64 JIT"),
-        RowKind::Switch("arm64Backend:", false),
+        RowKind::Switch("arm64Backend:", false, false),
         RowKind::Label("Interpreter fallback"),
-        RowKind::Switch("arm64Fallback:", false),
+        RowKind::Switch("arm64Fallback:", false, false),
         RowKind::Subsection("Audio"),
         RowKind::Label("Audio backend"),
         RowKind::AudioBackendDropdown,
         RowKind::Label("Core audio"),
-        RowKind::Switch("coreAudio:", false),
+        RowKind::Switch("coreAudio:", false, false),
         RowKind::Label("Lower audio quality"),
-        RowKind::Switch("lowAudioQuality:", false),
+        RowKind::Switch("lowAudioQuality:", false, false),
         RowKind::Subsection("Networking"),
         RowKind::Label("Network access"),
-        RowKind::Switch("network:", false),
+        RowKind::Switch("network:", false, false),
         RowKind::Section("DISPLAY, CONTROLS & DEBUG"),
         RowKind::Subsection("Display"),
         RowKind::Label("Custom resolution"),
@@ -3771,54 +3708,27 @@ fn setup_quick_options(
             ("→", "orientationLandscapeRight"),
             ("↓", "orientationPortraitUpsideDown"),
         ]),
-        RowKind::Label("Render rotation"),
-        RowKind::Buttons(&[
-            ("Default", "renderRotationDefault"),
-            ("-90°", "renderRotationMinus90"),
-            ("-180°", "renderRotationMinus180"),
-            ("90°", "renderRotationPlus90"),
-            ("180°", "renderRotationPlus180"),
-        ]),
-        RowKind::Label("Revert X axis"),
-        RowKind::Switch("revertXAxis:", false),
-        RowKind::Label("Revert Y axis"),
-        RowKind::Switch("revertYAxis:", false),
-        RowKind::Label("Stretch to fullscreen"),
-        RowKind::Switch("fullscreenStretched:", false),
-        RowKind::Label("Scale hack"),
-        RowKind::Buttons(&[
-            ("Default", "scaleHackDefault"),
-            ("Off", "scaleHack1"),
-            ("0.50×", "scaleHackHalf"),
-            ("0.75×", "scaleHackThreeQuarters"),
-            ("2×", "scaleHack2"),
-            ("3×", "scaleHack3"),
-            ("4×", "scaleHack4"),
-        ]),
-        RowKind::Label("Show HUD"),
-        RowKind::Switch("showFPS:", true),
-        RowKind::Subsection("Controls"),
-        RowKind::Label("Use analog sticks for tilt controls"),
-        RowKind::Switch("analogStickTiltControls:", true),
-        RowKind::Subsection("Games"),
+        RowKind::Label("Device model"),
+        RowKind::DeviceDropdown,
         RowKind::Label("Cheat Engine"),
-        RowKind::Switch("cheatEngine:", !env.options.trainer_disabled),
-        RowKind::Label("Game folder"),
-        RowKind::Buttons(&[
-            ("Open folder", "openFileManager"),
-            ("Refresh", "refreshApps"),
-        ]),
-        RowKind::Subsection("Diagnostics"),
-        RowKind::Label("Real-Time Corruption System"),
-        RowKind::Switch("rtcs:", false),
-        RowKind::Label("Enable log file"),
-        RowKind::Switch("logFile:", true),
-        RowKind::Label("Verbose logging"),
-        RowKind::Switch("verboseLogging:", false),
-        RowKind::Label("Trace OpenGL errors"),
-        RowKind::Switch("traceGLErrors:", true),
-        RowKind::Label("Fullscreen override"),
-        RowKind::Switch("fullscreen:", false),
+        RowKind::Switch("cheatEngine:", cheat_engine_enabled, true),
+        RowKind::Label("Network access"),
+        RowKind::Switch("network:", false, true),
+        RowKind::Label("Show FPS"),
+        RowKind::Switch("showFPS:", false, true),
+        RowKind::Label("Trace GL errors"),
+        RowKind::Switch("traceGLErrors:", false, true),
+        RowKind::Label("GLES Native"),
+        RowKind::Switch(
+            "glesNative:",
+            gles_native_enabled,
+            gles_native_switch_enabled,
+        ),
+        RowKind::Label("Use analog sticks for tilt controls"),
+        RowKind::Switch("analogStickTiltControls:", true, true),
+        // ---- (divider for stuff skipped below)
+        RowKind::Label("Fullscreen (override)"),
+        RowKind::Switch("fullscreen:", false, true),
     ];
     let rows = if crate::window::Window::rotatable_fullscreen() {
         // Fullscreen option doesn't make sense on always-fullscreen platforms
@@ -4159,7 +4069,7 @@ fn setup_quick_options(
                 custom_driver_menu = dropdown.1;
                 custom_driver_paths = dropdown.3;
             }
-            RowKind::Switch(selector_name, default_state) => {
+            RowKind::Switch(selector_name, default_state, enabled) => {
                 let switch_frame = CGRect {
                     origin: CGPoint {
                         x: main_frame.size.width * 0.70,
@@ -4174,6 +4084,7 @@ fn setup_quick_options(
                 let switch: id = msg_class![env; UISwitch alloc];
                 let switch: id = msg![env; switch initWithFrame:switch_frame];
                 () = msg![env; switch setOn:default_state];
+                () = msg![env; switch setEnabled:enabled];
                 let selector = env.objc.lookup_selector(selector_name).unwrap();
                 () = msg![env; switch addTarget:delegate
                                          action:selector
@@ -5256,4 +5167,97 @@ fn make_device_model_dropdown(
     () = msg![env; menu_view addSubview:down_btn];
 
     (button, menu_view, items, thumb_view)
+}
+
+fn quick_options_trainer_enabled(options: &Options) -> bool {
+    !options.trainer_disabled
+}
+
+fn quick_options_trainer_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--trainer"
+    } else {
+        "--no-trainer"
+    }
+}
+
+/// Returns `(native_enabled, switch_enabled)` for the probed ANGLE state.
+fn quick_options_gles_native_state(options: &Options, angle_available: bool) -> (bool, bool) {
+    (options.gles_native || !angle_available, angle_available)
+}
+
+/// Launch argument matching the "GLES Native" switch. Always emitted so that
+/// the switch's choice overrides the base default and the options files.
+fn quick_options_gles_native_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--gles-native"
+    } else {
+        "--no-gles-native"
+    }
+}
+
+#[cfg(test)]
+mod quick_options_trainer_tests {
+    use super::*;
+
+    #[test]
+    fn trainer_toggle_defaults_off_and_emits_explicit_launch_option() {
+        let mut options = Options::default();
+
+        let mut enabled = quick_options_trainer_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
+
+        options.parse_argument("--trainer").unwrap();
+        enabled = quick_options_trainer_enabled(&options);
+        assert!(enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--trainer");
+
+        options.parse_argument("--no-trainer").unwrap();
+        enabled = quick_options_trainer_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
+    }
+}
+
+#[cfg(test)]
+mod quick_options_gles_native_tests {
+    use super::*;
+
+    #[test]
+    fn gles_native_switch_follows_backend_availability_and_option_state() {
+        let mut options = Options::default();
+
+        let (mut enabled, mut switch_enabled) = quick_options_gles_native_state(&options, true);
+        assert!(!enabled);
+        assert!(switch_enabled);
+        assert_eq!(
+            quick_options_gles_native_argument(enabled),
+            "--no-gles-native"
+        );
+
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
+        assert!(enabled);
+        assert!(!switch_enabled);
+        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
+
+        options.parse_argument("--gles-native").unwrap();
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
+        assert!(enabled);
+        assert!(switch_enabled);
+        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
+
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
+        assert!(enabled);
+        assert!(!switch_enabled);
+
+        options.parse_argument("--no-gles-native").unwrap();
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
+        assert!(!enabled);
+        assert!(switch_enabled);
+        assert_eq!(
+            quick_options_gles_native_argument(enabled),
+            "--no-gles-native"
+        );
+    }
 }
