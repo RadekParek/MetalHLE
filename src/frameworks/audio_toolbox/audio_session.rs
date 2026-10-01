@@ -6,12 +6,15 @@
 
 //! `AudioSession.h` (Audio Session Services)
 
+use crate::abi::CallFromHost;
 use crate::abi::GuestFunction;
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::carbon_core::OSStatus;
 use crate::frameworks::core_audio_types::{debug_fourcc, fourcc};
 use crate::frameworks::core_foundation::cf_run_loop::{CFRunLoopMode, CFRunLoopRef};
+use crate::frameworks::foundation::ns_string;
 use crate::mem::{guest_size_of, ConstVoidPtr, MutPtr, MutVoidPtr};
+use crate::objc::id;
 use crate::Environment;
 
 type AudioSessionInterruptionListener = GuestFunction;
@@ -59,6 +62,11 @@ const kAudioSessionCategory_SoloAmbientSound: u32 = fourcc(b"solo");
 /// чтобы не возвращать им мусор и не ломать их внутреннюю логику.
 pub struct State {
     pub active: bool,
+    pub property_listeners: Vec<(
+        AudioSessionPropertyID,
+        AudioSessionPropertyListener,
+        ConstVoidPtr,
+    )>,
     pub category: u32,
     pub current_hardware_sample_rate: f64,
     pub current_hardware_output_number_channels: u32,
@@ -76,6 +84,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             active: false,
+            property_listeners: Vec::new(),
             // По умолчанию в iOS — SoloAmbientSound (звук игры заглушает
             // Music.app,
             // но сам слышен). 'ambi' подошла бы, только если игра хочет микс с
@@ -95,6 +104,20 @@ impl Default for State {
             duck_others: 0,
         }
     }
+}
+
+pub fn current_output_volume(env: &Environment) -> f32 {
+    env.framework_state
+        .audio_toolbox
+        .audio_session
+        .current_hardware_output_volume
+}
+
+pub fn set_current_output_volume(env: &mut Environment, volume: f32) {
+    env.framework_state
+        .audio_toolbox
+        .audio_session
+        .current_hardware_output_volume = volume.clamp(0.0, 1.0);
 }
 
 fn get_audio_session_property_size(in_id: AudioSessionPropertyID) -> u32 {
@@ -128,18 +151,6 @@ fn get_audio_session_property_size(in_id: AudioSessionPropertyID) -> u32 {
     }
 }
 
-pub fn current_output_volume(env: &Environment) -> f32 {
-    env.framework_state
-        .audio_toolbox
-        .audio_session
-        .current_hardware_output_volume
-}
-pub fn set_current_output_volume(env: &mut Environment, volume: f32) {
-    env.framework_state
-        .audio_toolbox
-        .audio_session
-        .current_hardware_output_volume = volume.clamp(0.0, 1.0);
-}
 pub fn AudioSessionInitialize(
     _env: &mut Environment,
     _in_run_loop: CFRunLoopRef,
@@ -215,7 +226,7 @@ pub fn AudioSessionGetProperty(
             );
         }
         kAudioSessionProperty_CurrentHardwareInputNumberChannels => {
-            env.mem.write(out_data.cast::<u32>(), 1);
+            env.mem.write(out_data.cast::<u32>(), 0);
         }
         kAudioSessionProperty_CurrentHardwareOutputNumberChannels => {
             env.mem.write(
@@ -230,7 +241,9 @@ pub fn AudioSessionGetProperty(
             );
         }
         kAudioSessionProperty_AudioInputAvailable => {
-            env.mem.write(out_data.cast::<u32>(), 1);
+            // touchHLE currently does not emulate microphone input.
+            let value: u32 = 0;
+            env.mem.write(out_data.cast(), value);
         }
         kAudioSessionProperty_CurrentHardwareIOBufferDuration => {
             env.mem.write(
@@ -245,7 +258,12 @@ pub fn AudioSessionGetProperty(
             );
         }
         kAudioSessionProperty_AudioRoute => {
-            env.mem.write(out_data.cast::<u32>(), 0);
+            // Per the Audio Session Services Reference this property is a
+            // read-only CFStringRef describing the current route, e.g.
+            // "SpeakerAndMicrophone" (the default iPhone route). Returning
+            // NULL made apps that parse the route string misbehave.
+            let route: id = ns_string::get_static_str(env, "SpeakerAndMicrophone");
+            env.mem.write(out_data.cast(), route.to_bits() as u32);
         }
         kAudioSessionProperty_OverrideCategoryMixWithOthers => {
             env.mem
@@ -309,6 +327,7 @@ pub fn AudioSessionSetProperty(
                 debug_fourcc(category)
             );
             session.category = category;
+            notify_property_listeners(env, in_id);
         }
         kAudioSessionProperty_PreferredHardwareSampleRate => {
             let rate = env.mem.read(in_data.cast::<f64>());
@@ -330,14 +349,30 @@ pub fn AudioSessionSetProperty(
             // Значение игнорируем (у нас один фиксированный маршрут), но не
             // жалуемся.
         }
+        kAudioSessionProperty_AudioRoute
+        | kAudioSessionProperty_OtherAudioIsPlaying
+        | kAudioSessionProperty_AudioInputAvailable
+        | kAudioSessionProperty_CurrentHardwareSampleRate
+        | kAudioSessionProperty_CurrentHardwareIOBufferDuration
+        | kAudioSessionProperty_CurrentHardwareOutputVolume
+        | kAudioSessionProperty_CurrentHardwareInputNumberChannels
+        | kAudioSessionProperty_CurrentHardwareOutputNumberChannels => {
+            // These properties are read-only per Apple's documentation
+            // ("Audio Session Programming Guide": hardware state cannot be
+            // changed by the client). Accept the call with no error rather
+            // than logging a TODO every time an app probes the hardware.
+        }
         kAudioSessionProperty_OverrideCategoryMixWithOthers => {
             session.mix_with_others = env.mem.read(in_data.cast::<u32>());
+            notify_property_listeners(env, in_id);
         }
         kAudioSessionProperty_OverrideCategoryDefaultToSpeaker => {
             session.default_to_speaker = env.mem.read(in_data.cast::<u32>());
+            notify_property_listeners(env, in_id);
         }
         kAudioSessionProperty_OverrideCategoryEnableBluetoothInput => {
             session.bluetooth_input = env.mem.read(in_data.cast::<u32>());
+            notify_property_listeners(env, in_id);
         }
         kAudioSessionProperty_OtherMixableAudioShouldDuck => {
             session.duck_others = env.mem.read(in_data.cast::<u32>());
@@ -345,6 +380,7 @@ pub fn AudioSessionSetProperty(
                 "AudioSessionSetProperty OtherMixableAudioShouldDuck -> {}",
                 session.duck_others
             );
+            notify_property_listeners(env, in_id);
         }
         _ => {
             log!(
@@ -359,75 +395,99 @@ pub fn AudioSessionSetProperty(
 
 /// Per Apple Audio Session Services Reference:
 /// AudioSessionAddPropertyListener registers a callback to be invoked when
-/// an audio session property changes (e.g., route change, interruption).
-/// Since the emulator has a fixed audio route and no interruptions,
-/// we store the listener but never invoke it. Return success so apps
-/// proceed with their initialization.
+/// an audio session property changes (see `notify_property_listeners`).
 pub fn AudioSessionAddPropertyListener(
-    _env: &mut Environment,
+    env: &mut Environment,
     in_id: AudioSessionPropertyID,
-    _in_proc: AudioSessionPropertyListener,
-    _in_client_data: ConstVoidPtr,
+    in_proc: AudioSessionPropertyListener,
+    in_client_data: ConstVoidPtr,
 ) -> OSStatus {
-    log_dbg!(
-        "AudioSessionAddPropertyListener({}) — registered (will not fire)",
-        debug_fourcc(in_id)
-    );
+    log_dbg!("AudioSessionAddPropertyListener({})", debug_fourcc(in_id));
+    env.framework_state
+        .audio_toolbox
+        .audio_session
+        .property_listeners
+        .push((in_id, in_proc, in_client_data));
     kAudioSessionNoErr
 }
 
 pub fn AudioSessionRemovePropertyListener(
-    _env: &mut Environment,
+    env: &mut Environment,
     in_id: AudioSessionPropertyID,
 ) -> OSStatus {
     log_dbg!(
-        "TODO: AudioSessionRemovePropertyListener {}",
+        "AudioSessionRemovePropertyListener({})",
         debug_fourcc(in_id)
     );
+    env.framework_state
+        .audio_toolbox
+        .audio_session
+        .property_listeners
+        .retain(|(id, _, _)| *id != in_id);
     kAudioSessionNoErr
 }
 
 // Recommended replacement for AudioSessionAddPropertyListener /
 // -RemovePropertyListener,
 // see Apple's `Audio Session Support` (`AudioToolbox/AudioServices.h`).
-//
-// The signature mirrors the other `…WithUserData` Audio Toolbox APIs
-// (e.g. `AudioUnitAddPropertyListenerWithUserData`):
-//
-//     extern OSStatus
-//     AudioSessionAddPropertyListenerWithUserData(
-//         AudioSessionPropertyID         inID,
-//         AudioSessionPropertyListener   inProc,
-//         void                          *inUserData);
-//
-// PvZ (com.popcap.PvZ) uses the `WithUserData` remove variant for cleanup;
-// without an export the load-time non-lazy bind fails and any subsequent
-// invocation jumps to a NULL pointer. Provide a no-op stub matching the
-// existing listener stubs so the linker is satisfied.
 pub fn AudioSessionAddPropertyListenerWithUserData(
-    _env: &mut Environment,
+    env: &mut Environment,
     in_id: AudioSessionPropertyID,
-    _in_proc: AudioSessionPropertyListener,
-    _in_user_data: ConstVoidPtr,
+    in_proc: AudioSessionPropertyListener,
+    in_user_data: ConstVoidPtr,
 ) -> OSStatus {
     log_dbg!(
-        "TODO: AudioSessionAddPropertyListenerWithUserData {}",
+        "AudioSessionAddPropertyListenerWithUserData({})",
         debug_fourcc(in_id)
     );
+    env.framework_state
+        .audio_toolbox
+        .audio_session
+        .property_listeners
+        .push((in_id, in_proc, in_user_data));
     kAudioSessionNoErr
 }
 
 pub fn AudioSessionRemovePropertyListenerWithUserData(
-    _env: &mut Environment,
+    env: &mut Environment,
     in_id: AudioSessionPropertyID,
-    _in_proc: AudioSessionPropertyListener,
+    in_proc: AudioSessionPropertyListener,
     _in_user_data: ConstVoidPtr,
 ) -> OSStatus {
     log_dbg!(
-        "TODO: AudioSessionRemovePropertyListenerWithUserData {}",
+        "AudioSessionRemovePropertyListenerWithUserData({})",
         debug_fourcc(in_id)
     );
+    env.framework_state
+        .audio_toolbox
+        .audio_session
+        .property_listeners
+        .retain(|(id, proc_, _)| !(*id == in_id && *proc_ == in_proc));
     kAudioSessionNoErr
+}
+
+/// Fire all listeners registered for `in_id`.
+fn notify_property_listeners(env: &mut Environment, in_id: AudioSessionPropertyID) {
+    let listeners: Vec<(
+        AudioSessionPropertyID,
+        AudioSessionPropertyListener,
+        ConstVoidPtr,
+    )> = env
+        .framework_state
+        .audio_toolbox
+        .audio_session
+        .property_listeners
+        .iter()
+        .filter(|(id, _, _)| *id == in_id)
+        .copied()
+        .collect();
+    for (_, proc_, user_data) in listeners {
+        log_dbg!(
+            "Firing AudioSessionPropertyListener for {}",
+            debug_fourcc(in_id)
+        );
+        let () = proc_.call_from_host(env, (user_data, in_id));
+    }
 }
 
 pub const FUNCTIONS: FunctionExports = &[

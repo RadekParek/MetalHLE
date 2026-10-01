@@ -16,29 +16,39 @@ pub mod ui_switch;
 pub mod ui_text_field;
 
 use crate::frameworks::core_graphics::CGPoint;
-use crate::frameworks::foundation::NSUInteger;
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
+use crate::frameworks::uikit::ui_application;
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_class, msg_send, msg_super, nil, objc_classes,
     release, retain, ClassExports, NSZonePtr, SEL,
 };
 use crate::Environment;
 
-// TODO: There are many members of this enum missing.
 pub type UIControlEvents = NSUInteger;
 const UIControlEventTouchDown: UIControlEvents = 1 << 0;
+const UIControlEventTouchDownRepeat: UIControlEvents = 1 << 1;
 const UIControlEventTouchDragInside: UIControlEvents = 1 << 2;
 const UIControlEventTouchDragOutside: UIControlEvents = 1 << 3;
 const UIControlEventTouchDragEnter: UIControlEvents = 1 << 4;
 const UIControlEventTouchDragExit: UIControlEvents = 1 << 5;
 pub const UIControlEventTouchUpInside: UIControlEvents = 1 << 6;
 const UIControlEventTouchUpOutside: UIControlEvents = 1 << 7;
+const UIControlEventTouchCancel: UIControlEvents = 1 << 8;
 pub const UIControlEventValueChanged: UIControlEvents = 1 << 12;
+pub const UIControlEventEditingDidBegin: UIControlEvents = 1 << 16;
+pub const UIControlEventEditingChanged: UIControlEvents = 1 << 17;
+pub const UIControlEventEditingDidEnd: UIControlEvents = 1 << 18;
+const UIControlEventEditingDidEndOnExit: UIControlEvents = 1 << 19;
+
+pub type UIControlContentVerticalAlignment = NSInteger;
+const UIControlContentVerticalAlignmentCenter: UIControlContentVerticalAlignment = 0;
 
 pub struct UIControlHostObject {
     superclass: super::UIViewHostObject,
     enabled: bool,
     selected: bool,
     highlighted: bool,
+    content_vertical_alignment: UIControlContentVerticalAlignment,
     /// `UITouch*` of the touch currently being tracked, [nil] if none
     tracked_touch: id,
     tracking: bool,
@@ -54,6 +64,7 @@ impl Default for UIControlHostObject {
             enabled: true,
             selected: false,
             highlighted: false,
+            content_vertical_alignment: UIControlContentVerticalAlignmentCenter,
             tracked_touch: nil,
             tracking: false,
             action_targets: Vec::new(),
@@ -78,7 +89,7 @@ fn send_actions(env: &mut Environment, this: id, event: id, control_event: UICon
         .collect();
 
     if !action_targets.is_empty() {
-        log_dbg!(
+        log!(
             "UIControl {:?} dispatching {} action(s) for control event mask {:#x}",
             this,
             action_targets.len(),
@@ -86,78 +97,9 @@ fn send_actions(env: &mut Environment, this: id, event: id, control_event: UICon
         );
     }
 
+    let application: id = msg_class![env; UIApplication sharedApplication];
     for (target, action) in action_targets {
-        if target == nil {
-            log_dbg!(
-                "UIControl {:?} resolving nil target action {:?} through responder chain",
-                this,
-                action
-            );
-            let application: id = msg_class![env; UIApplication sharedApplication];
-            let handled: bool =
-                msg![env; application sendAction:action to:nil from:this forEvent:event];
-            if !handled {
-                log!(
-                    "Warning: UIControl {:?} could not resolve responder-chain action {:?}",
-                    this,
-                    action
-                );
-            }
-        } else {
-            () = msg![env; this sendAction:action to:target forEvent:event];
-        }
-    }
-}
-
-fn scroll_view_ancestor(env: &mut Environment, view: id) -> id {
-    let scroll_view_class = env.objc.get_known_class("UIScrollView", &mut env.mem);
-    let mut parent: id = msg![env; view superview];
-    let mut depth = 0;
-    while parent != nil && depth < 32 {
-        let class = msg![env; parent class];
-        if env.objc.class_is_subclass_of(class, scroll_view_class) {
-            return parent;
-        }
-        parent = msg![env; parent superview];
-        depth += 1;
-    }
-    nil
-}
-
-fn forward_touch_to_scroll_view(
-    env: &mut Environment,
-    view: id,
-    touches: id,
-    event: id,
-    moved: bool,
-) {
-    let scroll_view = scroll_view_ancestor(env, view);
-    if scroll_view == nil {
-        return;
-    }
-    let can_cancel: bool = msg![env; scroll_view canCancelContentTouches];
-    if moved && can_cancel {
-        let touch: id = msg![env; touches anyObject];
-        let previous: CGPoint = msg![env; touch previousLocationInView:view];
-        let current: CGPoint = msg![env; touch locationInView:view];
-        let dx = current.x - previous.x;
-        let dy = current.y - previous.y;
-        if dx * dx + dy * dy > 64.0 {
-            let tracked = env.objc.borrow::<UIControlHostObject>(view).tracked_touch;
-            if tracked == touch {
-                () = msg![env; view cancelTrackingWithEvent:event];
-                release(env, tracked);
-                let host = env.objc.borrow_mut::<UIControlHostObject>(view);
-                host.tracked_touch = nil;
-                host.tracking = false;
-                () = msg![env; view setHighlighted:false];
-            }
-        }
-    }
-    if moved {
-        () = msg![env; scroll_view touchesMoved:touches withEvent:event];
-    } else {
-        () = msg![env; scroll_view touchesEnded:touches withEvent:event];
+        () = msg![env; application sendAction:action to:target from:this forEvent:event];
     }
 }
 
@@ -179,6 +121,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         enabled: _,
         selected: _,
         highlighted: _,
+        content_vertical_alignment: _,
         tracking: _,
         action_targets: _, // targets are weak references, nothing to do
         tracked_touch,
@@ -229,6 +172,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setHighlighted:(bool)highlighted {
     env.objc.borrow_mut::<UIControlHostObject>(this).highlighted = highlighted;
+}
+
+- (NSInteger)contentVerticalAlignment {
+    env.objc.borrow::<UIControlHostObject>(this).content_vertical_alignment
+}
+
+- (())setContentVerticalAlignment:(UIControlContentVerticalAlignment)alignment {
+    env.objc.borrow_mut::<UIControlHostObject>(this).content_vertical_alignment = alignment;
 }
 
 - (bool)tracking {
@@ -283,10 +234,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // TODO: unclear if this is meant to be affected by tracking
     send_actions(env, this, event, UIControlEventTouchDown);
-    let scroll_view = scroll_view_ancestor(env, this);
-    if scroll_view != nil {
-        () = msg![env; scroll_view touchesBegan:touches withEvent:event];
-    }
 }
 - (())touchesMoved:(id)touches // NSSet* of UITouch*
          withEvent:(id)event { // UIEvent*
@@ -318,14 +265,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         (false, true) => UIControlEventTouchDragEnter,
         (true, false) => UIControlEventTouchDragExit,
     });
-    forward_touch_to_scroll_view(env, this, touches, event, true);
 }
 - (())touchesEnded:(id)touches // NSSet* of UITouch*
          withEvent:(id)event { // UIEvent*
     let touch: id = msg![env; touches anyObject];
     let tracked_touch = env.objc.borrow::<UIControlHostObject>(this).tracked_touch;
     if tracked_touch != touch {
-        forward_touch_to_scroll_view(env, this, touches, event, false);
         return;
     }
     () = msg![env; this endTrackingWithTouch:touch withEvent:event];
@@ -341,25 +286,39 @@ pub const CLASSES: ClassExports = objc_classes! {
         true => UIControlEventTouchUpInside,
         false => UIControlEventTouchUpOutside,
     });
-    forward_touch_to_scroll_view(env, this, touches, event, false);
+}
+
+- (())touchesCancelled:(id)touches withEvent:(id)event {
+    let tracked = env.objc.borrow::<UIControlHostObject>(this).tracked_touch;
+    if tracked == nil { return; }
+    let contains: bool = msg![env; touches containsObject:tracked];
+    if !contains { return; }
+    let host = env.objc.borrow_mut::<UIControlHostObject>(this);
+    host.tracked_touch = nil;
+    host.tracking = false;
+    () = msg![env; this cancelTrackingWithEvent:event];
+    () = msg![env; this setHighlighted:false];
+    send_actions(env, this, event, UIControlEventTouchCancel);
+    release(env, tracked);
 }
 
 - (())addTarget:(id)target
          action:(SEL)action
 forControlEvents:(UIControlEvents)events {
-    if target == nil {
-        log_dbg!(
-            "[{0:?} addTarget:nil action:{1:?} forControlEvents:{2:?}] stored for responder-chain dispatch",
-            this,
-            action,
-            events,
-        );
-    }
+    // A nil target is intentional: UIApplication resolves the action through
+    // the sender's responder chain when the control event is delivered.
+    // The target is a *weak* reference!
 
+    // The selector must be for a method with zero to two arguments. A
+    // selector with more colons is malformed guest input; log it and ignore
+    // the registration instead of panicking the host.
     let sel_str = action.as_str(&env.mem);
     let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
     if ![0, 1, 2].contains(&colon_count) {
-        log!("Warning: [{:?} addTarget: action:{:?}] unsupported selector arity {}; ignoring", this, action, colon_count);
+        log!(
+            "Warning: addTarget: unsupported selector {:?} ({} colons); ignoring.",
+            sel_str, colon_count
+        );
         return;
     }
 
@@ -369,8 +328,6 @@ forControlEvents:(UIControlEvents)events {
 - (())sendAction:(SEL)action
               to:(id)target
         forEvent:(id)event { // UIEvent*
-    assert!(target != nil); // TODO
-
     let sel_str = action.as_str(&env.mem);
     let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
     match colon_count {

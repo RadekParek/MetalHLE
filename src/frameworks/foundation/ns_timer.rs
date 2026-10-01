@@ -15,27 +15,28 @@ use crate::Environment;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-struct NSTimerHostObject {
-    ns_interval: NSTimeInterval,
+pub struct NSTimerHostObject {
+    pub ns_interval: NSTimeInterval,
     /// Copy of `ns_interval` in Rust's type for time intervals. Keep in sync!
-    rust_interval: Duration,
+    pub rust_interval: Duration,
     /// Strong reference
-    target: id,
-    selector: SEL,
+    pub target: id,
+    pub selector: SEL,
     /// Strong reference
-    user_info: id,
+    pub user_info: id,
     /// Strong reference to an `NSInvocation*`, used by the
     /// `…:invocation:repeats:` variants. When non-nil, firing the timer calls
     /// `[invocation invoke]` instead of sending `selector` to `target`.
-    invocation: id,
-    repeats: bool,
-    due_by: Option<Instant>,
+    pub invocation: id,
+    pub repeats: bool,
+    /// Virtual game-clock deadline, not a host scheduler deadline.
+    pub due_by: Option<Instant>,
     /// If the timer is currently running its callback, this is set so that the
     /// re-entering the run loop from inside the callback doesn't cause an
     /// infinite loop.
-    is_running_callback: bool,
+    pub is_running_callback: bool,
     /// Weak reference
-    run_loop: id,
+    pub run_loop: id,
 }
 impl HostObject for NSTimerHostObject {}
 
@@ -66,9 +67,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     retain(env, target);
     retain(env, user_info);
 
-    let due_by = Instant::now()
+    let due_by = env.guest_clock.now()
         .checked_add(rust_interval)
-        .unwrap_or_else(Instant::now);
+        .unwrap_or_else(|| env.guest_clock.now());
     let host_object = Box::new(NSTimerHostObject {
         ns_interval,
         rust_interval,
@@ -130,9 +131,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     retain(env, invocation);
 
-    let due_by = Instant::now()
+    let due_by = env.guest_clock.now()
         .checked_add(rust_interval)
-        .unwrap_or_else(Instant::now);
+        .unwrap_or_else(|| env.guest_clock.now());
     let host_object = Box::new(NSTimerHostObject {
         ns_interval,
         rust_interval,
@@ -226,13 +227,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())fire {
-    let &NSTimerHostObject {
-        target,
-        selector,
-        invocation,
-        repeats,
-        ..
-    } = env.objc.borrow(this);
+    let (target, selector, invocation, repeats, is_valid) = {
+        let host = env.objc.borrow::<NSTimerHostObject>(this);
+        (
+            host.target,
+            host.selector,
+            host.invocation,
+            host.repeats,
+            host.due_by.is_some(),
+        )
+    };
+    if !is_valid {
+        return;
+    }
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
     if invocation != nil {
@@ -257,11 +264,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let timer = env.objc.borrow_mut::<NSTimerHostObject>(this);
     if timer.due_by.is_some() {
         if !time_interval.is_finite() || time_interval <= 0.0 {
-            timer.due_by = Some(Instant::now());
+            timer.due_by = Some(env.guest_clock.now());
         } else {
             let safe_interval = time_interval.min(100.0 * 365.0 * 24.0 * 3600.0);
             let delta = ns_time_interval_to_duration_or_zero(safe_interval);
-            timer.due_by = Instant::now().checked_add(delta).or(Some(Instant::now()));
+            timer.due_by = env.guest_clock.now().checked_add(delta).or(Some(env.guest_clock.now()));
         }
     }
 }
@@ -273,7 +280,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     if let Some(due) = due_by_opt {
-        let now = Instant::now();
+        let now = env.guest_clock.now();
         let time_interval: NSTimeInterval = if due > now {
             due.duration_since(now).as_secs_f64()
         } else {
@@ -301,18 +308,18 @@ pub const CLASSES: ClassExports = objc_classes! {
         // позаимствовали
         let time_interval: NSTimeInterval = msg![env; _date timeIntervalSinceNow];
         if !time_interval.is_finite() || time_interval <= 0.0 {
-            std::time::Instant::now()
+            env.guest_clock.now()
         } else {
             let safe_interval = time_interval.min(100.0 * 365.0 * 24.0 * 3600.0);
             let delta = ns_time_interval_to_duration_or_zero(safe_interval);
-            std::time::Instant::now()
+            env.guest_clock.now()
                 .checked_add(delta)
-                .unwrap_or_else(std::time::Instant::now)
+                .unwrap_or_else(|| env.guest_clock.now())
         }
     } else {
-        std::time::Instant::now()
+        env.guest_clock.now()
             .checked_add(rust_interval)
-            .unwrap_or_else(std::time::Instant::now)
+            .unwrap_or_else(|| env.guest_clock.now())
     };
 
     // ТОЛЬКО ТЕПЕРЬ берём `borrow_mut` и записываем все данные
@@ -379,7 +386,7 @@ pub(super) fn set_run_loop(env: &mut Environment, timer: id, run_loop: id) {
 
 /// For use by `NSRunLoop`: check if a timer is due to fire and fire it if
 //necessary.
-/// Returns the next firing time, if any.
+/// Returns the next firing time in guest-clock coordinates, if any.
 pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> {
     let &NSTimerHostObject {
         ns_interval,
@@ -398,7 +405,7 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
     }
 
     let due_by = due_by?;
-    let now = Instant::now();
+    let now = env.guest_clock.now();
 
     if due_by > now {
         return Some(due_by);
@@ -430,7 +437,7 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
             .unwrap_or(rust_interval);
         let next_time = due_by
             .checked_add(advance_by_dur)
-            .unwrap_or_else(|| Instant::now() + rust_interval);
+            .unwrap_or_else(|| env.guest_clock.now() + rust_interval);
         env.objc.borrow_mut::<NSTimerHostObject>(timer).due_by = Some(next_time);
     }
 

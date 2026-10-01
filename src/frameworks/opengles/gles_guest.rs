@@ -7,16 +7,13 @@
 //! Wrapper functions exposing OpenGL ES to the guest.
 
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
-use crate::frameworks::opengles::eagl::EAGLContextHostObject;
+use crate::frameworks::opengles::eagl::{EAGLContextHostObject, GLShadowState};
 use crate::gles::{gles11_raw as gles11, GLES};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::nil;
 use crate::Environment;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt::Write as FmtWrite;
 use std::slice::from_raw_parts;
-use std::time::{Duration, Instant};
 use touchHLE_gl_bindings::gles11::{
     ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, WRITE_ONLY_OES,
 };
@@ -46,230 +43,50 @@ const SUPPORTED_COMPRESSED_TEXTURE_FORMATS: &[GLenum] = &[
 ];
 
 fn trace_potatogold_render() -> bool {
-    std::env::var_os("TOUCHHLE_TRACE_POTATOGOLD_RENDER").is_some()
+    crate::env_flag_cached!("TOUCHHLE_TRACE_POTATOGOLD_RENDER")
 }
 
-pub(crate) fn gl_error_name_for_diagnostics(err: GLenum) -> &'static str {
-    gl_error_name(err)
-}
+const TEXTURE_CUBE_MAP: GLenum = 0x8513;
+const TEXTURE_BINDING_CUBE_MAP: GLenum = 0x8514;
+const TEXTURE_CUBE_MAP_POSITIVE_X: GLenum = 0x8515;
+const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
 
-/// Drain the host driver's GL error queue, logging every distinct error
-/// collected. Errors raised by the host driver during internal presentation
-/// bookkeeping are not guest faults, but they were previously discarded
-/// silently, which made root-causing black screens impossible. Callers that
-/// intentionally provoke a driver error should still use this instead of a
-/// bare drain loop: the error is now visible in the log with the call site.
-pub(crate) fn drain_gl_errors_logged(gles: &mut dyn GLES, context: &'static str) {
-    let mut drained: Vec<GLenum> = Vec::new();
-    loop {
-        let err = unsafe { gles.GetError() };
-        if err == gles11::NO_ERROR {
-            break;
-        }
-        if !drained.contains(&err) {
-            drained.push(err);
-        }
-        if drained.len() >= 8 {
-            break;
-        }
-    }
-    for err in drained {
-        crate::gles::forensics_state::record_named(
-            "host-drain",
-            Some(format!("ctx={context}")),
-            err,
-        );
-        log!(
-            "Warning: host driver GL error {:#x} ({}) drained during {}",
-            err,
-            gl_error_name(err),
-            context
-        );
-    }
-}
-
-fn gl_error_name(err: GLenum) -> &'static str {
-    match err {
-        gles11::NO_ERROR => "GL_NO_ERROR",
-        gles11::INVALID_ENUM => "GL_INVALID_ENUM",
-        gles11::INVALID_VALUE => "GL_INVALID_VALUE",
-        gles11::INVALID_OPERATION => "GL_INVALID_OPERATION",
-        gles11::STACK_OVERFLOW => "GL_STACK_OVERFLOW",
-        gles11::STACK_UNDERFLOW => "GL_STACK_UNDERFLOW",
-        gles11::OUT_OF_MEMORY => "GL_OUT_OF_MEMORY",
-        0x0506 => "GL_INVALID_FRAMEBUFFER_OPERATION",
-        _ => "UNKNOWN_GL_ERROR",
-    }
-}
-
-fn gl_enum_name(value: GLenum) -> &'static str {
-    match value {
-        gles11::NO_ERROR => "GL_NO_ERROR",
-        gles11::INVALID_ENUM => "GL_INVALID_ENUM",
-        gles11::INVALID_VALUE => "GL_INVALID_VALUE",
-        gles11::INVALID_OPERATION => "GL_INVALID_OPERATION",
-        gles11::TEXTURE_2D => "GL_TEXTURE_2D",
-        0x84C0 => "GL_TEXTURE0",
-        0x84C1 => "GL_TEXTURE1",
-        0x84C2 => "GL_TEXTURE2",
-        0x84C3 => "GL_TEXTURE3",
-        0x8513 => "GL_TEXTURE_CUBE_MAP",
-        gles11::TEXTURE_MIN_FILTER => "GL_TEXTURE_MIN_FILTER",
-        gles11::TEXTURE_MAG_FILTER => "GL_TEXTURE_MAG_FILTER",
-        gles11::NEAREST => "GL_NEAREST",
-        gles11::LINEAR => "GL_LINEAR",
-        gles11::RGBA => "GL_RGBA",
-        gles11::RGB => "GL_RGB",
-        gles11::UNSIGNED_BYTE => "GL_UNSIGNED_BYTE",
-        gles11::UNSIGNED_SHORT_5_6_5 => "GL_UNSIGNED_SHORT_5_6_5",
-        gles11::UNSIGNED_SHORT_4_4_4_4 => "GL_UNSIGNED_SHORT_4_4_4_4",
-        gles11::UNSIGNED_SHORT_5_5_5_1 => "GL_UNSIGNED_SHORT_5_5_5_1",
-        gles11::FLOAT => "GL_FLOAT",
-        gles11::DEPTH_TEST => "GL_DEPTH_TEST",
-        gles11::CULL_FACE => "GL_CULL_FACE",
-        gles11::BLEND => "GL_BLEND",
-        gles11::SCISSOR_TEST => "GL_SCISSOR_TEST",
-        gles11::ARRAY_BUFFER => "GL_ARRAY_BUFFER",
-        gles11::ELEMENT_ARRAY_BUFFER => "GL_ELEMENT_ARRAY_BUFFER",
-        gles11::TRIANGLES => "GL_TRIANGLES",
-        gles11::TRIANGLE_STRIP => "GL_TRIANGLE_STRIP",
-        gles11::TRIANGLE_FAN => "GL_TRIANGLE_FAN",
-        0x8B31 => "GL_VERTEX_SHADER",
-        0x8B30 => "GL_FRAGMENT_SHADER",
-        0x8B81 => "GL_COMPILE_STATUS",
-        0x8B82 => "GL_LINK_STATUS",
-        gles11::ACTIVE_TEXTURE => "GL_ACTIVE_TEXTURE",
-        gles11::TEXTURE_BINDING_2D => "GL_TEXTURE_BINDING_2D",
-        0x8B8D => "GL_CURRENT_PROGRAM",
-        gles11::VIEWPORT => "GL_VIEWPORT",
-        gles11::UNPACK_ALIGNMENT => "GL_UNPACK_ALIGNMENT",
-        gles11::VENDOR => "GL_VENDOR",
-        gles11::RENDERER => "GL_RENDERER",
-        gles11::VERSION => "GL_VERSION",
-        gles11::EXTENSIONS => "GL_EXTENSIONS",
-        _ => "UNKNOWN_GL_ENUM",
-    }
-}
-
-fn format_gles_enum(value: GLenum) -> String {
-    format!("0x{value:x} ({})", gl_enum_name(value))
-}
-
-fn gl_call_parameters(parameters: &[(&str, String)]) -> String {
-    let mut result = String::new();
-    for (index, (name, value)) in parameters.iter().enumerate() {
-        if index > 0 {
-            result.push_str(", ");
-        }
-        let _ = write!(result, "{name}={value}");
-    }
-    result
-}
-
-fn log_gl_call(
-    name: &str,
-    parameters: String,
-    gles: &mut dyn GLES,
-    call: impl FnOnce(&mut dyn GLES),
-) {
-    if std::env::var_os("TOUCHHLE_TRACE_GL_CALLS").is_none() {
-        call(gles);
-        return;
-    }
-    log!("[GLES CALL] {name}({parameters})");
-    log_gpu_state(gles, "before-call");
-    call(gles);
-    let error = unsafe { gles.GetError() };
-    log!(
-        "[GLES RESULT] {name} error=0x{:x} ({})",
-        error,
-        gl_error_name(error)
-    );
-    if error != gles11::NO_ERROR {
-        log_gpu_state(gles, "after-call-error");
-    }
-}
-
-fn log_gpu_state(gles: &mut dyn GLES, reason: &str) {
-    let mut active_texture = 0;
-    let mut bound_texture_2d = 0;
-    let mut framebuffer = 0;
-    let mut renderbuffer = 0;
-    let mut array_buffer = 0;
-    let mut element_array_buffer = 0;
-    let mut viewport = [0; 4];
-    let mut scissor = [0; 4];
-    let mut current_program = None;
-    let depth_test = unsafe { gles.IsEnabled(gles11::DEPTH_TEST) != 0 };
-    let blend = unsafe { gles.IsEnabled(gles11::BLEND) != 0 };
-    let scissor_test = unsafe { gles.IsEnabled(gles11::SCISSOR_TEST) != 0 };
-    unsafe {
-        gles.GetIntegerv(gles11::ACTIVE_TEXTURE, &mut active_texture);
-        gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut bound_texture_2d);
-        gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
-        gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut renderbuffer);
-        gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut array_buffer);
-        gles.GetIntegerv(
-            gles11::ELEMENT_ARRAY_BUFFER_BINDING,
-            &mut element_array_buffer,
-        );
-        gles.GetIntegerv(gles11::VIEWPORT, viewport.as_mut_ptr());
-        gles.GetIntegerv(gles11::SCISSOR_BOX, scissor.as_mut_ptr());
-        if gles.is_es2() {
-            let mut value = 0;
-            gles.GetIntegerv(0x8B8D, &mut value);
-            current_program = Some(value);
-        }
-    }
-    log!(
-        "[GLES GPU STATE] reason={} backend={} active_texture=0x{:x} ({}) bound_texture_2d={} framebuffer={} renderbuffer={} array_buffer={} element_array_buffer={} current_program={} viewport=[{}, {}, {}, {}] scissor=[{}, {}, {}, {}] enables={{depth:{}, blend:{}, scissor:{}}}",
-        reason,
-        gles_backend_name(gles),
-        active_texture,
-        gl_enum_name(active_texture as GLenum),
-        bound_texture_2d,
-        framebuffer,
-        renderbuffer,
-        array_buffer,
-        element_array_buffer,
-        current_program.map_or_else(|| "n/a".to_string(), |value| value.to_string()),
-        viewport[0],
-        viewport[1],
-        viewport[2],
-        viewport[3],
-        scissor[0],
-        scissor[1],
-        scissor[2],
-        scissor[3],
-        depth_test,
-        blend,
-        scissor_test,
-    );
-    let mut diagnostic_error = unsafe { gles.GetError() };
-    while diagnostic_error != gles11::NO_ERROR {
-        log!(
-            "[GLES GPU STATE] diagnostic query produced {} ({:#x}); drained without attributing it to the guest call",
-            gl_error_name(diagnostic_error),
-            diagnostic_error
-        );
-        diagnostic_error = unsafe { gles.GetError() };
-    }
-}
-
-fn gles_backend_name(gles: &dyn GLES) -> &'static str {
-    if gles.is_translator() {
-        if gles.is_es2() {
-            "gles1-on-gles2"
-        } else {
-            "gles1-on-gles3"
-        }
-    } else if gles.is_native_es1() {
-        "gles1-native"
-    } else if gles.is_es2() {
-        "gles2"
+fn texture_binding_pname(target: GLenum) -> Option<GLenum> {
+    if target == gles11::TEXTURE_2D {
+        Some(gles11::TEXTURE_BINDING_2D)
+    } else if target == TEXTURE_CUBE_MAP
+        || (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z).contains(&target)
+    {
+        Some(TEXTURE_BINDING_CUBE_MAP)
     } else {
-        "other"
+        None
     }
+}
+
+unsafe fn current_bound_texture(gles: &mut dyn GLES, target: GLenum) -> Option<GLuint> {
+    let pname = texture_binding_pname(target)?;
+    let mut texture = 0;
+    gles.GetIntegerv(pname, &mut texture);
+    GLuint::try_from(texture).ok()
+}
+
+fn pvrtc_subimage_matches_level(
+    texture_level: Option<(GLsizei, GLsizei, GLenum)>,
+    xoffset: GLint,
+    yoffset: GLint,
+    width: GLsizei,
+    height: GLsizei,
+    format: GLenum,
+) -> bool {
+    matches!(
+        texture_level,
+        Some((stored_width, stored_height, stored_format))
+            if xoffset == 0
+                && yoffset == 0
+                && width == stored_width
+                && height == stored_height
+                && format == stored_format
+    )
 }
 
 #[track_caller]
@@ -289,8 +106,14 @@ where
         );
         return U::default();
     }
-    let _perf_scope = crate::perf::gles_scope();
+    let trace = env.options.trace_gl_errors;
     let caller = std::panic::Location::caller();
+    // `sync_context` now returns None when no GL context is bound to the
+    // calling thread. The guard above already short-circuits the common
+    // case where the *guest* never made a context current, but on edge
+    // cases (e.g. context destroyed mid-call, headless GLES driver missing,
+    // see HyperHLE log #5) we may still hit None here. Treat it the same
+    // as the no-context branch above: log once and return the default.
     let Some(mut gles) = super::sync_context(
         &mut env.framework_state.opengles,
         &mut env.objc,
@@ -305,28 +128,84 @@ where
         );
         return U::default();
     };
-    let call_id = crate::gles::next_gl_call_id();
+    // Clear any sticky host-GL error before the call so that the post-call
+    // trace report only reflects errors raised by *this* dispatch, not
+    // leftovers from untraced internal code paths (EAGL present, context
+    // sync, etc.). Without this, one bad call makes every later traced
+    // call report the same code at the wrong line.
+    if trace {
+        unsafe { gles.GetError() };
+    }
     let res = f(gles.as_mut(), &mut env.mem);
-    // Record the call in the forensics ring WITHOUT polling glGetError.
-    // Polling here would drain the GL error flag before the guest's own
-    // glGetError call sees it (changing guest-visible behaviour), and it
-    // doubles the GL call count. Errors are observed where the guest (or
-    // host-internal GL work) observes them, and reported there with the full
-    // recent-call sequence from this ring.
-    crate::gles::forensics_state::record(env.active_host_function.as_deref(), 0);
-    if crate::gles::verbose_logging_enabled() {
-        log!(
-            "[GLES VERBOSE] call #{} from {}:{}",
-            call_id,
-            caller.file(),
+    if trace {
+        let err = unsafe { gles.GetError() };
+        if err != 0 {
+            log!(
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
+                 dispatched from {}:{}",
+                err,
+                caller.file(),
+                caller.line()
+            );
+        }
+    }
+    #[allow(clippy::let_and_return)]
+    res
+}
+
+/// Like [with_ctx_and_mem], but the closure also gets the current context's
+/// [GLShadowState] (see its documentation). Use this for entry points that
+/// either change the mirrored state or want to consult it instead of asking
+/// the driver.
+#[track_caller]
+fn with_ctx_mem_and_shadow<T, U: Default>(env: &mut Environment, f: T) -> U
+where
+    T: FnOnce(&mut dyn GLES, &mut Mem, &mut GLShadowState) -> U,
+{
+    let Some(current_ctx) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        log_dbg!(
+            "Skipping GLES call without context (line {})",
+            std::panic::Location::caller().line()
+        );
+        return U::default();
+    };
+    let trace = env.options.trace_gl_errors;
+    let caller = std::panic::Location::caller();
+    let window = env
+        .window
+        .as_mut()
+        .expect("OpenGL ES is not supported in headless mode");
+    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
+    // Disjoint field borrows: the GL context box and the shadow state live
+    // side by side in the host object.
+    let shadow = &mut host_obj.shadow;
+    let Some(gles_ctx) = host_obj.gles_ctx.as_deref_mut() else {
+        log_dbg!(
+            "Skipping GLES call: current EAGLContext has no GLES backend (line {})",
             caller.line()
         );
-        log_gpu_state(gles.as_mut(), "after-call");
+        return U::default();
+    };
+    let mut gles = gles_ctx.make_current(window);
+    if trace {
+        unsafe { gles.GetError() };
     }
-    if crate::gles::translator_tracing_enabled() && gles.is_translator() {
-        crate::gles::trace_translator_event(|| {
-            format!("guest call at {}:{}", caller.file(), caller.line())
-        });
+    let res = f(gles.as_mut(), &mut env.mem, shadow);
+    if trace {
+        let err = unsafe { gles.GetError() };
+        if err != 0 {
+            log!(
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
+                 dispatched from {}:{}",
+                err,
+                caller.file(),
+                caller.line()
+            );
+        }
     }
     #[allow(clippy::let_and_return)]
     res
@@ -337,7 +216,16 @@ fn with_ctx_and_mem_no_skip<T, U: Default>(env: &mut Environment, f: T) -> U
 where
     T: FnOnce(&mut dyn GLES, &mut Mem) -> U,
 {
+    let trace = env.options.trace_gl_errors;
     let caller = std::panic::Location::caller();
+    // _no_skip historically panicked if there was no current context,
+    // but real games (HyperHLE log #5 / Resident Evil 4) hit this on
+    // worker threads that issue GL calls after `setCurrentContext:nil`.
+    // Apple's documented behaviour is "GL calls silently fail" — mirror
+    // that by returning the type's default instead of aborting the
+    // emulator. The trade-off vs. with_ctx_and_mem is unchanged: we still
+    // attempt the call when a context exists, even if it isn't the one
+    // the guest expects.
     let Some(mut gles) = super::sync_context(
         &mut env.framework_state.opengles,
         &mut env.objc,
@@ -354,18 +242,18 @@ where
         );
         return U::default();
     };
-    let call_id = crate::gles::next_gl_call_id();
     let res = f(gles.as_mut(), &mut env.mem);
-    // See the comment in `with_ctx_and_mem`: record without draining.
-    crate::gles::forensics_state::record(env.active_host_function.as_deref(), 0);
-    if crate::gles::verbose_logging_enabled() {
-        log!(
-            "[GLES VERBOSE] no-skip call #{} from {}:{}",
-            call_id,
-            caller.file(),
-            caller.line()
-        );
-        log_gpu_state(gles.as_mut(), "after-call");
+    if trace {
+        let err = unsafe { gles.GetError() };
+        if err != 0 {
+            log!(
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
+                 dispatched from {}:{}",
+                err,
+                caller.file(),
+                caller.line()
+            );
+        }
     }
     #[allow(clippy::let_and_return)]
     res
@@ -373,97 +261,100 @@ where
 
 fn glGetError(env: &mut Environment) -> GLenum {
     let ignore_gl_errors = env.options.ignore_gl_errors;
-    let function_name = env.active_host_function.clone();
     with_ctx_and_mem(env, |gles, _mem| {
         let err = unsafe { gles.GetError() };
         if err != 0 {
             if ignore_gl_errors {
                 return 0;
             }
-            // Benign driver-quirk errors: the app's own glGetError probing
-            // legitimately surfaces these, so keep the GL semantics (the app
-            // still sees the error code) but do NOT log or forensic-report
-            // them -- they are not emulator bugs and they flood the log.
+            // Many engines (Unity, Cocos2d, Mono Game) call glGetError
+            // every frame as an instrumentation hook. Once an error is
+            // sticky in the host GL state machine (e.g. a strict Mali
+            // driver returns GL_INVALID_ENUM for a call that the
+            // emulator tolerated), every subsequent app-side
+            // glGetError gets the same code, flooding the log. We
+            // remember which error codes we've already reported and
+            // demote repeats of the same code to log_dbg so the
+            // diagnostic information is preserved (developers can
+            // still use `--trace-gl-errors` to find the originating
+            // call) but the console isn't drowning in identical lines.
             //
-            // - GetActiveUniform/GetActiveAttrib with an out-of-range index:
-            //   guest enumeration loops always over-run by one; the return
-            //   values already say GL_FALSE/0, so the error is expected.
-            // - MapBufferOES/UnmapBufferOES: the staging-buffer emulation
-            //   intentionally allows unbalanced map/unmap sequences (see
-            //   gles2_native.rs); the driver rejects the extra ones.
-            let benign_probe = function_name.as_deref().is_some_and(|f| {
-                let f = f.to_ascii_lowercase();
-                f.contains("getactiveuniform")
-                    || f.contains("getactiveattrib")
-                    || f.contains("mapbufferoes")
-                    || f.contains("unmapbufferoes")
-            });
-            if benign_probe {
-                return err;
-            }
-            // GL_INVALID_FRAMEBUFFER_OPERATION (0x506): on Adreno drivers the
-            // multisample FBO pair is reported incomplete even though we lie
-            // to the app about completeness (see glCheckFramebufferStatusOES).
-            // Draws still happen on the resolve path, so the app seeing 0x506
-            // only makes it disable its render path (black screens in
-            // BioShock). Swallow it entirely.
-            if err == 0x0506 {
-                return 0;
-            }
-            // Errors surfacing here were usually produced by an EARLIER call
-            // (the app's own glGetError drains the queue long after the
-            // culprit), so attach the forensic ring buffer + GL state dump:
-            // it shows which recent call and state produced the error.
-            crate::gles::forensics_state::record(function_name.as_deref(), err);
-            crate::gles::forensics_state::report(
-                gles,
-                err,
-                function_name.as_deref(),
-                std::panic::Location::caller(),
-            );
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static APP_ERROR_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-            static APP_ERROR_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
-            let count = APP_ERROR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            let function_name = function_name.as_deref().unwrap_or("unknown guest wrapper");
-            // Logging every occurrence with the full driver string flooded
-            // logcat (BioShock produced 500+ lines in one session, which is
-            // real I/O cost on Android). Log the first 10 in full, then
-            // sample every 200th and keep a suppressed-error tally.
-            let log_this_one = count < 10 || (count + 1) % 200 == 0;
-            if log_this_one {
-                let driver = unsafe { gles.driver_description() };
-                log!(
-                    "[GLES APP ERROR #{:05}] code=0x{:x} name={} function={} driver={}",
-                    count + 1,
-                    err,
-                    gl_error_name(err),
-                    function_name,
-                    driver
-                );
-            } else {
-                let suppressed = APP_ERROR_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-                if (suppressed + 1) % 500 == 0 {
-                    log!(
-                        "[GLES APP ERROR] {} further errors suppressed so far (latest code=0x{:x} {})",
-                        suppressed + 1,
-                        err,
-                        gl_error_name(err)
-                    );
+            // The set is per-process (no thread synchronisation
+            // needed because GL contexts are accessed serialised
+            // through `with_ctx_and_mem`); we cap it at 16 distinct
+            // codes which is more than the entire OpenGL ES error
+            // enum space.
+            use std::sync::atomic::{AtomicU32, Ordering};
+            const MAX_REPORTED: usize = 16;
+            static REPORTED: [AtomicU32; MAX_REPORTED] = [
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+            ];
+            let mut already_seen = false;
+            for slot in &REPORTED {
+                let cur = slot.load(Ordering::Relaxed);
+                if cur == err {
+                    already_seen = true;
+                    break;
                 }
-            };
+                if cur == 0
+                    && slot
+                        .compare_exchange(0, err, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+            if already_seen {
+                log_dbg!("glGetError() returned {:#x} (already reported)", err);
+            } else {
+                log!(
+                    "Warning: glGetError() returned {:#x} (subsequent repeats \
+                     of the same code are silenced; rerun with \
+                     --trace-gl-errors to identify the originating GL call)",
+                    err
+                );
+            }
         }
         err
     })
 }
 fn glEnable(env: &mut Environment, cap: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Enable(cap) });
+    if cap == gles11::FOG {
+        with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+            shadow.fog_enabled = true;
+            gles.Enable(cap)
+        });
+    } else {
+        with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Enable(cap) });
+    }
 }
 fn glIsEnabled(env: &mut Environment, cap: GLenum) -> GLboolean {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsEnabled(cap) })
 }
 fn glDisable(env: &mut Environment, cap: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Disable(cap) });
+    if cap == gles11::FOG {
+        with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+            shadow.fog_enabled = false;
+            gles.Disable(cap)
+        });
+    } else {
+        with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Disable(cap) });
+    }
 }
 fn glClientActiveTexture(env: &mut Environment, texture: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -499,9 +390,6 @@ fn glGetFloatv(env: &mut Environment, pname: GLenum, params: MutPtr<GLfloat>) {
     if params.is_null() {
         return;
     }
-    if pname == gles11::COLOR_CLEAR_VALUE || pname == gles11::CURRENT_COLOR {
-        log_dbg!("GL query glGetFloatv(pname={pname:#x}) is handled by the active backend");
-    }
     if env
         .framework_state
         .opengles
@@ -532,9 +420,6 @@ fn glGetIntegerv(env: &mut Environment, pname: GLenum, params: MutPtr<GLint>) {
         }
         0x8cdf | 0x8d57 => {
             env.mem.write(params, 1 as _);
-        }
-        gles11::MAX_TEXTURE_SIZE => {
-            env.mem.write(params, 2048 as _);
         }
         _ => {
             if env
@@ -674,6 +559,15 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
             // desktop GL; reference it by numeric literal so we don't have
             // to pull in the ES 2.0 enum table here.
             0x8B8C => b"OpenGL ES GLSL ES 1.00",
+            // GAMELOFT BYPASS: the Asphalt 8 engine feature-tests
+            // GL_OES_element_index_uint before selecting its renderer; without
+            // it the game never submits any draw calls and the screen stays
+            // black. GL_APPLE_framebuffer_multisample is deliberately NOT
+            // advertised (fazidroid "A8 gfx fix & vulkan optimization"): with
+            // it the engine picks the Apple multisample-resolve FBO path,
+            // whose resolve never lands on the visible renderbuffer here and
+            // yields a black screen; without it the engine streams straight
+            // to the single-sample framebuffer.
             gles11::EXTENSIONS => b"GL_APPLE_texture_2D_limited_npot GL_APPLE_texture_format_BGRA8888 GL_APPLE_texture_max_level GL_EXT_debug_label GL_EXT_discard_framebuffer GL_EXT_occlusion_query_boolean GL_EXT_read_format_bgra GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_depth24 GL_OES_depth_texture GL_OES_element_index_uint GL_OES_fbo_render_mipmap GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_standard_derivatives GL_OES_stencil_wrap GL_OES_texture_float GL_OES_texture_half_float GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object GL_OES_vertex_half_float ",
             _ => b"Unknown",
         }
@@ -765,102 +659,97 @@ fn glSampleCoveragex(env: &mut Environment, value: GLclampx, invert: GLboolean) 
 fn glShadeModel(env: &mut Environment, mode: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.ShadeModel(mode) })
 }
-fn log_game_rect(
-    env: &Environment,
-    label: &str,
-    x: GLint,
-    y: GLint,
-    width: GLsizei,
-    height: GLsizei,
-    submitted: (GLint, GLint, GLsizei, GLsizei),
-) {
-    // Log only on change: games like BioShock/MCPE re-issue the same viewport
-    // and scissor every frame, which flooded the log with thousands of
-    // identical lines (real I/O cost on Android).
-    thread_local! {
-        static LAST: RefCell<HashMap<&'static str, (GLint, GLint, GLsizei, GLsizei)>> =
-            RefCell::new(HashMap::new());
-    }
-    // Some games alternate between two different rects every frame (BioShock
-    // toggles 512x512 <-> 480x320), which defeats plain change detection.
-    // Additionally rate-limit each label to at most one line per second.
-    thread_local! {
-        static LAST_LOG: RefCell<HashMap<&'static str, Instant>> =
-            RefCell::new(HashMap::new());
-    }
-    let now = Instant::now();
-    let changed = LAST.with(|last| {
-        let mut last = last.borrow_mut();
-        let changed = last.get(label) != Some(&(x, y, width, height));
-        last.insert(intern_rect_label(label), (x, y, width, height));
-        changed
-    });
-    if !changed {
-        return;
-    }
-    let allowed = LAST_LOG.with(|times| {
-        let mut times = times.borrow_mut();
-        let allowed = times
-            .get(label)
-            .map(|t| now.duration_since(*t) >= Duration::from_secs(1))
-            .unwrap_or(true);
-        if allowed {
-            times.insert(intern_rect_label(label), now);
-        }
-        allowed
-    });
-    if !allowed {
-        return;
-    }
-    let label_static = intern_rect_label(label);
-    if crate::gles::translator_tracing_enabled() {
-        log!(
-            "[{} GAME SPACE] bundle={} requested=({}, {}, {}, {}) submitted=({}, {}, {}, {}) scale_hack={} drawable conversion is deferred to final presentation (logged on change only)",
-            label_static,
-            env.bundle.bundle_identifier(),
-            x,
-            y,
-            width,
-            height,
-            submitted.0,
-            submitted.1,
-            submitted.2,
-            submitted.3,
-            env.options.scale_hack,
-        );
-    }
-}
-
-fn intern_rect_label(label: &str) -> &'static str {
-    thread_local! {
-        static INTERNED: RefCell<HashMap<String, &'static str>> = RefCell::new(HashMap::new());
-    }
-    INTERNED.with(|cache| {
-        if let Some(interned) = cache.borrow().get(label) {
-            return *interned;
-        }
-        let leaked: &'static str = Box::leak(label.to_string().into_boxed_str());
-        cache.borrow_mut().insert(label.to_string(), leaked);
-        leaked
-    })
-}
-
 fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
-    let factor = env.options.scale_hack;
-    let scale = |value: GLsizei| (value as f32 * factor).round() as GLsizei;
-    let submitted = (scale(x), scale(y), scale(width), scale(height));
-    log_game_rect(env, "SCISSOR", x, y, width, height, submitted);
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            log!(
+                "First glScissor({}, {}, {}, {}) [this log will only be shown once]",
+                x,
+                y,
+                width,
+                height
+            );
+        }
+    }
+    let factor = env.options.scale_hack.get() as GLsizei;
+    let (x, y) = (x * factor, y * factor);
+    let (width, height) = (width * factor, height * factor);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.Scissor(submitted.0, submitted.1, submitted.2, submitted.3)
+        gles.Scissor(x, y, width, height)
     })
 }
 fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
-    let factor = env.options.scale_hack;
-    let scale = |value: GLsizei| (value as f32 * factor).round() as GLsizei;
-    let submitted = (scale(x), scale(y), scale(width), scale(height));
-    log_game_rect(env, "VIEWPORT", x, y, width, height, submitted);
+    // ULTRAHLE_MINIONJUMP_VIEWPORT_BEGIN
+    let (x, y, width, height) = if matches!(
+        env.bundle.bundle_identifier(),
+        "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
+    ) && x == 0
+        && y == 0
+        && width == 768
+        && height == 1024
+    {
+        log!("UltraHLE MinionJump: viewport swap 768x1024 -> 1024x768");
+        (0, 0, 1024, 768)
+    } else if crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_LANDSCAPE_SCREEN")
+        && x == 0
+        && y == 0
+        && width == 768
+        && height == 1024
+    {
+        log!("UltraHLE MinionJump: env iPad landscape viewport swap 768x1024 -> 1024x768");
+        (0, 0, 1024, 768)
+    } else {
+        (x, y, width, height)
+    };
+    // ULTRAHLE_MINIONJUMP_VIEWPORT_END
+    let (mut x, mut y, mut width, mut height) = (x, y, width, height);
+
+    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEWPORT") {
+        // PotatoGold/adrastea-style landscape apps can end up with a 20px
+        // status-bar-shortened portrait-derived viewport, e.g. 460x320,
+        // even after UIScreen/EAGL have been made landscape. That leaves the
+        // final frame cropped/scuffed. In this compatibility mode, promote
+        // the common iPhone landscape viewport cases to the full 480x320
+        // logical viewport.
+        let should_force = (x == 0 && y == 0 && width == 460 && height == 320)
+            || (x == 0 && y == 0 && width == 320 && height == 460)
+            || (x == 0 && y == 0 && width == 320 && height == 480);
+
+        if should_force {
+            log!(
+                "TOUCHHLE_FORCE_LANDSCAPE_VIEWPORT=1: overriding glViewport({}, {}, {}, {}) to glViewport(0, 0, 480, 320)",
+                x,
+                y,
+                width,
+                height
+            );
+            x = 0;
+            y = 0;
+            width = 480;
+            height = 320;
+        }
+    }
+
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            log!(
+                "First glViewport({}, {}, {}, {}) [this log will only be shown once]",
+                x,
+                y,
+                width,
+                height
+            );
+        }
+    }
+    let factor = env.options.scale_hack.get() as GLsizei;
+    let (x, y) = (x * factor, y * factor);
+    let (width, height) = (width * factor, height * factor);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.Viewport(submitted.0, submitted.1, submitted.2, submitted.3)
+        gles.Viewport(x, y, width, height)
     })
 }
 fn glLineWidth(env: &mut Environment, val: GLfloat) {
@@ -914,20 +803,41 @@ fn glPointParameterxv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLf
     })
 }
 
+/// Keep the fog range mirror (see [GLShadowState]) in sync with a
+/// `glFog{f,x}{,v}` call.
+fn shadow_fog_param(shadow: &mut GLShadowState, pname: GLenum, value: f32) {
+    match pname {
+        gles11::FOG_START => shadow.fog_start = value,
+        gles11::FOG_END => shadow.fog_end = value,
+        _ => (),
+    }
+}
 fn glFogf(env: &mut Environment, pname: GLenum, param: GLfloat) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Fogf(pname, param) })
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow_fog_param(shadow, pname, param);
+        gles.Fogf(pname, param)
+    })
 }
 fn glFogx(env: &mut Environment, pname: GLenum, param: GLfixed) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Fogx(pname, param) })
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow_fog_param(shadow, pname, param as f32 / 65536.0);
+        gles.Fogx(pname, param)
+    })
 }
 fn glFogfv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLfloat>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
+        if matches!(pname, gles11::FOG_START | gles11::FOG_END) {
+            shadow_fog_param(shadow, pname, mem.read(params));
+        }
         let params = mem.ptr_at(params, 4);
         unsafe { gles.Fogfv(pname, params) }
     })
 }
 fn glFogxv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLfixed>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
+        if matches!(pname, gles11::FOG_START | gles11::FOG_END) {
+            shadow_fog_param(shadow, pname, mem.read(params) as f32 / 65536.0);
+        }
         let params = mem.ptr_at(params, 4);
         unsafe { gles.Fogxv(pname, params) }
     })
@@ -1018,14 +928,29 @@ fn glGenBuffers(env: &mut Environment, n: GLsizei, buffers: MutPtr<GLuint>) {
     })
 }
 fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    if n <= 0 || buffers.is_null() {
+        // Nothing to delete (n < 0 would be GL_INVALID_VALUE on a real
+        // driver; don't turn it into a host-side panic).
+        return;
+    }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
+        for i in 0..n_usize {
+            shadow.on_buffers_deleted(mem.read(buffers + i));
+        }
         let buffers = mem.ptr_at(buffers, n_usize);
         unsafe { gles.DeleteBuffers(n, buffers) }
     })
 }
 fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.BindBuffer(target, buffer) })
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        match target {
+            ARRAY_BUFFER => shadow.array_buffer = buffer,
+            ELEMENT_ARRAY_BUFFER => shadow.element_array_buffer = Some(buffer),
+            _ => (),
+        }
+        gles.BindBuffer(target, buffer)
+    })
 }
 fn glBufferData(
     env: &mut Environment,
@@ -1084,15 +1009,47 @@ fn glNormal3x(env: &mut Environment, nx: GLfixed, ny: GLfixed, nz: GLfixed) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Normal3x(nx, ny, nz) })
 }
 
+/// Is a buffer object bound to `GL_ARRAY_BUFFER` / `GL_ELEMENT_ARRAY_BUFFER`?
+///
+/// Answered from the [GLShadowState] mirror where possible. The element array
+/// binding lives in vertex array object state, so right after a VAO switch
+/// the mirror doesn't know it and we ask the driver once (and remember the
+/// answer until the next switch).
+unsafe fn buffer_is_bound(gles: &mut dyn GLES, shadow: &mut GLShadowState, target: GLenum) -> bool {
+    match target {
+        ARRAY_BUFFER => shadow.array_buffer != 0,
+        ELEMENT_ARRAY_BUFFER => {
+            if let Some(binding) = shadow.element_array_buffer {
+                binding != 0
+            } else {
+                let mut buffer_binding: GLint = 0;
+                gles.GetIntegerv(ELEMENT_ARRAY_BUFFER_BINDING, &mut buffer_binding);
+                // Internal state query: strict native drivers (e.g. Adreno
+                // GLES-CM) raise GL_INVALID_ENUM or GL_INVALID_OPERATION for
+                // these binding queries even though the returned value is
+                // valid. Swallow the error so the guest's error queue is not
+                // polluted.
+                let _ = gles.GetError();
+                shadow.element_array_buffer = Some(buffer_binding as GLuint);
+                buffer_binding != 0
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Translate the `pointer` argument of a `gl*Pointer` / `glDrawElements`
+/// call: if a buffer object is bound to `target`, it's an offset into that
+/// buffer and passes through unchanged; otherwise it's a guest pointer to
+/// client-side data that must become a host pointer.
 unsafe fn translate_pointer_or_offset_to_host(
     gles: &mut dyn GLES,
     mem: &Mem,
+    shadow: &mut GLShadowState,
     pointer_or_offset: ConstVoidPtr,
-    which_binding: GLenum,
+    target: GLenum,
 ) -> *const GLvoid {
-    let mut buffer_binding = 0;
-    gles.GetIntegerv(which_binding, &mut buffer_binding);
-    if buffer_binding != 0 {
+    if buffer_is_bound(gles, shadow, target) {
         let offset = pointer_or_offset.to_bits();
         offset as usize as *const _
     } else if pointer_or_offset.is_null() {
@@ -1110,6 +1067,12 @@ unsafe fn translate_pointer_or_offset_to_guest(
 ) -> ConstVoidPtr {
     let mut buffer_binding = 0;
     gles.GetIntegerv(which_binding, &mut buffer_binding);
+    // Internal state query: strict native drivers (e.g. Adreno GLES-CM) raise
+    // GL_INVALID_ENUM or GL_INVALID_OPERATION for these binding queries even
+    // though the returned value is valid. Swallow the error so the guest's
+    // error queue is not polluted on every draw call (same rationale as
+    // clamp_fog_state_values).
+    let _ = gles.GetError();
     if buffer_binding != 0 {
         let offset = pointer_or_offset as usize;
         Ptr::from_bits(u32::try_from(offset).unwrap())
@@ -1127,16 +1090,14 @@ fn glColorPointer(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.ColorPointer(size, type_, stride, pointer)
     })
 }
 fn glNormalPointer(env: &mut Environment, type_: GLenum, stride: GLsizei, pointer: ConstVoidPtr) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.NormalPointer(type_, stride, pointer)
     })
 }
@@ -1147,9 +1108,8 @@ fn glTexCoordPointer(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.TexCoordPointer(size, type_, stride, pointer)
     })
 }
@@ -1160,9 +1120,8 @@ fn glVertexPointer(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.VertexPointer(size, type_, stride, pointer)
     })
 }
@@ -1176,9 +1135,8 @@ fn glPointSizePointerOES(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.PointSizePointerOES(type_, stride, pointer)
     })
 }
@@ -1271,10 +1229,72 @@ fn glCompressedTexSubImage2D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let data: *const GLvoid = mem
-            .ptr_at(data.cast::<u8>(), image_size.try_into().unwrap())
-            .cast();
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let image_size_usize = match usize::try_from(image_size) {
+            Ok(size) => size,
+            Err(_) => {
+                gles.CompressedTexSubImage2D(
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    width,
+                    height,
+                    format,
+                    image_size,
+                    std::ptr::null(),
+                );
+                return;
+            }
+        };
+        let bound_texture = current_bound_texture(gles, target);
+        let texture_level = bound_texture
+            .and_then(|texture| shadow.pvrtc_texture_level(target, texture, level));
+        if pvrtc_subimage_matches_level(
+            texture_level,
+            xoffset,
+            yoffset,
+            width,
+            height,
+            format,
+        ) && !data.is_null()
+            && crate::gles::util::pvrtc_payload_size(format, width, height)
+                == Some(image_size_usize)
+        {
+            if let Some((is_2bit, is_opaque)) = crate::gles::util::pvrtc_format_properties(format) {
+                let data = mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize);
+                let payload = std::slice::from_raw_parts(data, image_size_usize);
+                let pixels = crate::image::decode_pvrtc_with_alpha(
+                    payload,
+                    is_2bit,
+                    width as u32,
+                    height as u32,
+                    is_opaque,
+                );
+                // PVRTC compressed subimages may only replace a complete level.
+                gles.TexSubImage2D(
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    width,
+                    height,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    pixels.as_ptr().cast(),
+                );
+                log_once!(
+                    "Software-decoded a full PVRTC glCompressedTexSubImage2D update into RGBA storage"
+                );
+                return;
+            }
+        }
+        let data = if data.is_null() {
+            std::ptr::null()
+        } else {
+            mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize)
+                .cast()
+        };
         gles.CompressedTexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, image_size, data,
         )
@@ -1384,17 +1404,15 @@ fn glDrawTexsvOES(env: &mut Environment, coords: ConstPtr<i16>) {
 fn glRenderbufferStorageMultisampleAPPLE(
     env: &mut Environment,
     target: GLenum,
-    _samples: GLsizei,
+    samples: GLsizei,
     internalformat: GLenum,
     width: GLsizei,
     height: GLsizei,
 ) {
     // Apply --scale-hack so an MSAA renderbuffer matches the size of the
     // single-sample one it'll be resolved into.
-    let factor = env.options.scale_hack;
-    let scale = |value: GLsizei| (value as f32 * factor).round() as GLsizei;
-    let (width, height) = (scale(width), scale(height));
-    let samples = crate::gles::anti_aliasing_samples().max(1) as GLsizei;
+    let factor = env.options.scale_hack.get() as GLsizei;
+    let (width, height) = (width * factor, height * factor);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.RenderbufferStorageMultisampleAPPLE(target, samples, internalformat, width, height)
     })
@@ -1413,19 +1431,22 @@ fn glResolveMultisampleFramebufferAPPLE(env: &mut Environment) {
 fn glDiscardFramebufferEXT(
     env: &mut Environment,
     target: GLenum,
-    num_attachments: GLsizei,
+    numAttachments: GLsizei,
     attachments: ConstPtr<GLenum>,
 ) {
+    // GL_EXT_discard_framebuffer is a bandwidth hint. On tile-based GPUs
+    // (ARM Mali, Qualcomm Adreno, PowerVR) honouring it lets the driver skip
+    // writing tile memory back to system RAM at the end of the frame. The
+    // guest attachment enums (GL_COLOR_EXT / GL_DEPTH_EXT / GL_STENCIL_EXT)
+    // share their values with the host extension, so forward them unchanged.
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let bytes = if num_attachments > 0 && !attachments.is_null() {
-            (num_attachments as GuestUSize).checked_mul(std::mem::size_of::<GLenum>() as GuestUSize)
+        let n = numAttachments.max(0) as GuestUSize;
+        let ptr = if n == 0 || attachments.is_null() {
+            std::ptr::null()
         } else {
-            None
+            mem.bytes_at(attachments.cast(), n * 4).as_ptr().cast()
         };
-        let pointer = bytes
-            .map(|length| mem.bytes_at(attachments.cast(), length).as_ptr().cast())
-            .unwrap_or(std::ptr::null());
-        gles.DiscardFramebufferEXT(target, num_attachments, pointer);
+        gles.DiscardFramebufferEXT(target, numAttachments, ptr);
     });
 }
 
@@ -1442,8 +1463,10 @@ fn glPopGroupMarkerEXT(_env: &mut Environment) {
 }
 
 fn glBindVertexArrayOES(env: &mut Environment, array: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         if gles.supports_vao_oes() {
+            // The element array buffer binding is VAO state.
+            shadow.invalidate_vao_state();
             gles.BindVertexArrayOES(array);
         }
         // Otherwise no-op: without real VAO support all vertex state lives in
@@ -1451,8 +1474,10 @@ fn glBindVertexArrayOES(env: &mut Environment, array: GLuint) {
     });
 }
 fn glDeleteVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         if gles.supports_vao_oes() {
+            // Deleting the bound VAO rebinds the default one.
+            shadow.invalidate_vao_state();
             let slice = mem.bytes_at(arrays.cast(), (n.max(0) as GuestUSize) * 4);
             gles.DeleteVertexArraysOES(n, slice.as_ptr().cast());
         }
@@ -1498,9 +1523,8 @@ fn glMatrixIndexPointerOES(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.MatrixIndexPointerOES(size, type_, stride, pointer)
     })
 }
@@ -1511,9 +1535,8 @@ fn glWeightPointerOES(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.WeightPointerOES(size, type_, stride, pointer)
     })
 }
@@ -1548,8 +1571,15 @@ fn glGetBufferPointervOES(
 /// queries return GL_INVALID_OPERATION and poison the error queue, so we only
 /// apply this on the GLES1-on-GL2 emulation backend where the queries are
 /// supported.
-unsafe fn guard_client_vertex_arrays(gles: &mut dyn GLES, mem: &Mem) -> Vec<GLuint> {
-    if gles.is_native_es1() {
+unsafe fn guard_client_vertex_arrays(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    shadow: &GLShadowState,
+) -> Vec<GLuint> {
+    // PERF: fixed-function-only apps never enable a generic vertex attribute
+    // array, so there is nothing to guard and no reason to spend 1 + 2×N
+    // driver queries per draw call on it.
+    if !shadow.generic_attribs_used || !gles.is_gles1_on_gl2() {
         return Vec::new();
     }
 
@@ -1607,20 +1637,34 @@ unsafe fn guard_client_vertex_arrays(gles: &mut dyn GLES, mem: &Mem) -> Vec<GLui
     disabled
 }
 
-const VALID_DRAW_MODES: [GLenum; 7] = [0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006];
+/// Valid primitive modes for GLES1/2 draw calls. A guest passing anything else
+/// would raise GL_INVALID_ENUM (0x500) on the host driver; we filter those
+/// draws out with a one-time warning instead of feeding the driver garbage.
+const VALID_DRAW_MODES: [GLenum; 7] = [
+    0x0000, // GL_POINTS
+    0x0001, // GL_LINES
+    0x0002, // GL_LINE_LOOP
+    0x0003, // GL_LINE_STRIP
+    0x0004, // GL_TRIANGLES
+    0x0005, // GL_TRIANGLE_STRIP
+    0x0006, // GL_TRIANGLE_FAN
+];
 
 fn draw_mode_is_valid(mode: GLenum) -> bool {
     VALID_DRAW_MODES.contains(&mode)
 }
 
-fn warn_invalid_draw_mode(name: &str, mode: GLenum) {
+/// Warn once per (call site, bad mode) about an invalid draw mode.
+fn warn_invalid_draw_mode(what: &str, mode: GLenum) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         log!(
-            "Warning: skipping {} with invalid primitive mode 0x{:x}",
-            name,
-            mode
+            "Warning: guest issued a draw call with invalid mode 0x{:x} ({}); \
+             skipping the draw instead of feeding the host driver an invalid \
+             enum (avoids GL_INVALID_ENUM spam and driver-side stalls)",
+            mode,
+            what
         );
     }
 }
@@ -1630,11 +1674,9 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log_dbg!(
-                "First glDrawArrays(mode=0x{:x}, first={}, count={})",
-                mode,
-                first,
-                count
+            log!(
+                "First glDrawArrays(mode=0x{:x}, first={}, count={}) (app submitting first draw) [this log will only be shown once]",
+                mode, first, count
             );
         }
 
@@ -1656,10 +1698,10 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         warn_invalid_draw_mode("glDrawArrays", mode);
         return;
     }
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let disabled_arrays = guard_client_vertex_arrays(gles, mem);
-        let fog_state_backup = clamp_fog_state_values(gles);
-        if std::env::var_os("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE").is_some() {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
+        let fog_state_backup = clamp_fog_state_values(gles, shadow);
+        if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log!(
@@ -1681,6 +1723,87 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         }
     })
 }
+
+/// One-shot state dump at the first guest draw call, gated by
+/// `TOUCHHLE_DEBUG_ES2_DRAW`. Helps diagnose "render loop alive but
+/// renderbuffer stays black" situations.
+unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, mem: &Mem) {
+    if !crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        return;
+    }
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut fbo: GLint = 0;
+    gles.GetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &mut fbo);
+    let mut program: GLint = 0;
+    gles.GetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &mut program);
+    let mut tex: GLint = 0;
+    gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut tex);
+    let mut arr_buf: GLint = 0;
+    gles.GetIntegerv(0x8894 /* GL_ARRAY_BUFFER_BINDING */, &mut arr_buf);
+    let mut elem_buf: GLint = 0;
+    gles.GetIntegerv(0x8895 /* GL_ELEMENT_ARRAY_BUFFER_BINDING */, &mut elem_buf);
+    let mut viewport = [0 as GLint; 4];
+    gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, viewport.as_mut_ptr());
+    let mut rb: GLint = 0;
+    gles.GetIntegerv(0x8CA7 /* GL_RENDERBUFFER_BINDING */, &mut rb);
+    let status = gles.CheckFramebufferStatus(0x8D40 /* GL_FRAMEBUFFER */);
+    // Drain any error the queries raised so the guest doesn't inherit it.
+    let mut err = gles.GetError();
+    let mut errs = Vec::new();
+    while err != 0 && errs.len() < 4 {
+        errs.push(err);
+        err = gles.GetError();
+    }
+    let mut color_mask = [0u8; 4];
+    gles.GetBooleanv(0x0C23 /* GL_COLOR_WRITEMASK */, color_mask.as_mut_ptr());
+    let states = [0x0BE2, 0x0B71, 0x0B44, 0x0C11, 0x0B90]
+        .map(|cap| gles.IsEnabled(cap) != 0);
+    let mut attribs = Vec::new();
+    for name in ["a_position", "a_texCoord", "a_color"] {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        let loc = gles.GetAttribLocation(program as GLuint, name_c.as_ptr());
+        if loc < 0 { continue; }
+        let i = loc as GLuint;
+        let mut enabled = 0;
+        let mut size = 0;
+        let mut type_ = 0;
+        let mut stride = 0;
+        let mut buffer = 0;
+        let mut ptr: *mut GLvoid = std::ptr::null_mut();
+        gles.GetVertexAttribiv(i, 0x8622, &mut enabled);
+        gles.GetVertexAttribiv(i, 0x8623, &mut size);
+        gles.GetVertexAttribiv(i, 0x8625, &mut type_);
+        gles.GetVertexAttribiv(i, 0x8624, &mut stride);
+        gles.GetVertexAttribiv(i, 0x889F, &mut buffer);
+        gles.GetVertexAttribPointerv(i, 0x8645, &mut ptr);
+        let first = if buffer == 0 && type_ as u32 == 0x1406 && !ptr.is_null() && mem.is_host_ptr_in_guest_mem(ptr) {
+            Some(std::slice::from_raw_parts(ptr.cast::<f32>(), (size as usize).min(4)).to_vec())
+        } else { None };
+        attribs.push((name, loc, enabled, size, type_, stride, buffer, ptr as usize, first));
+    }
+    log!(
+        "ES2 draw state: fbo={} status={:#x} program={} texture={} \
+         array_buf={} elem_buf={} renderbuffer={} viewport={:?} color_mask={:?} states={:?} attribs={:?} \
+         generic_attribs_used={} err={:?}",
+        fbo,
+        status,
+        program,
+        tex,
+        arr_buf,
+        elem_buf,
+        rb,
+        viewport,
+        color_mask,
+        states,
+        attribs,
+        shadow.generic_attribs_used,
+        errs,
+    );
+}
+
 fn glDrawElements(
     env: &mut Environment,
     mode: GLenum,
@@ -1692,11 +1815,9 @@ fn glDrawElements(
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log_dbg!(
-                "First glDrawElements(mode=0x{:x}, count={}, type=0x{:x})",
-                mode,
-                count,
-                type_
+            log!(
+                "First glDrawElements(mode=0x{:x}, count={}, type=0x{:x}) (app submitting first indexed draw) [this log will only be shown once]",
+                mode, count, type_
             );
         }
 
@@ -1719,10 +1840,11 @@ fn glDrawElements(
         warn_invalid_draw_mode("glDrawElements", mode);
         return;
     }
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let disabled_arrays = guard_client_vertex_arrays(gles, mem);
-        let fog_state_backup = clamp_fog_state_values(gles);
-        if std::env::var_os("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE").is_some() {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        log_es2_draw_state_once(gles, shadow, mem);
+        let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
+        let fog_state_backup = clamp_fog_state_values(gles, shadow);
+        if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log!(
@@ -1737,13 +1859,38 @@ fn glDrawElements(
             gles.Disable(0x0b44); // GL_CULL_FACE
         }
 
-        let indices = translate_pointer_or_offset_to_host(
-            gles,
-            mem,
-            indices,
-            gles11::ELEMENT_ARRAY_BUFFER_BINDING,
-        );
+        let indices =
+            translate_pointer_or_offset_to_host(gles, mem, shadow, indices, ELEMENT_ARRAY_BUFFER);
         gles.DrawElements(mode, count, type_, indices);
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+            static FB_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !FB_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut vp = [0 as GLint; 4];
+                gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, vp.as_mut_ptr());
+                if vp[2] > 0 && vp[3] > 0 {
+                    let w = vp[2] as usize;
+                    let h = vp[3] as usize;
+                    let mut pix = vec![0u8; w * h * 4];
+                    gles.ReadPixels(
+                        vp[0],
+                        vp[1],
+                        vp[2],
+                        vp[3],
+                        0x1908, /* GL_RGBA */
+                        0x1401, /* GL_UNSIGNED_BYTE */
+                        pix.as_mut_ptr() as *mut _,
+                    );
+                    dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, "/tmp/a8run/fb_after_draw.ppm");
+                }
+                let mut err = gles.GetError();
+                let mut errs = Vec::new();
+                while err != 0 && errs.len() < 4 {
+                    errs.push(err);
+                    err = gles.GetError();
+                }
+                log!("[ES2DIAG] post-draw ReadPixels errs={:?}", errs);
+            }
+        }
         restore_fog_state_values(gles, fog_state_backup);
         for index in disabled_arrays {
             gles.EnableVertexAttribArray(index);
@@ -1756,7 +1903,10 @@ fn glClear(env: &mut Environment, mask: GLbitfield) {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log_dbg!("First glClear(mask=0x{:x})", mask);
+            log!(
+                "First glClear(mask=0x{:x}) [this log will only be shown once]",
+                mask
+            );
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Clear(mask) });
@@ -1772,8 +1922,8 @@ fn glClearColor(
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log_dbg!(
-                "First glClearColor({}, {}, {}, {})",
+            log!(
+                "First glClearColor({}, {}, {}, {}) [this log will only be shown once]",
                 red,
                 green,
                 blue,
@@ -1985,12 +2135,8 @@ fn glReadPixels(
 ) {
     with_ctx_and_mem(env, |gles, mem| {
         let pixels = {
-            let mut alignment = 4;
-            unsafe {
-                gles.GetIntegerv(gles11::PACK_ALIGNMENT, &mut alignment);
-            }
-            let size =
-                image_size_estimate(width, height, format, type_, alignment.max(1) as GuestUSize);
+            let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
+            let size = image_size_estimate(pixel_count, format, type_);
             mem.ptr_at_mut(pixels.cast::<u8>(), size).cast::<GLvoid>()
         };
         unsafe { gles.ReadPixels(x, y, width, height, format, type_, pixels) }
@@ -2016,10 +2162,18 @@ fn glGenTextures(env: &mut Environment, n: GLsizei, textures: MutPtr<GLuint>) {
     })
 }
 fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let textures = mem.ptr_at(textures, n_usize);
-        unsafe { gles.DeleteTextures(n, textures) }
+        let deleted = if n_usize == 0 {
+            Vec::new()
+        } else {
+            unsafe { from_raw_parts(textures, n_usize as usize) }.to_vec()
+        };
+        unsafe { gles.DeleteTextures(n, textures) };
+        for texture in deleted {
+            shadow.forget_pvrtc_texture(texture);
+        }
     })
 }
 fn glActiveTexture(env: &mut Environment, texture: GLenum) {
@@ -2029,7 +2183,6 @@ fn glIsTexture(env: &mut Environment, texture: GLuint) -> GLboolean {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsTexture(texture) })
 }
 fn glBindTexture(env: &mut Environment, target: GLenum, texture: GLuint) {
-    let anisotropic_filtering = env.options.anisotropic_filtering;
     if trace_potatogold_render() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNT: AtomicU32 = AtomicU32::new(0);
@@ -2044,14 +2197,7 @@ fn glBindTexture(env: &mut Environment, target: GLenum, texture: GLuint) {
     }
 
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.BindTexture(target, texture);
-        if texture != 0 && anisotropic_filtering > 1 {
-            gles.TexParameterf(
-                target,
-                gles11::TEXTURE_MAX_ANISOTROPY_EXT,
-                anisotropic_filtering as GLfloat,
-            );
-        }
+        gles.BindTexture(target, texture)
     })
 }
 /// If `pname` is `GL_TEXTURE_MIN_FILTER` and `param` is a mipmap min-filter
@@ -2097,63 +2243,20 @@ fn maybe_demipmap_min_filter(env: &Environment, pname: GLenum, param: GLint) -> 
     demipmap_filter_value(pname, param)
 }
 
-fn override_texture_filter_value(
-    filtering: crate::options::TextureFiltering,
-    pname: GLenum,
-    param: GLint,
-) -> GLint {
-    use crate::options::TextureFiltering;
-    match filtering {
-        TextureFiltering::Default => param,
-        TextureFiltering::Bilinear | TextureFiltering::Anisotropic => {
-            if pname == gles11::TEXTURE_MIN_FILTER || pname == gles11::TEXTURE_MAG_FILTER {
-                gles11::LINEAR as GLint
-            } else {
-                param
-            }
-        }
-        TextureFiltering::Trilinear => {
-            if pname == gles11::TEXTURE_MIN_FILTER {
-                gles11::LINEAR_MIPMAP_LINEAR as GLint
-            } else if pname == gles11::TEXTURE_MAG_FILTER {
-                gles11::LINEAR as GLint
-            } else {
-                param
-            }
-        }
-    }
-}
-
-fn override_texture_filter(env: &Environment, pname: GLenum, param: GLint) -> GLint {
-    override_texture_filter_value(env.options.texture_filtering, pname, param)
-}
-
-fn configured_texture_min_filter(env: &Environment) -> Option<GLint> {
-    use crate::options::TextureFiltering;
-    match env.options.texture_filtering {
-        TextureFiltering::Default => None,
-        TextureFiltering::Bilinear | TextureFiltering::Anisotropic => Some(gles11::LINEAR as GLint),
-        TextureFiltering::Trilinear => Some(gles11::LINEAR_MIPMAP_LINEAR as GLint),
-    }
-}
-
 fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: GLint) {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log_dbg!(
-                "First glTexParameteri(target=0x{:x}, pname=0x{:x}, param=0x{:x})",
-                target,
-                pname,
-                param as u32
+            log!(
+                "First glTexParameteri(target=0x{:x}, pname=0x{:x}, param=0x{:x}) [this log will only be shown once]",
+                target, pname, param as u32
             );
         }
     }
     if pname == gles11::TEXTURE_CROP_RECT_OES {
         return;
     }
-    let param = override_texture_filter(env, pname, param);
     let param = maybe_demipmap_min_filter(env, pname, param);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameteri(target, pname, param)
@@ -2165,8 +2268,7 @@ fn glTexParameterf(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     }
     // Floats can also be used to pass enum-valued min-filter params (an
     // OpenGL quirk), so route them through the same substitution.
-    let param = override_texture_filter(env, pname, param as GLint);
-    let param = maybe_demipmap_min_filter(env, pname, param) as GLfloat;
+    let param = maybe_demipmap_min_filter(env, pname, param as GLint) as GLfloat;
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameterf(target, pname, param)
     })
@@ -2176,7 +2278,6 @@ fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: 
         return;
     }
     // Fixed-point can also encode enum values; route through substitution.
-    let param = override_texture_filter(env, pname, param);
     let param = maybe_demipmap_min_filter(env, pname, param) as GLfixed;
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameterx(target, pname, param)
@@ -2184,7 +2285,7 @@ fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: 
 }
 fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLint>) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if std::env::var_os("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT").is_none() {
+        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
             return;
         }
 
@@ -2208,21 +2309,17 @@ fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params
         });
         return;
     }
-    let filtering = env.options.texture_filtering;
-    let fix_min_filter = env.options.fix_texture_min_filter;
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
-        let original: GLint = *params_ptr;
-        let overridden = override_texture_filter_value(filtering, pname, original);
-        let substituted = if fix_min_filter {
-            demipmap_filter_value(pname, overridden)
-        } else {
-            overridden
-        };
-        if substituted != original {
-            let v = [substituted];
-            gles.TexParameteriv(target, pname, v.as_ptr());
-            return;
+        if fix_min_filter {
+            let original: GLint = *params_ptr;
+            let substituted = demipmap_filter_value(pname, original);
+            if substituted != original {
+                let v = [substituted];
+                gles.TexParameteriv(target, pname, v.as_ptr());
+                return;
+            }
         }
         gles.TexParameteriv(target, pname, params_ptr)
     })
@@ -2234,7 +2331,7 @@ fn glTexParameterfv(
     params: ConstPtr<GLfloat>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if std::env::var_os("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT").is_none() {
+        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
             return;
         }
 
@@ -2258,21 +2355,17 @@ fn glTexParameterfv(
         });
         return;
     }
-    let filtering = env.options.texture_filtering;
-    let fix_min_filter = env.options.fix_texture_min_filter;
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
-        let original: GLfloat = *params_ptr;
-        let overridden = override_texture_filter_value(filtering, pname, original as GLint);
-        let substituted = if fix_min_filter {
-            demipmap_filter_value(pname, overridden)
-        } else {
-            overridden
-        } as GLfloat;
-        if substituted != original {
-            let v = [substituted];
-            gles.TexParameterfv(target, pname, v.as_ptr());
-            return;
+        if fix_min_filter {
+            let original: GLfloat = *params_ptr;
+            let substituted = demipmap_filter_value(pname, original as GLint) as GLfloat;
+            if substituted != original {
+                let v = [substituted];
+                gles.TexParameterfv(target, pname, v.as_ptr());
+                return;
+            }
         }
         gles.TexParameterfv(target, pname, params_ptr)
     })
@@ -2284,7 +2377,7 @@ fn glTexParameterxv(
     params: ConstPtr<GLfixed>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if std::env::var_os("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT").is_none() {
+        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
             return;
         }
 
@@ -2308,32 +2401,26 @@ fn glTexParameterxv(
         });
         return;
     }
-    let filtering = env.options.texture_filtering;
-    let fix_min_filter = env.options.fix_texture_min_filter;
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
-        let original: GLfixed = *params_ptr;
-        let overridden = override_texture_filter_value(filtering, pname, original);
-        let substituted = if fix_min_filter {
-            demipmap_filter_value(pname, overridden)
-        } else {
-            overridden
-        } as GLfixed;
-        if substituted != original {
-            let v = [substituted];
-            gles.TexParameterxv(target, pname, v.as_ptr());
-            return;
+        if fix_min_filter {
+            let original: GLfixed = *params_ptr;
+            let substituted = demipmap_filter_value(pname, original) as GLfixed;
+            if substituted != original {
+                let v = [substituted];
+                gles.TexParameterxv(target, pname, v.as_ptr());
+                return;
+            }
         }
         gles.TexParameterxv(target, pname, params_ptr)
     })
 }
-fn image_size_estimate(
-    width: GLsizei,
-    height: GLsizei,
-    format: GLenum,
-    type_: GLenum,
-    alignment: GuestUSize,
-) -> GuestUSize {
+fn image_size_estimate(pixel_count: GuestUSize, format: GLenum, type_: GLenum) -> GuestUSize {
+    // This is only an upper-bound estimate used for memory tracking, not
+    // anything OpenGL actually needs. Unknown combos should yield a
+    // conservative "don't try to copy guest pixels" sentinel (0) and log,
+    // not crash the host. The driver will catch real format issues.
     let bytes_per_pixel: Option<GuestUSize> = match type_ {
         gles11::UNSIGNED_BYTE => match format {
             gles11::ALPHA | gles11::LUMINANCE => Some(1),
@@ -2344,10 +2431,7 @@ fn image_size_estimate(
         },
         gles11::UNSIGNED_SHORT_5_6_5
         | gles11::UNSIGNED_SHORT_4_4_4_4
-        | gles11::UNSIGNED_SHORT_5_5_5_1
-        | 0x8365
-        | 0x8366 => Some(2),
-        0x8367 => Some(4),
+        | gles11::UNSIGNED_SHORT_5_5_5_1 => Some(2),
         _ => None,
     };
     let Some(bpp) = bytes_per_pixel else {
@@ -2358,122 +2442,15 @@ fn image_size_estimate(
         );
         return 0;
     };
-    let width = width.max(0) as GuestUSize;
-    let height = height.max(0) as GuestUSize;
-    let row_bytes = width.saturating_mul(bpp);
-    let alignment = alignment.clamp(1, 8);
-    let row_stride = row_bytes.saturating_add(alignment - 1) / alignment * alignment;
-    row_stride
-        .saturating_mul(height.saturating_sub(1))
-        .saturating_add(row_bytes)
-}
-fn normalise_tex_image_formats(
-    internalformat: GLint,
-    format: GLenum,
-    type_: GLenum,
-) -> (GLint, GLenum, GLenum) {
-    let host_format = match format {
-        gles11::ALPHA
-        | gles11::RGB
-        | gles11::RGBA
-        | gles11::LUMINANCE
-        | gles11::LUMINANCE_ALPHA => format,
-        gles11::BGRA_EXT => gles11::RGBA,
-        _ => gles11::RGBA,
-    };
-    let host_type = match type_ {
-        gles11::UNSIGNED_BYTE
-        | gles11::UNSIGNED_SHORT_5_6_5
-        | gles11::UNSIGNED_SHORT_4_4_4_4
-        | gles11::UNSIGNED_SHORT_5_5_5_1
-        | 0x8365
-        | 0x8366
-        | 0x8367 => type_,
-        _ => gles11::UNSIGNED_BYTE,
-    };
-    let valid_internalformat = matches!(
-        internalformat as GLenum,
-        gles11::ALPHA | gles11::RGB | gles11::RGBA | gles11::LUMINANCE | gles11::LUMINANCE_ALPHA
-    );
-    let host_internalformat = if valid_internalformat && internalformat as GLenum == host_format {
-        internalformat
-    } else {
-        host_format as GLint
-    };
-    (host_internalformat, host_format, host_type)
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn tex_image_2d_checked(
-    gles: &mut dyn GLES,
-    target: GLenum,
-    level: GLint,
-    internalformat: GLint,
-    width: GLsizei,
-    height: GLsizei,
-    border: GLint,
-    format: GLenum,
-    type_: GLenum,
-    pixels: *const GLvoid,
-    fallback_pixels: *const GLvoid,
-) {
-    let previous_error = gles.GetError();
-    if previous_error != gles11::NO_ERROR {
-        log_dbg!(
-            "Cleared stale host GL error before TexImage2D: 0x{:04x} ({})",
-            previous_error,
-            gl_error_name(previous_error)
-        );
-    }
-    gles.TexImage2D(
-        target,
-        level,
-        internalformat,
-        width,
-        height,
-        border,
-        format,
-        type_,
-        pixels,
-    );
-    let error = gles.GetError();
-    if error == gles11::NO_ERROR {
-        return;
-    }
-
-    log!(
-        "Warning: host TexImage2D rejected target=0x{:x} level={} internalformat=0x{:x} size={}x{} format=0x{:x} type=0x{:x}: 0x{:04x} ({}); retrying as RGBA8",
-        target,
-        level,
-        internalformat,
-        width,
-        height,
-        format,
-        type_,
-        error,
-        gl_error_name(error)
-    );
-    gles.TexImage2D(
-        target,
-        level,
-        gles11::RGBA as GLint,
-        width,
-        height,
-        0,
-        gles11::RGBA,
-        gles11::UNSIGNED_BYTE,
-        fallback_pixels,
-    );
-    let fallback_error = gles.GetError();
-    if fallback_error != gles11::NO_ERROR {
+    pixel_count.checked_mul(bpp).unwrap_or_else(|| {
         log!(
-            "Warning: RGBA8 TexImage2D recovery also failed: 0x{:04x} ({})",
-            fallback_error,
-            gl_error_name(fallback_error)
+            "Warning: image_size_estimate(): pixel_count {} * bpp {} overflowed GuestUSize; returning u32::MAX.",
+            pixel_count,
+            bpp
         );
-    }
+        GuestUSize::MAX
+    })
 }
-
 fn glTexImage2D(
     env: &mut Environment,
     target: GLenum,
@@ -2490,13 +2467,9 @@ fn glTexImage2D(
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log_dbg!(
-                "First glTexImage2D({}x{}, internalformat=0x{:x}, format=0x{:x}, type=0x{:x})",
-                width,
-                height,
-                internalformat as u32,
-                format,
-                type_
+            log!(
+                "First glTexImage2D({}x{}, internalformat=0x{:x}, format=0x{:x}, type=0x{:x}) (app uploading texture data) [this log will only be shown once]",
+                width, height, internalformat as u32, format, type_
             );
         }
 
@@ -2519,189 +2492,74 @@ fn glTexImage2D(
             }
         }
     }
+    let guest_pixels = pixels;
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
-    let texture_upscaler = env.options.texture_upscaler;
-    let anisotropic_filtering = env.options.anisotropic_filtering;
-    let configured_min_filter = configured_texture_min_filter(env);
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let mut alignment = 4;
-        gles.GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut alignment);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
         let pixels = if pixels.is_null() {
             std::ptr::null()
         } else {
-            let size =
-                image_size_estimate(width, height, format, type_, alignment.max(1) as GuestUSize);
+            let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
+            let size = image_size_estimate(pixel_count, format, type_);
             mem.ptr_at(pixels.cast::<u8>(), size).cast::<GLvoid>()
         };
-        if gles.is_native_es1() {
-            // TouchHLE parity: a native OpenGL ES 1.1 driver accepts every
-            // guest upload format itself, so the RGBA8 decode / upscaler /
-            // format-normalisation stack below is skipped entirely. Passing
-            // the guest's exact internalformat/format/type through is what
-            // upstream does, and is the only path verified pixel-perfect on
-            // real drivers (e.g. Angry Birds' mixed PVRTC/565/8888 uploads).
-            gles.TexImage2D(
-                target,
-                level,
-                internalformat,
-                width,
-                height,
-                border,
-                format,
-                type_,
-                pixels,
-            );
-            crate::gles::util::record_texture_level_format(
-                gles, target, level, format as u32, type_ as u32,
-            );
-            if fix_filter {
-                gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
-            }
-            if !fix_filter && level == 0 {
-                if let Some(filter) = configured_min_filter {
-                    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, filter);
-                }
-            }
-            if anisotropic_filtering > 1 {
-                gles.TexParameterf(
-                    target,
-                    gles11::TEXTURE_MAX_ANISOTROPY_EXT,
-                    anisotropic_filtering as GLfloat,
-                );
-            }
-            return;
+        gles.TexImage2D(
+            target,
+            level,
+            internalformat,
+            width,
+            height,
+            border,
+            format,
+            type_,
+            pixels,
+        );
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
         }
-        if let Some(decoded) = crate::gles::util::decode_texture_to_rgba8(
-            width, height, format, type_, pixels, alignment,
-        ) {
-            let (upload_pixels, upload_width, upload_height) = crate::gles::util::upscale_rgba8(
-                &decoded,
-                width.max(0) as u32,
-                height.max(0) as u32,
-                texture_upscaler,
-            )
-            .map_or(
-                (decoded, width.max(0) as u32, height.max(0) as u32),
-                |(pixels, width, height)| (pixels, width, height),
-            );
-            gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
-            tex_image_2d_checked(
-                gles,
-                target,
-                level,
-                gles11::RGBA as GLint,
-                upload_width as GLsizei,
-                upload_height as GLsizei,
-                border,
-                gles11::RGBA,
-                gles11::UNSIGNED_BYTE,
-                upload_pixels.as_ptr().cast(),
-                upload_pixels.as_ptr().cast(),
-            );
-            crate::gles::util::record_texture_level_format(
-                gles, target, level, gles11::RGBA as u32, gles11::UNSIGNED_BYTE as u32,
-            );
-            gles.PixelStorei(gles11::UNPACK_ALIGNMENT, alignment);
-        } else {
-            let (host_internalformat, host_format, host_type) =
-                normalise_tex_image_formats(internalformat, format, type_);
-            let supported_source = matches!(
-                format,
-                gles11::ALPHA
-                    | gles11::RGB
-                    | gles11::RGBA
-                    | gles11::LUMINANCE
-                    | gles11::LUMINANCE_ALPHA
-                    | gles11::BGRA_EXT
-            ) && matches!(
-                type_,
-                gles11::UNSIGNED_BYTE
-                    | gles11::UNSIGNED_SHORT_5_6_5
-                    | gles11::UNSIGNED_SHORT_4_4_4_4
-                    | gles11::UNSIGNED_SHORT_5_5_5_1
-                    | 0x8365
-                    | 0x8366
-                    | 0x8367
-            );
-            let host_border = if border == 0 {
-                0
-            } else {
-                log_dbg!("Normalizing non-zero GLES2 texture border {} to 0", border);
-                0
-            };
-            if !pixels.is_null() && !supported_source {
-                let blank_len = (width.max(0) as usize)
-                    .saturating_mul(height.max(0) as usize)
-                    .saturating_mul(4);
-                let blank = vec![0u8; blank_len];
-                log!(
-                    "Warning: unsupported glTexImage2D source format/type internal=0x{:x} format=0x{:x} type=0x{:x}; uploading a safe RGBA fallback",
-                    internalformat as u32,
-                    format,
-                    type_
-                );
-                tex_image_2d_checked(
-                    gles,
-                    target,
-                    level,
-                    gles11::RGBA as GLint,
-                    width.max(0),
-                    height.max(0),
-                    host_border,
-                    gles11::RGBA,
-                    gles11::UNSIGNED_BYTE,
-                    blank.as_ptr().cast(),
-                    blank.as_ptr().cast(),
-                );
-            } else {
-                if host_internalformat != internalformat
-                    || host_format != format
-                    || host_type != type_
-                    || host_border != border
-                {
-                    log_dbg!(
-                        "Normalizing GLES texture upload internal=0x{:x}/format=0x{:x}/type=0x{:x} to internal=0x{:x}/format=0x{:x}/type=0x{:x}",
-                        internalformat as u32,
-                        format,
-                        type_,
-                        host_internalformat as u32,
-                        host_format,
-                        host_type
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+            static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = TEX_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 && !pixels.is_null() && level == 0 {
+                let tex_id = {
+                    let mut t: GLint = 0;
+                    gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut t);
+                    t
+                };
+                let bytes_pp: usize = match (format, type_) {
+                    (0x1908, 0x1401) => 4, // RGBA UNSIGNED_BYTE
+                    (0x1908, 0x8033) => 2, // RGBA UNSIGNED_SHORT_4_4_4_4
+                    (0x1907, 0x8363) => 2, // RGB UNSIGNED_SHORT_5_6_5
+                    _ => 0,
+                };
+                if bytes_pp > 0 {
+                    let px_count = (width as usize) * (height as usize);
+                    let byte_size = px_count * bytes_pp;
+                    let buf: Vec<u8> = mem
+                        .bytes_at(guest_pixels.cast::<u8>(), byte_size as u32)
+                        .to_vec();
+                    let path = format!(
+                        "/tmp/a8run/tex{}_id{}_{}x{}.ppm", n, tex_id, width, height
                     );
+                    dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
                 }
-                tex_image_2d_checked(
-                    gles,
-                    target,
-                    level,
-                    host_internalformat,
-                    width,
-                    height,
-                    host_border,
-                    host_format,
-                    host_type,
-                    pixels,
-                    pixels,
-                );
             }
         }
         if fix_filter {
+            // Set GL_TEXTURE_MIN_FILTER to GL_LINEAR for the bound
+            // texture so it isn't sampled as opaque black on strict
+            // ES 1.1 drivers (notably Qualcomm Adreno) just because
+            // the guest never bothered to override the default
+            // GL_NEAREST_MIPMAP_LINEAR. The guest's own
+            // glTexParameteri(GL_TEXTURE_MIN_FILTER, …) will override
+            // this on subsequent calls — see Options::fix_texture_min_filter.
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log_dbg!("fix_texture_min_filter: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after level-0 texture upload");
+                log!(
+                    "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
+                );
             }
             gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
-        }
-        if !fix_filter && level == 0 {
-            if let Some(filter) = configured_min_filter {
-                gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, filter);
-            }
-        }
-        if anisotropic_filtering > 1 {
-            gles.TexParameterf(
-                target,
-                gles11::TEXTURE_MAX_ANISOTROPY_EXT,
-                anisotropic_filtering as GLfloat,
-            );
         }
     })
 }
@@ -2718,84 +2576,12 @@ fn glTexSubImage2D(
     pixels: ConstVoidPtr,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let mut alignment = 4;
-        gles.GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut alignment);
-        let size =
-            image_size_estimate(width, height, format, type_, alignment.max(1) as GuestUSize);
-        let pixels = if pixels.is_null() {
-            std::ptr::null()
-        } else {
-            mem.ptr_at(pixels.cast::<u8>(), size).cast::<GLvoid>()
-        };
-        if gles.is_native_es1() {
-            // TouchHLE parity: native ES 1.1 passthrough — see glTexImage2D.
-            gles.TexSubImage2D(
-                target,
-                level,
-                xoffset,
-                yoffset,
-                width,
-                height,
-                format,
-                type_,
-                pixels,
-            );
-            return;
-        }
-        // Strict ES 2.0 drivers (Adreno 7xx) raise GL_INVALID_OPERATION when
-        // the sub-image format differs from the format the level was created
-        // with (e.g. an RGBA8-updated sub-rectangle on a 565 or native-format
-        // level). Track the format each level was created with and upload the
-        // sub-image in THAT format. Angry Birds Star Wars (Fusion engine)
-        // asserts on every driver error and aborts, so also drain any error
-        // the reformatting path produces instead of leaking it to the app.
-        let level_format = crate::gles::util::texture_level_format(
-            gles, target, level,
-        );
-        let use_rgba = match level_format {
-            Some((f, t)) => f == gles11::RGBA && t == gles11::UNSIGNED_BYTE,
-            None => false,
-        };
-        if use_rgba {
-            if let Some(decoded) = crate::gles::util::decode_texture_to_rgba8(
-                width, height, format, type_, pixels, alignment,
-            ) {
-                gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
-                gles.TexSubImage2D(
-                    target,
-                    level,
-                    xoffset,
-                    yoffset,
-                    width,
-                    height,
-                    gles11::RGBA,
-                    gles11::UNSIGNED_BYTE,
-                    decoded.as_ptr().cast(),
-                );
-                gles.PixelStorei(gles11::UNPACK_ALIGNMENT, alignment);
-            } else {
-                gles.TexSubImage2D(
-                    target, level, xoffset, yoffset, width, height, format, type_, pixels,
-                );
-            }
-        } else {
-            gles.TexSubImage2D(
-                target, level, xoffset, yoffset, width, height, format, type_, pixels,
-            );
-        }
-        // Keep driver-side INVALID_OPERATION from reaching the app's
-        // glGetError(): its assertion handler aborts the game on sight.
-        let mut drained = 0u32;
-        loop {
-            let e = gles.GetError();
-            if e == 0 {
-                break;
-            }
-            drained += 1;
-            if drained > 8 {
-                break;
-            }
-        }
+        let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
+        let size = image_size_estimate(pixel_count, format, type_);
+        let pixels = mem.ptr_at(pixels.cast::<u8>(), size).cast::<GLvoid>();
+        gles.TexSubImage2D(
+            target, level, xoffset, yoffset, width, height, format, type_, pixels,
+        )
     })
 }
 fn glCompressedTexImage2D(
@@ -2813,82 +2599,18 @@ fn glCompressedTexImage2D(
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            log_dbg!(
-                "First glCompressedTexImage2D({}x{}, internalformat=0x{:x}, image_size={})",
-                width,
-                height,
-                internalformat,
-                image_size
+            log!(
+                "First glCompressedTexImage2D({}x{}, internalformat=0x{:x}, image_size={}) (app uploading PVRTC/compressed texture) [this log will only be shown once]",
+                width, height, internalformat, image_size
             );
         }
     }
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
-    let no_texture_compression = env.options.no_texture_compression;
-    let texture_upscaler = env.options.texture_upscaler;
-    let anisotropic_filtering = env.options.anisotropic_filtering;
-    let configured_min_filter = configured_texture_min_filter(env);
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let data: *const GLvoid = mem
-            .ptr_at(data.cast::<u8>(), image_size.try_into().unwrap())
-            .cast();
-        if no_texture_compression {
-            let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
-            if crate::gles::util::try_decode_pvrtc(
-                gles,
-                target,
-                level,
-                internalformat,
-                width,
-                height,
-                border,
-                payload,
-            ) {
-                return;
-            }
-            if let Some(decoded) = crate::gles::util::PalettedTextureFormat::decode_rgba8(
-                internalformat,
-                width,
-                height,
-                payload,
-            ) {
-                let (upload_pixels, upload_width, upload_height) =
-                    crate::gles::util::upscale_rgba8(
-                        &decoded,
-                        width.max(0) as u32,
-                        height.max(0) as u32,
-                        texture_upscaler,
-                    )
-                    .map_or(
-                        (decoded, width.max(0) as u32, height.max(0) as u32),
-                        |(pixels, width, height)| (pixels, width, height),
-                    );
-                gles.TexImage2D(
-                    target,
-                    level,
-                    gles11::RGBA as GLint,
-                    upload_width as GLsizei,
-                    upload_height as GLsizei,
-                    border,
-                    gles11::RGBA,
-                    gles11::UNSIGNED_BYTE,
-                    upload_pixels.as_ptr().cast(),
-                );
-                if anisotropic_filtering > 1 {
-                    gles.TexParameterf(
-                        target,
-                        gles11::TEXTURE_MAX_ANISOTROPY_EXT,
-                        anisotropic_filtering as GLfloat,
-                    );
-                }
-                if !fix_filter && level == 0 {
-                    if let Some(filter) = configured_min_filter {
-                        gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, filter);
-                    }
-                }
-                return;
-            }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
         }
-
         // Pre-flight: drain any sticky GL error left by the previous call
         // (e.g. an oversized RGBA8 glTexImage2D on a strict Mali driver),
         // so when we check post-upload below we can attribute a fresh error
@@ -2912,6 +2634,55 @@ fn glCompressedTexImage2D(
             }
         }
 
+        let image_size_usize = match usize::try_from(image_size) {
+            Ok(size) => size,
+            Err(_) => return,
+        };
+        let data: *const GLvoid = mem
+            .ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize)
+            .cast();
+        let is_pvrtc = matches!(
+            internalformat,
+            gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
+                | gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+                | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+                | gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+        );
+        if is_pvrtc && !data.is_null() && image_size > 0 {
+            let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size_usize);
+            if crate::gles::try_decode_pvrtc(
+                gles,
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                payload,
+            ) {
+                if border == 0
+                    && width > 0
+                    && height > 0
+                    && crate::gles::util::pvrtc_payload_size(internalformat, width, height)
+                        == Some(image_size_usize)
+                {
+                    if let Some(texture) = bound_texture {
+                        shadow.record_pvrtc_texture_level(
+                            target,
+                            texture,
+                            level,
+                            width,
+                            height,
+                            internalformat,
+                        );
+                    }
+                }
+                if fix_filter {
+                    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                }
+                return;
+            }
+        }
         gles.CompressedTexImage2D(
             target,
             level,
@@ -2976,18 +2747,6 @@ fn glCompressedTexImage2D(
         if fix_filter {
             gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
         }
-        if !fix_filter && level == 0 {
-            if let Some(filter) = configured_min_filter {
-                gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, filter);
-            }
-        }
-        if anisotropic_filtering > 1 {
-            gles.TexParameterf(
-                target,
-                gles11::TEXTURE_MAX_ANISOTROPY_EXT,
-                anisotropic_filtering as GLfloat,
-            );
-        }
     })
 }
 fn glCopyTexImage2D(
@@ -3001,8 +2760,12 @@ fn glCopyTexImage2D(
     height: GLsizei,
     border: GLint,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
     })
 }
 fn glCopyTexSubImage2D(
@@ -3036,21 +2799,30 @@ fn glTexEnvi(env: &mut Environment, target: GLenum, pname: GLenum, param: GLint)
     })
 }
 fn glTexEnvfv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLfloat>) {
-    assert!(target == gles11::TEXTURE_ENV || target == gles11::TEXTURE_FILTER_CONTROL_EXT);
+    if target != gles11::TEXTURE_ENV && target != gles11::TEXTURE_FILTER_CONTROL_EXT {
+        return;
+    }
+    if params.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at(params, 4);
         unsafe { gles.TexEnvfv(target, pname, params) }
     })
 }
 fn glTexEnvxv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLfixed>) {
-    assert!(target == gles11::TEXTURE_ENV);
+    if target != gles11::TEXTURE_ENV || params.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at(params, 4);
         unsafe { gles.TexEnvxv(target, pname, params) }
     })
 }
 fn glTexEnviv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLint>) {
-    assert!(target == gles11::TEXTURE_ENV);
+    if target != gles11::TEXTURE_ENV || params.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at(params, 4);
         unsafe { gles.TexEnviv(target, pname, params) }
@@ -3146,9 +2918,8 @@ fn glRenderbufferStorageOES(
     width: GLsizei,
     height: GLsizei,
 ) {
-    let factor = env.options.scale_hack;
-    let scale = |value: GLsizei| (value as f32 * factor).round() as GLsizei;
-    let (width, height) = (scale(width), scale(height));
+    let factor = env.options.scale_hack.get() as GLsizei;
+    let (width, height) = (width * factor, height * factor);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.RenderbufferStorageOES(target, internalformat, width, height)
     })
@@ -3262,50 +3033,18 @@ fn glGetRenderbufferParameterivOES(
     pname: GLenum,
     params: MutPtr<GLint>,
 ) {
-    let factor = env.options.scale_hack;
+    let factor = env.options.scale_hack.get() as GLint;
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at_mut(params, 1);
         unsafe { gles.GetRenderbufferParameterivOES(target, pname, params) };
         if pname == gles11::RENDERBUFFER_WIDTH_OES || pname == gles11::RENDERBUFFER_HEIGHT_OES {
-            unsafe {
-                params.write_unaligned((params.read_unaligned() as f32 / factor).round() as GLint)
-            }
+            unsafe { params.write_unaligned(params.read_unaligned() / factor) }
         }
     })
 }
 fn glCheckFramebufferStatusOES(env: &mut Environment, target: GLenum) -> GLenum {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let status = gles.CheckFramebufferStatusOES(target);
-        if gles.is_es2() && status != gles11::FRAMEBUFFER_COMPLETE_OES {
-            // Some strict Adreno drivers report GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
-            // (0x8CD7) for single-sample FBOs backed by an EAGL drawable renderbuffer,
-            // which makes Unreal Engine 3 games (BioShock) bail out of rendering with
-            // a storm of GL_INVALID_OPERATION/GL_INVALID_FRAMEBUFFER_OPERATION errors.
-            // If the FBO actually has a color attachment with an object bound, treat
-            // it as complete: the attachment set is functional (RGBA8 + depth16).
-            static FORCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let mut color_obj: i32 = 0;
-            gles.GetFramebufferAttachmentParameterivOES(
-                target,
-                gles11::COLOR_ATTACHMENT0_OES,
-                gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
-                &mut color_obj,
-            );
-            while gles.GetError() != 0 {}
-            if color_obj != 0 {
-                let seen = FORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if seen < 8 {
-                    log!(
-                        "[FBO leniency] driver reported incomplete status {:#x} but FBO has color attachment {}; treating as FRAMEBUFFER_COMPLETE (force #{}).",
-                        status,
-                        color_obj,
-                        seen + 1
-                    );
-                }
-                return gles11::FRAMEBUFFER_COMPLETE_OES;
-            }
-        }
-        status
+        gles.CheckFramebufferStatusOES(target)
     })
 }
 fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: ConstPtr<GLuint>) {
@@ -3338,6 +3077,48 @@ fn glIsFramebuffer(env: &mut Environment, framebuffer: GLuint) -> GLboolean {
 fn glIsRenderbuffer(env: &mut Environment, renderbuffer: GLuint) -> GLboolean {
     glIsRenderbufferOES(env, renderbuffer)
 }
+/// Dump raw pixel data (RGB) to a PPM file for diagnosis. Supports the
+/// formats Geometry Dash / cocos2d-x use (RGBA8, RGBA4444, RGB565).
+pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32, path: &str) {
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    match (format, type_) {
+        (0x1908, 0x1401) => {
+            for px in pix.chunks_exact(4) {
+                rgb.extend_from_slice(&[px[0], px[1], px[2]]);
+            }
+        }
+        (0x1908, 0x8033) => {
+            for px in pix.chunks_exact(2) {
+                let v = u16::from_be_bytes([px[0], px[1]]);
+                let r = (((v >> 12) & 0xF) * 17) as u8;
+                let g = (((v >> 8) & 0xF) * 17) as u8;
+                let b = (((v >> 4) & 0xF) * 17) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        (0x1907, 0x8363) => {
+            for px in pix.chunks_exact(2) {
+                let v = u16::from_le_bytes([px[0], px[1]]);
+                let r = (((v >> 11) & 0x1F) * 255 / 31) as u8;
+                let g = (((v >> 5) & 0x3F) * 255 / 63) as u8;
+                let b = ((v & 0x1F) * 255 / 31) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        _ => {
+            log!("dump_rgb_ppm: unsupported format=0x{:x} type=0x{:x}", format, type_);
+            return;
+        }
+    }
+    let header = format!("P6\n{} {}\n255\n", width, height);
+    let mut out = header.into_bytes();
+    out.extend_from_slice(&rgb);
+    match std::fs::write(path, &out) {
+        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path),
+        Err(e) => log!("Failed to dump pixels to {}: {}", path, e),
+    }
+}
+
 fn glBindFramebuffer(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
     glBindFramebufferOES(env, target, framebuffer)
 }
@@ -3444,8 +3225,9 @@ fn glGetBufferParameteriv(
     })
 }
 fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
-    assert!(matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER));
-    assert!(access == WRITE_ONLY_OES);
+    if !matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER) || access != WRITE_ONLY_OES {
+        return nil.cast();
+    }
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
     let host_buffer = with_ctx_and_mem_no_skip(env, |gles, _mem| unsafe {
         gles.MapBufferOES(target, access)
@@ -3453,12 +3235,20 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
     if host_buffer.is_null() {
         nil.cast()
     } else {
-        let buffer_size = _get_buffer_size(env, target) as u32;
-        let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size).cast();
+        let buffer_size = match usize::try_from(_get_buffer_size(env, target)) {
+            Ok(size) => size,
+            Err(_) => {
+                with_ctx_and_mem(env, |gles, _mem| unsafe {
+                    gles.UnmapBufferOES(target);
+                });
+                return nil.cast();
+            }
+        };
+        let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size as GuestUSize).cast();
         unsafe {
             env.mem
-                .bytes_at_mut(guest_buffer.cast(), buffer_size)
-                .copy_from_slice(from_raw_parts(host_buffer as *mut u8, buffer_size as usize));
+                .bytes_at_mut(guest_buffer.cast(), buffer_size as GuestUSize)
+                .copy_from_slice(from_raw_parts(host_buffer as *const u8, buffer_size));
         }
         let Some(current_ctx) = *env
             .framework_state
@@ -3482,9 +3272,9 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
         // close to Apple's lenient behaviour, we unmap the stale mapping
         // (freeing the previous guest mirror) and install the new one so
         // the app can continue uploading data instead of crashing.
-        if let Some((stale_guest_buffer, _stale_host_buffer)) = current_ctx_host_object
+        if let Some((stale_guest_buffer, _stale_host_buffer, _stale_size)) = current_ctx_host_object
             .mapped_buffers
-            .remove(&buffer_object_name)
+            .remove(&(target, buffer_object_name))
         {
             log!(
                 "Warning: glMapBufferOES called on buffer {} that was already mapped; \
@@ -3499,43 +3289,85 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
             });
             // Re-borrow because with_ctx_and_mem dropped our reference.
             let current_ctx_host_object = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
-            current_ctx_host_object
-                .mapped_buffers
-                .insert(buffer_object_name, (guest_buffer, host_buffer));
+            current_ctx_host_object.mapped_buffers.insert(
+                (target, buffer_object_name),
+                (guest_buffer, host_buffer, buffer_size),
+            );
         } else {
-            current_ctx_host_object
-                .mapped_buffers
-                .insert(buffer_object_name, (guest_buffer, host_buffer));
+            current_ctx_host_object.mapped_buffers.insert(
+                (target, buffer_object_name),
+                (guest_buffer, host_buffer, buffer_size),
+            );
         }
         guest_buffer
     }
 }
-fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
+fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let current_ctx = env
+    let Some(current_ctx) = env
         .framework_state
         .opengles
-        .current_ctx_for_thread(env.current_thread);
-    let Some(current_ctx) = current_ctx else {
+        .current_ctx_for_thread(env.current_thread)
+        .as_ref()
+        .copied()
+    else {
         return gles11::FALSE;
     };
     let mapping = env
         .objc
-        .borrow_mut::<EAGLContextHostObject>(*current_ctx)
+        .borrow_mut::<EAGLContextHostObject>(current_ctx)
         .mapped_buffers
-        .remove(&buffer_object_name);
-    let Some((guest_buffer, host_buffer)) = mapping else {
-        return gles11::FALSE;
+        .remove(&(target, buffer_object_name));
+    let Some((guest_buffer, host_buffer, buffer_size)) = mapping else {
+        // An unbalanced unmap (no guest mapping recorded for this buffer):
+        // every driver-side mapping is owned by a recorded guest mapping, so
+        // the buffer cannot be driver-mapped here. Forwarding the call would
+        // only raise a spurious GL_INVALID_OPERATION (seen with Asphalt 8's
+        // Jet engine, which unmaps buffers it failed to map). Treat it as a
+        // no-op reporting success, matching Apple's lenient behaviour.
+        log_dbg!(
+            "glUnmapBuffer{} on buffer {} with no matching mapping; ignoring",
+            if oes { "OES" } else { "" },
+            buffer_object_name
+        );
+        return gles11::TRUE;
     };
-    let buffer_size = _get_buffer_size(env, target) as u32;
     unsafe {
         host_buffer.copy_from(
-            env.mem.bytes_at(guest_buffer.cast(), buffer_size).as_ptr() as *mut GLvoid,
-            buffer_size as usize,
+            env.mem
+                .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
+                .as_ptr() as *mut GLvoid,
+            buffer_size,
         );
     }
     env.mem.free(guest_buffer);
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UnmapBufferOES(target) })
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        let result = if oes {
+            gles.UnmapBufferOES(target)
+        } else {
+            gles.UnmapBuffer(target)
+        };
+        // Strict drivers (e.g. Qualcomm Adreno) can raise GL_INVALID_OPERATION
+        // here even for mappings we believe are balanced, poisoning the error
+        // queue for the app's own glGetError() polling. Apple's unmap never
+        // surfaces such phantom errors, so purge whatever this call raised and
+        // keep reporting success (same lenient philosophy as the unbalanced
+        // unmap path above).
+        let raised = gles.GetError();
+        if raised != 0 {
+            log_dbg!(
+                "glUnmapBuffer{}: driver raised error {:#x} on unmap of target {:#x}; purging (treated as benign)",
+                if oes { "OES" } else { "" },
+                raised,
+                target
+            );
+        }
+        result
+    })
+}
+
+fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
+    unmap_buffer(env, target, true)
 }
 
 // =====================================================================
@@ -3559,26 +3391,15 @@ fn read_guest_cstring(mem: &Mem, ptr: ConstPtr<GLubyte>) -> std::ffi::CString {
 }
 
 fn glCreateProgram(env: &mut Environment) -> GLuint {
-    with_ctx_and_mem(env, |gles, _mem| {
-        let mut result = 0;
-        log_gl_call("glCreateProgram", String::new(), gles, |gles| unsafe {
-            result = gles.CreateProgram();
-        });
-        result
-    })
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.CreateProgram() })
 }
 fn glCreateShader(env: &mut Environment, type_: GLenum) -> GLuint {
-    with_ctx_and_mem(env, |gles, _mem| {
-        let mut result = 0;
-        log_gl_call(
-            "glCreateShader",
-            gl_call_parameters(&[("type", format_gles_enum(type_))]),
-            gles,
-            |gles| unsafe {
-                result = gles.CreateShader(type_);
-            },
-        );
-        result
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        let shader = gles.CreateShader(type_);
+        if shader != 0 {
+            record_shader_type(shader, type_);
+        }
+        shader
     })
 }
 fn glBindAttribLocation(
@@ -3587,20 +3408,14 @@ fn glBindAttribLocation(
     index: GLuint,
     name: ConstPtr<GLubyte>,
 ) {
-    let current_context = env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .unwrap_or(nil);
-    if current_context != nil {
-        env.objc
-            .borrow::<EAGLContextHostObject>(current_context)
-            .guest_bound_attribs
-            .borrow_mut()
-            .insert(program);
-    }
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let cstr = read_guest_cstring(mem, name);
+        let name_str = String::from_utf8_lossy(cstr.as_bytes()).into_owned();
+        shadow
+            .guest_bound_attribs
+            .entry(program)
+            .or_default()
+            .insert(name_str);
         gles.BindAttribLocation(program, index, cstr.as_ptr());
     });
 }
@@ -3613,7 +3428,18 @@ fn glGetAttribLocation(env: &mut Environment, program: GLuint, name: ConstPtr<GL
 fn glGetUniformLocation(env: &mut Environment, program: GLuint, name: ConstPtr<GLubyte>) -> GLint {
     with_ctx_and_mem_no_skip(env, |gles, mem| unsafe {
         let cstr = read_guest_cstring(mem, name);
-        gles.GetUniformLocation(program, cstr.as_ptr())
+        let loc = gles.GetUniformLocation(program, cstr.as_ptr());
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 64 {
+                log!(
+                    "[ES2DIAG] glGetUniformLocation(program={}, \"{}\") = {}",
+                    program,  String::from_utf8_lossy(cstr.as_bytes()).to_string(), loc
+                );
+            }
+        }
+        loc
     })
 }
 fn glUniformMatrix2fv(
@@ -3652,45 +3478,40 @@ fn glUniformMatrix4fv(
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let n = (count as usize) * 16;
         let ptr = mem.ptr_at(value, n.try_into().unwrap_or(0));
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") && location >= 0 {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if seen < 8 {
+                let mut m = [0.0_f32; 16];
+                std::ptr::copy_nonoverlapping(ptr, m.as_mut_ptr(), 16);
+                log!(
+                    "[ES2DIAG] glUniformMatrix4fv(loc={}, count={}, transpose={}, m0={:?})",
+                    location, count, transpose, m
+                );
+            }
+        }
         gles.UniformMatrix4fv(location, count, transpose, ptr);
     });
 }
 fn glUseProgram(env: &mut Environment, program: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| {
-        log_gl_call(
-            "glUseProgram",
-            gl_call_parameters(&[("program", program.to_string())]),
-            gles,
-            |gles| unsafe { gles.UseProgram(program) },
-        );
-    });
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UseProgram(program) });
 }
 fn glDeleteProgram(env: &mut Environment, program: GLuint) {
-    let current_context = env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .unwrap_or(nil);
-    if current_context != nil {
-        env.objc
-            .borrow::<EAGLContextHostObject>(current_context)
-            .guest_bound_attribs
-            .borrow_mut()
-            .remove(&program);
-    }
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.DeleteProgram(program) });
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow.guest_bound_attribs.remove(&program);
+        record_program_deleted(program);
+        gles.DeleteProgram(program)
+    });
 }
 fn glDeleteShader(env: &mut Environment, shader: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.DeleteShader(shader) });
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        record_shader_deleted(shader);
+        gles.DeleteShader(shader)
+    });
 }
 fn glCompileShader(env: &mut Environment, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        log_gl_call(
-            "glCompileShader",
-            gl_call_parameters(&[("shader", shader.to_string())]),
-            gles,
-            |gles| gles.CompileShader(shader),
-        );
+        gles.CompileShader(shader);
         let mut ok: GLint = 0;
         gles.GetShaderiv(shader, 0x8B81 /* GL_COMPILE_STATUS */, &mut ok);
         if ok == 0 {
@@ -3738,47 +3559,116 @@ fn glGetShaderPrecisionFormat(
 }
 fn glAttachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.AttachShader(program, shader)
+        gles.AttachShader(program, shader);
+        record_shader_attach(program, shader);
     });
 }
 fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.DetachShader(program, shader)
+        gles.DetachShader(program, shader);
+        record_shader_detach(program, shader);
     });
 }
-const GEOMETRY_DASH_ES2_ATTRIBUTE_BINDINGS: &[(GLuint, &[u8])] = &[
-    (0, b"a_position\0"),
-    (1, b"a_color\0"),
-    (2, b"a_texCoord\0"),
-];
-
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
-    let is_geometry_dash =
-        cfg!(target_os = "android") && env.bundle.bundle_identifier() == "com.robtop.geometryjump";
-    let current_context = env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .unwrap_or(nil);
-    let guest_bound = current_context != nil
-        && env
-            .objc
-            .borrow::<EAGLContextHostObject>(current_context)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        // If the app explicitly bound attribute locations for this program,
+        // respect them: forcing canonical bindings here would override the
+        // app's own vertex layout (on real hardware, app bindings made before
+        // glLinkProgram win, so our injected bindings must not clobber them).
+        let app_bound = shadow
             .guest_bound_attribs
-            .borrow()
-            .contains(&program);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        if gles.is_es2() && is_geometry_dash && !guest_bound {
-            for &(index, name) in GEOMETRY_DASH_ES2_ATTRIBUTE_BINDINGS {
-                gles.BindAttribLocation(program, index, name.as_ptr() as *const _);
+            .get(&program)
+            .map_or(false, |names| !names.is_empty());
+        if gles.is_es2() && !app_bound {
+            for (index, names) in [
+                (
+                    0,
+                    &[
+                        "position",
+                        "a_position",
+                        "inPos",
+                        "aPosition",
+                        "inPosition",
+                        "rm_Vertex",
+                    ][..],
+                ),
+                (
+                    1,
+                    &["normal", "a_normal", "aNormal", "inNormal", "rm_Normal"][..],
+                ),
+                (
+                    1,
+                    &["a_color"][..],
+                ),
+                (
+                    2,
+                    &["color", "aColor", "inColor", "inVtxColor", "rm_Color", "a_texCoord"][..],
+                ),
+                (
+                    3,
+                    &[
+                        "texCoord",
+                        "texcoord",
+                        "inUV0",
+                        "aTexCoord",
+                        "inTexCoord",
+                        "rm_TexCoord0",
+                    ][..],
+                ),
+                (
+                    4,
+                    &[
+                        "texCoord1",
+                        "a_texCoord1",
+                        "aTexCoord1",
+                        "inTexCoord1",
+                        "rm_TexCoord1",
+                    ][..],
+                ),
+                (
+                    5,
+                    &[
+                        "tangent",
+                        "a_tangent",
+                        "aTangent",
+                        "inTangent",
+                        "rm_Tangent",
+                    ][..],
+                ),
+                (
+                    6,
+                    &[
+                        "binormal",
+                        "a_binormal",
+                        "aBinormal",
+                        "inBinormal",
+                        "rm_Binormal",
+                    ][..],
+                ),
+            ] {
+                for name in names {
+                    let name = std::ffi::CString::new(*name).unwrap();
+                    gles.BindAttribLocation(program, index, name.as_ptr());
+                }
             }
         }
-        log_gl_call(
-            "glLinkProgram",
-            gl_call_parameters(&[("program", program.to_string())]),
-            gles,
-            |gles| gles.LinkProgram(program),
-        );
+        if gles.is_es2() {
+            // Strict linkers also reject uniform arrays whose element count
+            // differs between stages (lenient PowerVR drivers accepted it);
+            // Gangstar Rio trips this with its `light` array. Rewrite both
+            // stages to the max size before anything else touches them.
+            reconcile_uniform_array_sizes(gles, program);
+            // Strict linkers also compare *struct member lists* of uniforms
+            // shared between stages ("Field numbers of uniform 'X' differ…");
+            // unify differing struct definitions to their member union.
+            reconcile_uniform_struct_definitions(gles, program);
+            // Strict linkers (ANGLE) reject programs whose fragment shader
+            // declares varyings the vertex shader doesn't (legal-but-undefined
+            // on real iPhone-era hardware). Patch the vertex shader first so
+            // the link below succeeds; see `fix_fragment_only_varyings`.
+            fix_fragment_only_varyings(gles, program);
+        }
+        gles.LinkProgram(program);
         let mut ok: GLint = 0;
         gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
         if ok == 0 {
@@ -3790,7 +3680,26 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                 len as usize,
             ))
             .unwrap_or("?");
-            log!("Program {} link failed: {}", program, s);
+            // Last resort: the pre-link pass may have missed a fragment-only
+            // varying (e.g. exotic source layout). Use the names the driver
+            // itself reported and retry the link once.
+            if gles.is_es2() && inject_driver_reported_varyings(gles, program, s) {
+                gles.LinkProgram(program);
+                gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
+                if ok != 0 {
+                    log!(
+                        "Program {} linked successfully after injecting \
+                         driver-reported fragment-only varyings",
+                        program
+                    );
+                }
+            }
+            if ok == 0 {
+                log!("Program {} link failed: {}", program, s);
+                if s.contains("Field numbers of uniform") {
+                    log_uniform_array_declarations(program);
+                }
+            }
         }
     });
 }
@@ -3804,11 +3713,6 @@ fn glIsProgram(env: &mut Environment, program: GLuint) -> GLboolean {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsProgram(program) })
 }
 fn glGetShaderiv(env: &mut Environment, shader: GLuint, pname: GLenum, params: MutPtr<GLint>) {
-    log_once_fmt!(
-        "[GLES] glGetShaderiv is active (first shader={}, pname=0x{:x}); repeated query logging is suppressed",
-        shader,
-        pname
-    );
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let mut val: GLint = 0;
         gles.GetShaderiv(shader, pname, &mut val);
@@ -3883,12 +3787,6 @@ fn glGetShaderInfoLog(
     });
 }
 fn glGetProgramiv(env: &mut Environment, program: GLuint, pname: GLenum, params: MutPtr<GLint>) {
-    log_once_fmt!(
-        "[GLES] glGetProgramiv is active (first program={}, pname=0x{:x}); repeated query logging is suppressed",
-        program,
-        pname
-    );
-
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let mut val: GLint = 0;
         gles.GetProgramiv(program, pname, &mut val);
@@ -5146,41 +5044,10 @@ fn log_uniform_array_declarations(program: GLuint) {
     );
 }
 
-/// Last-resort fix-up: if a link still failed, parse varying names reported
-/// by the driver (ANGLE: `FRAGMENT varying <name> does not match any VERTEX
-/// varying`; Mesa: `fragment shader input '<name>' has no matching output in
-/// the previous stage`), look their types up in the recorded fragment source
-/// and inject them into the vertex shader. The caller re-links afterwards.
-fn parse_driver_reported_varying_names(info_log: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in info_log.lines() {
-        let marker = if line.contains("FRAGMENT varying")
-            && line.contains("does not match any VERTEX varying")
-        {
-            "FRAGMENT varying"
-        } else if line.contains("fragment shader input")
-            && line.contains("has no matching output in the previous stage")
-        {
-            "fragment shader input"
-        } else {
-            continue;
-        };
-        let Some(index) = line.find(marker) else {
-            continue;
-        };
-        let rest = line[index + marker.len()..].trim_start();
-        let rest = rest.trim_start_matches(|c| matches!(c, '\'' | '"' | '`'));
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() && !names.contains(&name) {
-            names.push(name);
-        }
-    }
-    names
-}
-
+/// Last-resort fix-up: if a link still failed, parse the varying names the
+/// driver complained about ("FRAGMENT varying <name> does not match any
+/// VERTEX varying"), look their types up in the recorded fragment source and
+/// inject them into the vertex shader. The caller re-links afterwards.
 unsafe fn inject_driver_reported_varyings(
     gles: &mut dyn GLES,
     program: GLuint,
@@ -5189,7 +5056,17 @@ unsafe fn inject_driver_reported_varyings(
     const VERTEX_SHADER: GLuint = 0x8B31;
     const FRAGMENT_SHADER: GLuint = 0x8B30;
 
-    let names = parse_driver_reported_varying_names(info_log);
+    let mut names: Vec<String> = Vec::new();
+    for (i, _) in info_log.match_indices("FRAGMENT varying") {
+        let rest = info_log[i + "FRAGMENT varying".len()..].trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
     if names.is_empty() {
         return false;
     }
@@ -5292,26 +5169,33 @@ fn glShaderSource(
     //    uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
     let src = String::from_utf8_lossy(&raw_source);
     let src = normalize_shader_preprocessor_whitespace(&src);
-    let src = strip_captain_tomato_shader_precision(&src);
-    if std::env::var_os("TOUCHHLE_TRACE_SHADER_SOURCE").is_some() {
-        log!("[GLES SHADER SOURCE] shader={} bytes={}", shader, src.len());
-        for (line_number, line) in src.lines().take(256).enumerate() {
-            log!("[GLES SHADER SOURCE] {:03}: {}", line_number + 1, line);
-        }
-        if src.lines().count() > 256 {
-            log!("[GLES SHADER SOURCE] further lines suppressed after 256");
-        }
-    }
-    let bytes_vec = src.into_bytes();
+    let src = normalize_asphalt8_shader_source(&src);
+    // 3. Hoist `#extension` directives to the top — strict compilers (ANGLE
+    //    etc.) reject them after non-preprocessor tokens; see
+    //    `hoist_shader_extension_directives`.
+    let src = hoist_shader_extension_directives(&src);
+    let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
     let ptr = cs.as_ptr();
+    // Remember what we submitted so `fix_fragment_only_varyings` can rewrite
+    // the vertex shader at link time without depending on optional backend
+    // entry points (GetShaderSource / GetAttachedShaders are unimplemented
+    // on some backends, e.g. GLES2Native's GetAttachedShaders panics).
+    record_shader_source(
+        shader,
+        String::from_utf8_lossy(cs.as_bytes()).into_owned(),
+    );
+    if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
+        let _ = std::fs::write(format!("/tmp/a8run/shader_{}.glsl", shader), cs.as_bytes());
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.ShaderSource(shader, 1, &ptr, std::ptr::null());
     });
 }
 fn glEnableVertexAttribArray(env: &mut Environment, index: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow.generic_attribs_used = true;
         gles.EnableVertexAttribArray(index)
     });
 }
@@ -5333,10 +5217,8 @@ fn glVertexAttribPointer(
     // buffer (not as a pointer into client memory) and we can pass it through
     // as-is. Otherwise we need to translate the guest pointer to a host
     // pointer.
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let mut bound: GLint = 0;
-        gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound);
-        let host_ptr = if bound == 0 {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let host_ptr = if !buffer_is_bound(gles, shadow, ARRAY_BUFFER) {
             if pointer.is_null() {
                 std::ptr::null()
             } else {
@@ -5776,7 +5658,9 @@ fn glGenVertexArrays(env: &mut Environment, n: GLsizei, arrays: MutPtr<GLuint>) 
 fn glBindVertexArray(env: &mut Environment, array: GLuint) {
     let is_es3 = with_ctx_and_mem(env, |gles, _mem| gles.is_es3());
     if is_es3 {
-        with_ctx_and_mem(env, |gles, _mem| unsafe {
+        with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+            // The element array buffer binding is VAO state.
+            shadow.invalidate_vao_state();
             gles.BindVertexArray(array);
         });
     } else {
@@ -5786,7 +5670,8 @@ fn glBindVertexArray(env: &mut Environment, array: GLuint) {
 fn glDeleteVertexArrays(env: &mut Environment, n: GLsizei, arrays: ConstPtr<GLuint>) {
     let is_es3 = with_ctx_and_mem(env, |gles, _mem| gles.is_es3());
     if is_es3 {
-        with_ctx_and_mem(env, |gles, mem| unsafe {
+        with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+            shadow.invalidate_vao_state();
             let slice = mem.bytes_at(arrays.cast(), (n as GuestUSize) * 4);
             gles.DeleteVertexArrays(n, slice.as_ptr().cast());
         });
@@ -5807,7 +5692,7 @@ fn glIsVertexArray(env: &mut Environment, array: GLuint) -> GLboolean {
 /// `glUnmapBufferOES` is the matching entry point — share the existing
 /// implementation since the buffer-mapping bookkeeping is identical.
 fn glUnmapBuffer(env: &mut Environment, target: GLenum) -> GLboolean {
-    glUnmapBufferOES(env, target)
+    unmap_buffer(env, target, false)
 }
 
 // ===== OpenGL ES 3.0 guest dispatchers =====
@@ -5841,21 +5726,36 @@ fn glMapBufferRange(
     if host_ptr.is_null() || length == 0 {
         return Ptr::null();
     }
-    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length as GuestUSize).cast();
+    let length_usize = match usize::try_from(length) {
+        Ok(size) => size,
+        Err(_) => return Ptr::null(),
+    };
+    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length_usize as GuestUSize).cast();
     unsafe {
-        let host_slice = from_raw_parts(host_ptr as *const u8, length as usize);
-        let guest_slice = env.mem.bytes_at_mut(guest_buf.cast(), length as GuestUSize);
+        let host_slice = from_raw_parts(host_ptr as *const u8, length_usize);
+        let guest_slice = env
+            .mem
+            .bytes_at_mut(guest_buf.cast(), length_usize as GuestUSize);
         guest_slice.copy_from_slice(host_slice);
     }
     let current_ctx: Option<crate::objc::id> = *env
         .framework_state
         .opengles
         .current_ctx_for_thread(env.current_thread);
-    if let Some(ctx) = current_ctx {
-        let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
-        host_obj
-            .mapped_buffers
-            .insert(target, (guest_buf, host_ptr));
+    let Some(ctx) = current_ctx else {
+        env.mem.free(guest_buf);
+        with_ctx_and_mem(env, |gles, _mem| unsafe {
+            gles.UnmapBuffer(target);
+        });
+        return Ptr::null();
+    };
+    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
+    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
+    if let Some((old_guest_buf, _, _)) = host_obj.mapped_buffers.insert(
+        (target, buffer_object_name),
+        (guest_buf, host_ptr, length_usize),
+    ) {
+        env.mem.free(old_guest_buf);
     }
     guest_buf.cast()
 }
@@ -5873,22 +5773,33 @@ fn glFlushMappedBufferRange(
         .opengles
         .current_ctx_for_thread(env.current_thread);
     if let Some(ctx) = current_ctx {
+        let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
         let mapping = env
             .objc
             .borrow::<EAGLContextHostObject>(ctx)
             .mapped_buffers
-            .get(&target)
+            .get(&(target, buffer_object_name))
             .copied();
-        if let Some((guest_buf, host_ptr)) = mapping {
-            let guest_slice = env
-                .mem
-                .bytes_at(guest_buf.cast(), (offset + length) as GuestUSize);
+        if let Some((guest_buf, host_ptr, mapped_size)) = mapping {
+            let offset_usize = match usize::try_from(offset) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let length_usize = match usize::try_from(length) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let end = match offset_usize.checked_add(length_usize) {
+                Some(value) if value <= mapped_size => value,
+                _ => return,
+            };
+            let guest_slice = env.mem.bytes_at(guest_buf.cast(), end as GuestUSize);
             unsafe {
                 let host_slice = std::slice::from_raw_parts_mut(
-                    (host_ptr as *mut u8).add(offset as usize),
-                    length as usize,
+                    (host_ptr as *mut u8).add(offset_usize),
+                    length_usize,
                 );
-                host_slice.copy_from_slice(&guest_slice[offset as usize..]);
+                host_slice.copy_from_slice(&guest_slice[offset_usize..end]);
             }
         }
     }
@@ -6273,9 +6184,24 @@ fn glTexStorage2D(
     width: GLsizei,
     height: GLsizei,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.TexStorage2D(target, levels, internalformat, width, height)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.TexStorage2D(target, levels, internalformat, width, height);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture(texture);
+        }
     });
+}
+
+fn glTexStorage2DEXT(
+    env: &mut Environment,
+    target: GLenum,
+    levels: GLsizei,
+    internalformat: GLenum,
+    width: GLsizei,
+    height: GLsizei,
+) {
+    glTexStorage2D(env, target, levels, internalformat, width, height);
 }
 
 fn glTexStorage3D(
@@ -6333,8 +6259,16 @@ fn glGetQueryObjectuiv(env: &mut Environment, id: GLuint, pname: GLenum, params:
     });
 }
 
-// EXT_occlusion_query_boolean / EXT_texture_storage aliases (same semantics
-// as their core GLES2 counterparts on the host drivers we support).
+// -- Boolean occlusion queries (GL_EXT_occlusion_query_boolean) --
+// The `*EXT` entry points are the OpenGL ES 2.0 form of the boolean occlusion
+// query API. They are semantically identical to the ES 3.0 core query objects
+// (only the accepted `target`s differ: GL_ANY_SAMPLES_PASSED_EXT and
+// GL_ANY_SAMPLES_PASSED_CONSERVATIVE_EXT), so each `*EXT` wrapper forwards to
+// the same backend trait method as its core counterpart. iPhone OS games such
+// as Rush Rally 2 link against these symbols directly, so they must be exported
+// or the dynamic linker leaves the guest's function pointer null and the app
+// jumps to a null address on launch.
+// Reference: https://registry.khronos.org/OpenGL/extensions/EXT/EXT_occlusion_query_boolean.txt
 fn glGenQueriesEXT(env: &mut Environment, n: GLsizei, ids: MutPtr<GLuint>) {
     glGenQueries(env, n, ids)
 }
@@ -6366,17 +6300,6 @@ fn glGetQueryObjectuivEXT(
     params: MutPtr<GLuint>,
 ) {
     glGetQueryObjectuiv(env, id, pname, params)
-}
-
-fn glTexStorage2DEXT(
-    env: &mut Environment,
-    target: GLenum,
-    levels: GLsizei,
-    internalformat: GLenum,
-    width: GLsizei,
-    height: GLsizei,
-) {
-    glTexStorage2D(env, target, levels, internalformat, width, height)
 }
 
 // -- Sampler objects --
@@ -7164,35 +7087,33 @@ fn glProgramParameteri(env: &mut Environment, program: GLuint, pname: GLenum, va
     });
 }
 
-unsafe fn clamp_fog_state_values(gles: &mut dyn GLES) -> Option<(f32, f32)> {
-    if gles.is_es2() {
+/// Work around the fog-division-by-zero problem: with linear fog and
+/// `GL_FOG_START == GL_FOG_END`, the fog factor `(end - z) / (end - start)`
+/// is NaN. Apple's PowerVR driver tolerates that, desktop GL drivers turn it
+/// into garbage (black or fully fogged geometry), so nudge the range apart
+/// for the duration of the draw.
+///
+/// PERF: this used to query `GL_FOG`, `GL_FOG_START` and `GL_FOG_END` from the
+/// driver (plus two `glGetError()` round-trips to swallow the errors strict
+/// drivers raise) on every single draw call. The guest is the only thing that
+/// can change that state, so it's answered from the [GLShadowState] mirror
+/// now, which costs nothing when fog is off (the overwhelmingly common case).
+unsafe fn clamp_fog_state_values(
+    gles: &mut dyn GLES,
+    shadow: &GLShadowState,
+) -> Option<(f32, f32)> {
+    if !shadow.fog_enabled {
         return None;
     }
-    let mut fog_enabled: GLboolean = 0;
-    gles.GetBooleanv(gles11::FOG, &mut fog_enabled);
-    if gles.GetError() != 0 {
-        return None;
-    }
-    let mut fog_start: GLfloat = 0.0;
-    let mut fog_end: GLfloat = 0.0;
-    gles.GetFloatv(gles11::FOG_START, &mut fog_start);
-    gles.GetFloatv(gles11::FOG_END, &mut fog_end);
-    if gles.GetError() != 0 {
-        return None;
-    }
-    if fog_enabled != 0 && fog_start == fog_end {
+    let (fog_start, fog_end) = (shadow.fog_start, shadow.fog_end);
+    if fog_start == fog_end {
         let new_fog_start = fog_end - 0.001;
         gles.Fogf(gles11::FOG_START, new_fog_start);
-        if gles.GetError() == 0 {
-            return Some((fog_start, fog_end));
-        }
+        return Some((fog_start, fog_end));
     }
     None
 }
 unsafe fn restore_fog_state_values(gles: &mut dyn GLES, from_backup: Option<(f32, f32)>) {
-    if gles.is_es2() {
-        return;
-    }
     if let Some((fog_start, fog_end)) = from_backup {
         gles.Fogf(gles11::FOG_START, fog_start);
         gles.Fogf(gles11::FOG_END, fog_end);
@@ -7550,6 +7471,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glTexSubImage3D(_, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(glCopyTexSubImage3D(_, _, _, _, _, _, _, _, _)),
     export_c_func!(glTexStorage2D(_, _, _, _, _)),
+    export_c_func!(glTexStorage2DEXT(_, _, _, _, _)),
     export_c_func!(glTexStorage3D(_, _, _, _, _, _)),
     export_c_func!(glGenQueries(_, _)),
     export_c_func!(glDeleteQueries(_, _)),
@@ -7558,6 +7480,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glEndQuery(_)),
     export_c_func!(glGetQueryiv(_, _, _)),
     export_c_func!(glGetQueryObjectuiv(_, _, _)),
+    // GL_EXT_occlusion_query_boolean (OpenGL ES 2.0 boolean occlusion queries)
     export_c_func!(glGenQueriesEXT(_, _)),
     export_c_func!(glDeleteQueriesEXT(_, _)),
     export_c_func!(glIsQueryEXT(_)),
@@ -7565,7 +7488,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glEndQueryEXT(_)),
     export_c_func!(glGetQueryivEXT(_, _, _)),
     export_c_func!(glGetQueryObjectuivEXT(_, _, _)),
-    export_c_func!(glTexStorage2DEXT(_, _, _, _, _)),
     export_c_func!(glGenSamplers(_, _)),
     export_c_func!(glDeleteSamplers(_, _)),
     export_c_func!(glIsSampler(_)),
@@ -7641,34 +7563,69 @@ pub const FUNCTIONS: FunctionExports = &[
 ];
 
 #[cfg(test)]
-mod shader_preprocessor_normalization_tests {
-    use super::normalize_shader_preprocessor_whitespace;
-    use super::override_texture_filter_value;
+mod pvrtc_subimage_matching_tests {
+    use super::pvrtc_subimage_matches_level;
     use crate::gles::gles11_raw as gles11;
-    use crate::options::TextureFiltering;
 
     #[test]
-    fn texture_filter_overrides_are_scoped_to_filter_parameters() {
-        assert_eq!(
-            override_texture_filter_value(
-                TextureFiltering::Bilinear,
-                gles11::TEXTURE_MIN_FILTER,
-                gles11::NEAREST_MIPMAP_LINEAR as i32,
-            ),
-            gles11::LINEAR as i32
-        );
-        assert_eq!(
-            override_texture_filter_value(TextureFiltering::Trilinear, 0x2802, 7),
-            7
-        );
-        assert_eq!(
-            override_texture_filter_value(
-                TextureFiltering::Trilinear,
-                gles11::TEXTURE_MIN_FILTER,
-                gles11::NEAREST as i32,
-            ),
-            gles11::LINEAR_MIPMAP_LINEAR as i32
-        );
+    fn accepts_only_a_full_update_of_the_tracked_pvrtc_level() {
+        let level = Some((2048, 2048, gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG));
+        assert!(pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            1024,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            4,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            None,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod shader_preprocessor_normalization_tests {
+    use super::{normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace};
+
+    #[test]
+    fn normalizes_asphalt8_multiline_and_numeric_shader_tokens() {
+        let src = "#if FOO ||\n BAR\n#endif]\nvec3(1,1,1); vec4(0.5, 0, 0, 0);";
+        let out = normalize_asphalt8_shader_source(src);
+        assert!(out.contains("FOO ||"));
+        assert!(!out.contains("||\n"));
+        assert!(out.contains("#endif\n"));
+        assert!(out.contains("vec3(1.0, 1.0, 1.0)"));
+        assert!(out.contains("vec4(0.5, 0.0, 0.0, 0.0)"));
     }
 
     #[test]
@@ -7894,23 +7851,6 @@ mod uniform_array_reconciliation_tests {
         assert_eq!(defs.len(), 1);
         let (start, end) = defs[0].body_span;
         assert_eq!(&src[start..end], "{ float a; }");
-    }
-
-    #[test]
-    fn fragment_varying_link_errors_are_parsed_for_angle_and_mesa() {
-        let log = "FRAGMENT varying vTexCoord does not match any VERTEX varying\n\
-                   error: fragment shader input `vAlpha` has no matching output in the previous stage\n\
-                   error: fragment shader input `vAlpha` has no matching output in the previous stage";
-        assert_eq!(
-            super::parse_driver_reported_varying_names(log),
-            vec!["vTexCoord".to_string(), "vAlpha".to_string()]
-        );
-    }
-
-    #[test]
-    fn unrelated_link_errors_do_not_trigger_varying_repair() {
-        let log = "error: fragment shader input `vAlpha` has an unsupported type";
-        assert!(super::parse_driver_reported_varying_names(log).is_empty());
     }
 
     #[test]

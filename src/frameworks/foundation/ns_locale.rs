@@ -151,7 +151,7 @@ fn get_preferred_languages(env: &mut Environment) -> Vec<String> {
         log!("The app requested your preferred languages. No information could be retrieved, so {:?} (English) will be reported.", lang);
         vec![lang]
     } else {
-        log!("The app requested your preferred languages. {:?} will be reported based on your system language preferences.", languages);
+        log_dbg!("The app requested your preferred languages. {:?} will be reported based on your system language preferences.", languages);
         languages
     }
 }
@@ -172,7 +172,7 @@ fn get_preferred_countries(env: &mut Environment) -> Vec<String> {
         log!("The app requested your current locale. No country information could be retrieved, so {:?} will be reported.", country);
         vec![country]
     } else {
-        log!("The app requested your current locale. {:?} will be reported based on your system region settings.", countries);
+        log_dbg!("The app requested your current locale. {:?} will be reported based on your system region settings.", countries);
         countries
     }
 }

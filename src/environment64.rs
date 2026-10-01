@@ -883,16 +883,12 @@ pub fn run(
                 );
             }
         }
-        match crate::window::Window::new(
+        Some(Box::new(crate::window::Window::new(
             "MetalHLE 1.0 ARM64",
             None,
             None,
             &window_options,
-            None,
-        ) {
-            Ok(window) => Some(Box::new(window)),
-            Err(err) => return Err(err),
-        }
+        )))
     };
     echo!(
         "ARM64 device selected: {} ({})",

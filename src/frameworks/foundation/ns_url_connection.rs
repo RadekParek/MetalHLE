@@ -6,24 +6,27 @@
 
 //! `NSURLConnection`.
 //!
-//! Requests use the host's network when the emulator's network option is
-//! enabled. Host failures are converted into the normal Foundation error
-//! callback instead of hanging or crashing the guest.
+//! This is a stub implementation that does not perform real networking.
+//!
+//! Synchronous requests return empty NSData with a descriptive NSError.
+//! Asynchronous connections immediately call `connection:didFailWithError:`
+//! on the delegate (if it implements that method) so the app can handle
+//! the failure gracefully instead of hanging or crashing.
 //!
 //! For block-based API (`sendAsynchronousRequest:queue:completionHandler:`),
 //! we deliver an NSError to the completion handler so the app can handle
 //! the offline state gracefully (e.g. Sonic Runners shows "Error" and retries).
 //!
-//! The compatibility profile can still request a deliberately synthetic 200
-//! response for apps that need that legacy behaviour.
+//! NOTE: Returning fake 200 OK with empty JSON `{}` causes crashes in games
+//! like Sonic Runners which try to parse specific server-protocol fields from
+//! the response body. Returning an error is always safe — all tested games
+//! handle NSURLErrorNotConnectedToInternet gracefully.
 
-use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr};
+use crate::mem::{MutPtr, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
 };
-use std::io::Read;
-use std::time::Duration;
 
 // NSError domain / code used when reporting "no network in emulator".
 const NS_URL_ERROR_DOMAIN: &str = "NSURLErrorDomain";
@@ -31,258 +34,6 @@ const NS_URL_ERROR_NOT_CONNECTED_TO_INTERNET: i32 = -1009;
 
 fn fake_network_success_enabled() -> bool {
     std::env::var_os("TOUCHHLE_FAKE_NETWORK_SUCCESS").is_some()
-}
-fn is_optional_unity_telemetry(method: &str, url: &str) -> bool {
-    method.eq_ignore_ascii_case("POST")
-        && (url.starts_with("http://stats.unity3d.com/")
-            || url.starts_with("https://stats.unity3d.com/"))
-}
-
-pub(crate) fn log_request_failure(error: &str) {
-    if error.contains("Dns Failed") || error.contains("failed to lookup address information") {
-        log_once_fmt!(
-            "NSURLConnection: request failed: {} [repeated DNS failures suppressed]",
-            error
-        );
-    } else {
-        log_once_fmt!(
-            "NSURLConnection: request failed: {} [repeated transport failures suppressed]",
-            error
-        );
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct NetworkResponse {
-    pub(crate) status_code: u16,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
-}
-
-pub(crate) fn perform_request(
-    env: &mut crate::Environment,
-    request: id,
-) -> Result<NetworkResponse, String> {
-    if request == nil {
-        return Err("request is nil".to_string());
-    }
-    if !env.ensure_network_access("NSURLConnection") {
-        return Err("network access is disabled".to_string());
-    }
-
-    let url_object: id = msg![env; request URL];
-    if url_object == nil {
-        return Err("request URL is nil".to_string());
-    }
-    let absolute_string: id = msg![env; url_object absoluteString];
-    let url =
-        crate::frameworks::foundation::ns_string::to_rust_string(env, absolute_string).into_owned();
-    if url.is_empty() {
-        return Err("request URL is empty".to_string());
-    }
-
-    let method_object: id = msg![env; request HTTPMethod];
-    let method =
-        crate::frameworks::foundation::ns_string::to_rust_string(env, method_object).into_owned();
-    let method = if method.is_empty() {
-        "GET".to_string()
-    } else {
-        method
-    };
-    let timeout: f64 = msg![env; request timeoutInterval];
-    let timeout = timeout.clamp(1.0, 20.0);
-
-    let body_object: id = msg![env; request HTTPBody];
-    let body_length: u32 = if body_object == nil {
-        0
-    } else {
-        msg![env; body_object length]
-    };
-    let body = if body_length == 0 {
-        Vec::new()
-    } else {
-        let bytes: ConstVoidPtr = msg![env; body_object bytes];
-        env.mem.bytes_at(bytes.cast::<u8>(), body_length).to_vec()
-    };
-
-    let mut request_headers = Vec::new();
-    let header_fields: id = msg![env; request allHTTPHeaderFields];
-    if header_fields != nil {
-        let keys: id = msg![env; header_fields allKeys];
-        let key_count: u32 = msg![env; keys count];
-        for index in 0..key_count {
-            let key: id = msg![env; keys objectAtIndex:index];
-            let value: id = msg![env; header_fields objectForKey:key];
-            if key != nil && value != nil {
-                let key =
-                    crate::frameworks::foundation::ns_string::to_rust_string(env, key).into_owned();
-                let value = crate::frameworks::foundation::ns_string::to_rust_string(env, value)
-                    .into_owned();
-                if !key.is_empty() && !value.is_empty() {
-                    request_headers.push((key, value));
-                }
-            }
-        }
-    }
-
-    perform_http_request(&method, &url, timeout, &request_headers, &body)
-}
-
-pub(crate) fn perform_http_request(
-    method: &str,
-    url: &str,
-    timeout: f64,
-    request_headers: &[(String, String)],
-    body: &[u8],
-) -> Result<NetworkResponse, String> {
-    if is_optional_unity_telemetry(method, url) {
-        log_once!("NSURLConnection: ignoring optional Unity telemetry upload to stats.unity3d.com");
-        return Ok(NetworkResponse {
-            status_code: 204,
-            headers: Vec::new(),
-            body: Vec::new(),
-        });
-    }
-
-    let method = if method.is_empty() { "GET" } else { method };
-    let timeout = timeout.clamp(1.0, 20.0);
-    log_once_fmt!("Foundation networking: sending {} {}", method, url);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs_f64(timeout))
-        .build();
-    let mut builder = agent.request(method, url);
-    let has_user_agent = request_headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("User-Agent"));
-    for (name, value) in request_headers {
-        builder = builder.set(name, value);
-    }
-    if !has_user_agent {
-        builder = builder.set("User-Agent", "MetalHLE 1.0");
-    }
-    let result = if body.is_empty() && method.eq_ignore_ascii_case("GET") {
-        builder.call()
-    } else {
-        builder.send_bytes(body)
-    };
-    let response = match result {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(error) => return Err(error.to_string()),
-    };
-    let status_code = response.status() as u16;
-    let headers = response
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| {
-            response
-                .header(&name)
-                .map(|value| (name, value.to_string()))
-        })
-        .collect();
-    let mut response_body = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut response_body)
-        .map_err(|error| error.to_string())?;
-    log_sampled!(
-        16,
-        "Foundation networking: received HTTP {} ({} bytes)",
-        status_code,
-        response_body.len()
-    );
-    Ok(NetworkResponse {
-        status_code,
-        headers,
-        body: response_body,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::perform_http_request;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
-
-    #[test]
-    fn http_request_returns_response_body_and_status() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"time\":123}",
-                )
-                .unwrap();
-        });
-        let response = perform_http_request(
-            "GET",
-            &format!("http://{address}/identity/2.0/time"),
-            2.0,
-            &[],
-            &[],
-        )
-        .unwrap();
-        server.join().unwrap();
-        assert_eq!(response.status_code, 200);
-        assert_eq!(response.body, b"{\"time\":123}");
-    }
-}
-
-pub(crate) fn make_data_from_bytes(env: &mut crate::Environment, body: &[u8]) -> id {
-    if body.is_empty() {
-        return msg_class![env; NSData data];
-    }
-    let length: u32 = body.len().try_into().unwrap_or(u32::MAX);
-    let buffer = env.mem.alloc(length);
-    if buffer.is_null() {
-        log!(
-            "NSURLConnection: response body allocation failed for {:#x} bytes; delivering empty NSData",
-            length
-        );
-        return msg_class![env; NSData data];
-    }
-    env.mem
-        .bytes_at_mut(buffer.cast(), length)
-        .copy_from_slice(&body[..length as usize]);
-    let bytes: ConstVoidPtr = buffer.cast_const().cast_void();
-    let data: id = msg_class![env; NSData dataWithBytes:bytes length:length];
-    env.mem.free(buffer.cast());
-    data
-}
-
-pub(crate) fn make_http_response(
-    env: &mut crate::Environment,
-    request: id,
-    status_code: u16,
-    response_headers: &[(String, String)],
-) -> id {
-    use crate::frameworks::foundation::ns_string::from_rust_string;
-
-    let url: id = msg![env; request URL];
-    let headers: id = msg_class![env; NSMutableDictionary new];
-    autorelease(env, headers);
-    for (name, value) in response_headers {
-        let name_object = from_rust_string(env, name.clone());
-        let value_object = from_rust_string(env, value.clone());
-        autorelease(env, name_object);
-        autorelease(env, value_object);
-        () = msg![env; headers setObject:value_object forKey:name_object];
-    }
-    let http_version = from_rust_string(env, "HTTP/1.1".to_string());
-    autorelease(env, http_version);
-    let response: id = msg_class![env; NSHTTPURLResponse alloc];
-    let response: id = msg![env;
-        response initWithURL:url
-                 statusCode:(status_code as i32)
-                HTTPVersion:http_version
-               headerFields:headers];
-    autorelease(env, response);
-    response
 }
 
 // ---------------------------------------------------------------------------
@@ -294,8 +45,10 @@ struct NSURLConnectionHostObject {
     /// `id<NSURLConnectionDelegate>` — retained while the connection is
     /// alive, released on dealloc / cancel.
     delegate: id,
-    /// `NSURLRequest*` retained while the connection is alive.
-    request: id,
+    /// `NSOperationQueue *` from setDelegateQueue:. touchHLE schedules all
+    /// delegate callbacks on the main thread, so the queue is only stored
+    /// (retained) for API fidelity.
+    delegate_queue: id,
     /// Whether the connection has already been cancelled / finished.
     cancelled: bool,
 }
@@ -311,7 +64,12 @@ fn make_network_error(env: &mut crate::Environment) -> id {
     autorelease(env, domain);
 
     let desc_key = get_static_str(env, "NSLocalizedDescription");
-    let desc_val = from_rust_string(env, "The network connection was unavailable.".to_string());
+    let desc_val = from_rust_string(
+        env,
+        "The network connection was lost. \
+         (touchHLE: networking not supported)"
+            .to_string(),
+    );
     autorelease(env, desc_val);
 
     let user_info: id = msg_class![env; NSMutableDictionary new];
@@ -344,11 +102,41 @@ fn make_fake_success_data(env: &mut crate::Environment) -> id {
 }
 
 fn make_fake_http_response(env: &mut crate::Environment, request: id) -> id {
-    let headers = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        ("Content-Length".to_string(), "2".to_string()),
-    ];
-    make_http_response(env, request, 200, &headers)
+    use crate::frameworks::foundation::ns_string::from_rust_string;
+
+    let url: id = if request != nil {
+        msg![env; request URL]
+    } else {
+        nil
+    };
+
+    let headers: id = msg_class![env; NSMutableDictionary new];
+    autorelease(env, headers);
+
+    let content_type_key = from_rust_string(env, "Content-Type".to_string());
+    autorelease(env, content_type_key);
+    let content_type_val = from_rust_string(env, "application/json".to_string());
+    autorelease(env, content_type_val);
+    () = msg![env; headers setObject:content_type_val forKey:content_type_key];
+
+    let content_len_key = from_rust_string(env, "Content-Length".to_string());
+    autorelease(env, content_len_key);
+    let content_len_val = from_rust_string(env, "2".to_string());
+    autorelease(env, content_len_val);
+    () = msg![env; headers setObject:content_len_val forKey:content_len_key];
+
+    let http_version = from_rust_string(env, "HTTP/1.1".to_string());
+    autorelease(env, http_version);
+
+    let response: id = msg_class![env; NSHTTPURLResponse alloc];
+    let response: id = msg![env;
+        response initWithURL:url
+                 statusCode:200
+                HTTPVersion:http_version
+               headerFields:headers];
+
+    autorelease(env, response);
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -364,35 +152,15 @@ fn notify_delegate_failure(env: &mut crate::Environment, connection: id, delegat
     () = msg![env; delegate connection:connection didFailWithError:error];
 }
 
-fn notify_delegate_success(
-    env: &mut crate::Environment,
-    connection: id,
-    delegate: id,
-    request: id,
-) {
+fn notify_delegate_success(env: &mut crate::Environment, connection: id, delegate: id) {
     if delegate == nil {
         return;
     }
 
-    let (response, data) = if fake_network_success_enabled() {
-        log!("NSURLConnection: delivering explicit compatibility-profile fake HTTP 200 response");
-        (
-            make_fake_http_response(env, request),
-            make_fake_success_data(env),
-        )
-    } else {
-        match perform_request(env, request) {
-            Ok(result) => (
-                make_http_response(env, request, result.status_code, &result.headers),
-                make_data_from_bytes(env, &result.body),
-            ),
-            Err(error) => {
-                log_request_failure(&error);
-                notify_delegate_failure(env, connection, delegate);
-                return;
-            }
-        }
-    };
+    log!("NSURLConnection: TOUCHHLE_FAKE_NETWORK_SUCCESS=1, notifying delegate of fake HTTP 200 success");
+
+    let response = make_fake_http_response(env, nil);
+    let data = make_fake_success_data(env);
 
     () = msg![env; delegate connection:connection didReceiveResponse:response];
     () = msg![env; delegate connection:connection didReceiveData:data];
@@ -408,7 +176,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host = Box::new(NSURLConnectionHostObject {
         delegate: nil,
-        request: nil,
+        delegate_queue: nil,
         cancelled: false,
     });
     env.objc.alloc_object(this, host, &mut env.mem)
@@ -429,6 +197,8 @@ pub const CLASSES: ClassExports = objc_classes! {
                        error:(MutPtr<id>)error_ptr {
 
     if fake_network_success_enabled() {
+        log!("NSURLConnection sendSynchronousRequest: TOUCHHLE_FAKE_NETWORK_SUCCESS=1, returning fake HTTP 200 + tiny JSON + no error");
+
         if !response_ptr.is_null() {
             let response = make_fake_http_response(env, request);
             retain(env, response);
@@ -437,51 +207,50 @@ pub const CLASSES: ClassExports = objc_classes! {
         if !error_ptr.is_null() {
             env.mem.write(error_ptr, nil);
         }
-        return make_fake_success_data(env);
+
+        let data = make_fake_success_data(env);
+        return data;
     }
 
-    match perform_request(env, request) {
-        Ok(result) => {
-            if !response_ptr.is_null() {
-                let response = make_http_response(env, request, result.status_code, &result.headers);
-                retain(env, response);
-                env.mem.write(response_ptr, response);
-            }
-            if !error_ptr.is_null() {
-                env.mem.write(error_ptr, nil);
-            }
-            make_data_from_bytes(env, &result.body)
-        }
-        Err(error) => {
-            log_request_failure(&error);
-            if !response_ptr.is_null() {
-                env.mem.write(response_ptr, nil);
-            }
-            if !error_ptr.is_null() {
-                let error_object = make_network_error(env);
-                retain(env, error_object);
-                env.mem.write(error_ptr, error_object);
-            }
-            msg_class![env; NSData data]
-        }
+    log!("NSURLConnection sendSynchronousRequest: stub called (returning empty data + error)");
+
+    // Even when request is nil we return non-nil NSData, because many
+    // callers do not nil-check the return value and crash otherwise.
+    if request == nil {
+        log!(
+            "NSURLConnection sendSynchronousRequest: nil request — \
+             returning empty NSData to prevent caller crash"
+        );
     }
+
+    // Write nil into *response (no HTTP response to report).
+    if !response_ptr.is_null() {
+        env.mem.write(response_ptr, nil);
+    }
+
+    // Build and write an NSError so the caller knows why data is empty.
+    if !error_ptr.is_null() {
+        let error = make_network_error(env);
+        // make_network_error already autoreleased; retain once more so the
+        // caller owns a +1 ref through the out-pointer.
+        retain(env, error);
+        env.mem.write(error_ptr, error);
+    }
+
+    // Always return empty NSData (never nil) to avoid null-deref crashes
+    // in callers that do not check the error out-pointer.
+    let empty_data: id = msg_class![env; NSData data];
+    empty_data
 }
 
 // MARK: - Asynchronous block API
 //
 // `+[NSURLConnection sendAsynchronousRequest:queue:completionHandler:]`
-// — iOS 5+ block-based convenience. Requests use the same host-network
-// bridge as the synchronous API and report transport failures through the
-// completion handler.
-
-+ (())customSendAsynchronousRequest:(id)request
-                              queue:(id)queue
-                  completionHandler:(MutVoidPtr)handler {
-    () = msg![env;
-        this sendAsynchronousRequest:request
-                                queue:queue
-                    completionHandler:handler];
-}
+// — iOS 5+ block-based convenience. touchHLE has no live network stack,
+// so we synthesise the "not connected to internet" error. The handler is
+// called with (nil, nil, error) as Apple documents for failure cases.
+// Games like Sonic Runners handle this gracefully — they show an error
+// dialog and allow the user to retry.
 
 + (())sendAsynchronousRequest:(id)request
                         queue:(id)queue
@@ -489,6 +258,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     if handler.is_null() {
         return;
     }
+    log!(
+        "NSURLConnection sendAsynchronousRequest:queue:completionHandler: \
+         delivering NSURLErrorNotConnectedToInternet (touchHLE has no network)"
+    );
+
+    let _ = request;
+
     // The completion handler is a `void (^)(NSURLResponse *, NSData *,
     // NSError *)` block. ARM32 ABI: the block struct's third word
     // (index 3 == byte offset 12) is the invoke function pointer.
@@ -502,24 +278,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _ = queue;
 
     if fake_network_success_enabled() {
-        let empty_data = make_fake_success_data(env);
-        let response = make_fake_http_response(env, request);
-        let _: () = invoke.call_from_host(env, (handler, response, empty_data, nil));
+        log!(
+            "NSURLConnection sendAsynchronousRequest:queue:completionHandler:              TOUCHHLE_FAKE_NETWORK_SUCCESS=1, delivering empty data + no error"
+        );
+        let empty_data: id = msg_class![env; NSData data];
+        let _: () = invoke.call_from_host(env, (handler, nil, empty_data, nil));
         return;
     }
 
-    match perform_request(env, request) {
-        Ok(result) => {
-            let response = make_http_response(env, request, result.status_code, &result.headers);
-            let data = make_data_from_bytes(env, &result.body);
-            let _: () = invoke.call_from_host(env, (handler, response, data, nil));
-        }
-        Err(error_message) => {
-            log_request_failure(&error_message);
-            let error = make_network_error(env);
-            let _: () = invoke.call_from_host(env, (handler, nil, nil, error));
-        }
-    }
+    // Call with (nil_response, nil_data, error) — failure.
+    let error = make_network_error(env);
+    let _: () = invoke.call_from_host(env, (handler, nil, nil, error));
 }
 
 // MARK: - Asynchronous API
@@ -557,11 +326,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     );
 
     retain(env, delegate);
-    retain(env, request);
     {
         let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(this);
         host.delegate  = delegate;
-        host.request   = request;
         host.cancelled = false;
     }
 
@@ -575,15 +342,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         // called during the initializer itself.
         if fake_network_success_enabled() {
             log_dbg!(
-                "NSURLConnection: scheduling deferred network-success notification"
+                "NSURLConnection: scheduling deferred empty-success notification \
+                 (TOUCHHLE_FAKE_NETWORK_SUCCESS=1)"
             );
             let sel = env.objc.register_host_selector("_touchHLE_deliverSuccess".to_string(), &mut env.mem);
             () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
         } else {
             log_dbg!(
-                "NSURLConnection: scheduling deferred network request"
+                "NSURLConnection: scheduling deferred failure notification \
+                 (networking not supported in touchHLE)"
             );
-            let sel = env.objc.register_host_selector("_touchHLE_deliverSuccess".to_string(), &mut env.mem);
+            let sel = env.objc.register_host_selector("_touchHLE_deliverFailure".to_string(), &mut env.mem);
             () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
         }
     }
@@ -610,19 +379,30 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     let delegate = host.delegate;
-    let request = host.request;
     if delegate == nil {
         return;
     }
-    notify_delegate_success(env, this, delegate, request);
+    notify_delegate_success(env, this, delegate);
 }
 
 // MARK: - Instance methods
 
 - (())start {
-    log_dbg!("NSURLConnection start: scheduling deferred network request");
-    let sel = env.objc.register_host_selector("_touchHLE_deliverSuccess".to_string(), &mut env.mem);
-    () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
+    if fake_network_success_enabled() {
+        log_dbg!(
+            "NSURLConnection start: scheduling deferred empty-success \
+             (TOUCHHLE_FAKE_NETWORK_SUCCESS=1)"
+        );
+        let sel = env.objc.register_host_selector("_touchHLE_deliverSuccess".to_string(), &mut env.mem);
+        () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
+    } else {
+        log_dbg!(
+            "NSURLConnection start: scheduling deferred failure \
+             (networking not supported in touchHLE)"
+        );
+        let sel = env.objc.register_host_selector("_touchHLE_deliverFailure".to_string(), &mut env.mem);
+        () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
+    }
 }
 
 - (())cancel {
@@ -632,16 +412,30 @@ pub const CLASSES: ClassExports = objc_classes! {
         .cancelled = true;
 }
 
+- (())setDelegateQueue:(id)queue {
+    log_dbg!("NSURLConnection setDelegateQueue: {:?}", queue);
+    retain(env, queue);
+    let old_queue = {
+        let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(this);
+        std::mem::replace(&mut host.delegate_queue, queue)
+    };
+    release(env, old_queue);
+}
+
+- (id)delegateQueue {
+    env.objc.borrow::<NSURLConnectionHostObject>(this).delegate_queue
+}
+
 // MARK: - Dealloc
 
 - (())dealloc {
     log_dbg!("NSURLConnection dealloc");
-    let (delegate, request) = {
+    let (delegate, delegate_queue) = {
         let host = env.objc.borrow::<NSURLConnectionHostObject>(this);
-        (host.delegate, host.request)
+        (host.delegate, host.delegate_queue)
     };
     release(env, delegate);
-    release(env, request);
+    release(env, delegate_queue);
     env.objc.dealloc_object(this, &mut env.mem);
 }
 

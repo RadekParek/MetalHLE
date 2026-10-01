@@ -913,19 +913,7 @@ pub const FUNCTIONS: FunctionExports = &[
 
 pub const DYLIB: HostDylib = HostDylib {
     path: "/usr/lib/libsqlite3.dylib",
-    aliases: &[
-        "/usr/lib/libsqlite3.0.dylib",
-        "sqlite3",
-        "sqlite3.so",
-        "sqlite3.dll",
-        "sqlite3.dylib",
-        "sqlite3.bundle",
-        "libsqlite3",
-        "libsqlite3.so",
-        "libsqlite3.dll",
-        "libsqlite3.dylib",
-        "libsqlite3.bundle",
-    ],
+    aliases: &["/usr/lib/libsqlite3.0.dylib"],
     class_exports: &[],
     constant_exports: &[],
     function_exports: &[FUNCTIONS],

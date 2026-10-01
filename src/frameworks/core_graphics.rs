@@ -16,7 +16,6 @@ pub mod cg_context;
 pub mod cg_data_provider;
 pub mod cg_font;
 pub mod cg_geometry;
-mod path_geometry;
 pub mod cg_gradient;
 pub mod cg_image;
 pub mod cg_layer;
@@ -70,3 +69,5 @@ pub struct State {
 pub type CGFloat = f32;
 
 pub use cg_geometry::{CGPoint, CGRect, CGSize};
+
+mod path_geometry;

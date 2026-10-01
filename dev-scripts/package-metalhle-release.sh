@@ -6,7 +6,7 @@ VERSION="$1"
 CHANGELOG_FROM="${2:-}"
 CHANGELOG_LIMIT="${CHANGELOG_LIMIT:-}"
 if [ -z "$VERSION" ]; then
-    echo "Usage: $0 <version e.g. v2.0.0> [changelog_from_ref]" >&2
+    echo "Usage: $0 <version e.g. v1.0.0> [changelog_from_ref]" >&2
     exit 1
 fi
 
@@ -73,11 +73,11 @@ if [ -z "$linux_bin" ]; then
 fi
 
 if [ -z "$CHANGELOG_FROM" ]; then
-    patch="${VERSION#v2.0.}"
+    patch="${VERSION#v1.0.}"
     if [ "$patch" = "0" ]; then
         CHANGELOG_FROM="$(git rev-list -n 1 HEAD -- dev-scripts/metalhle-should-release.sh)"
     else
-        CHANGELOG_FROM="v2.0.$((patch - 1))"
+        CHANGELOG_FROM="v1.0.$((patch - 1))"
     fi
 fi
 

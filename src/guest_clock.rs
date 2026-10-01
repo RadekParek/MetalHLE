@@ -47,20 +47,6 @@ impl Speed {
     }
 }
 
-/// Cross-thread speed control: the window thread writes request codes, the
-/// environment run loop consumes them. 0 = no request pending.
-static SPEED_REQUEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// Request a guest-clock speed change from a non-environment thread (window).
-/// Codes: 1 = step slower, 2 = step faster, 3 = reset to normal.
-pub fn request_speed(command: i32) {
-    SPEED_REQUEST.store(command, std::sync::atomic::Ordering::SeqCst);
-}
-
-pub(crate) fn take_speed_request() -> i32 {
-    SPEED_REQUEST.swap(0, std::sync::atomic::Ordering::SeqCst)
-}
-
 pub struct GuestClock {
     host_anchor: Instant,
     guest_anchor: Instant,
@@ -91,34 +77,8 @@ impl GuestClock {
         self.guest_anchor + self.elapsed_at(Instant::now())
     }
 
-    pub fn speed_multiplier(&self) -> f64 {
-        self.speed.multiplier()
-    }
-
     pub fn system_time(&self) -> SystemTime {
         self.wall_anchor + self.elapsed_at(Instant::now())
-    }
-
-    /// Apply any pending cross-thread speed request. Returns the new speed
-    /// label when a change was applied (for on-screen feedback).
-    pub fn poll_speed_request(&mut self) -> Option<&'static str> {
-        match crate::guest_clock::take_speed_request() {
-            1 => {
-                let next = self.speed.step(false);
-                self.set_speed(next);
-                Some(next.label())
-            }
-            2 => {
-                let next = self.speed.step(true);
-                self.set_speed(next);
-                Some(next.label())
-            }
-            3 => {
-                self.set_speed(Speed::Normal);
-                Some(Speed::Normal.label())
-            }
-            _ => None,
-        }
     }
 
     pub fn speed(&self) -> Speed {

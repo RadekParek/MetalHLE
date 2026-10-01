@@ -142,7 +142,12 @@ fn update(env: &mut Environment, this: id) {
     let background_image: id = msg![env; this currentBackgroundImage];
 
     () = msg![env; background_image_view setImage:background_image];
-    () = msg![env; title_label setHidden:false];
+
+    // Hide the title label when the button has a foreground image, since the
+    // image already contains any necessary text (e.g. baked-in button labels).
+    // Without proper side-by-side layout the title would overlap the image.
+    let hide_title = image != nil;
+    () = msg![env; title_label setHidden:hide_title];
 }
 
 fn init_common(env: &mut Environment, this: id) -> id {
@@ -657,6 +662,37 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)hitTest:(CGPoint)point withEvent:(id)event {
     if msg![env; this pointInside:point withEvent:event] { this } else { nil }
+}
+
+// Chrome for iOS extends UIButton with a category offering extra accessors.
+// These are benign no-ops / sensible defaults for an emulator.
+
+- (id)displayedText {
+    msg![env; this currentTitle]
+}
+
+- (id)text {
+    msg![env; this currentTitle]
+}
+
+- (())hidePlaceholderImage {
+    // Nothing to hide.
+}
+
+- (bool)isPreEditing {
+    false
+}
+
+- (bool)animatingEVCert {
+    false
+}
+
+- (id)rightView {
+    nil
+}
+
+- (id)leftView {
+    nil
 }
 
 @end

@@ -52,6 +52,15 @@ pub(crate) struct UIViewControllerHostObject {
     /// Lazily-created `UINavigationItem` returned by `-navigationItem`.
     /// Retained while it lives in this slot.
     navigation_item: id,
+    /// `UIRefreshControl*` from the iOS 6 `-refreshControl` property, or
+    /// `nil`. Stored for round-tripping only: pull-to-refresh gestures are
+    /// not simulated, so the control never fires.
+    refresh_control: id,
+    /// `-hidesBottomBarWhenPushed` flag, stored for round-tripping.
+    hides_bottom_bar_when_pushed: bool,
+    /// Lazily-created `UITabBarItem` returned by `-tabBarItem`, or `nil`.
+    /// Retained while it lives in this slot.
+    tab_bar_item: id,
     // ---------------------------
     modal_transition_style: UIModalTransitionStyle,
     modal_presentation_style: UIModalPresentationStyle,
@@ -88,6 +97,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let mut host_object = Box::<UIViewControllerHostObject>::default();
     host_object.edges_for_extended_layout = UI_RECT_EDGE_ALL;
+    host_object.tab_bar_item = crate::objc::nil;
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
@@ -114,6 +124,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)navigationController {
     env.objc.borrow::<UIViewControllerHostObject>(this).navigation_controller
+}
+
+- (id)refreshControl {
+    env.objc.borrow::<UIViewControllerHostObject>(this).refresh_control
+}
+
+- (())setRefreshControl:(id)refresh_control {
+    let old = std::mem::replace(
+        &mut env.objc.borrow_mut::<UIViewControllerHostObject>(this).refresh_control,
+        refresh_control,
+    );
+    if refresh_control != nil {
+        retain(env, refresh_control);
+    }
+    if old != nil {
+        release(env, old);
+    }
 }
 
 - (id)parentViewController {
@@ -189,8 +216,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     if presented != nil { release(env, presented); }
     // presenting_view_controller is a non-retained back-pointer; do not
     // release.
-    let navigation_item = env.objc.borrow::<UIViewControllerHostObject>(this).navigation_item;
+    let (navigation_item, refresh_control, tab_bar_item) = {
+        let h = env.objc.borrow::<UIViewControllerHostObject>(this);
+        (h.navigation_item, h.refresh_control, h.tab_bar_item)
+    };
     if navigation_item != nil { release(env, navigation_item); }
+    if refresh_control != nil { release(env, refresh_control); }
+    if tab_bar_item != nil { release(env, tab_bar_item); }
     if storyboard != nil { release(env, storyboard); }
 
     env.objc.dealloc_object(this, &mut env.mem);
@@ -442,32 +474,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         .borrow::<UIViewControllerHostObject>(this)
         .edges_for_extended_layout
 }
-// iOS 11 safe-area APIs. touchHLE has no notch or system-bar insets, so the
-// safe area is the view's bounds and the guide is a zero-behaviour layout
-// guide that remains available for feature detection and storyboard code.
-- (id)safeAreaLayoutGuide {
-    let existing = env.objc.borrow::<UIViewControllerHostObject>(this).view;
-    if existing == nil {
-        return nil;
-    }
-    msg![env; existing safeAreaLayoutGuide]
-}
-
-- (crate::frameworks::core_graphics::CGRect)viewSafeAreaInsets {
-    crate::frameworks::core_graphics::CGRect::default()
-}
-
-- (())viewSafeAreaInsetsDidChange {
-    log_dbg!("[(UIViewController*){:?} viewSafeAreaInsetsDidChange]", this);
-}
-
-- (bool)prefersHomeIndicatorAutoHidden {
-    false
-}
-
-- (bool)prefersStatusBarHidden {
-    false
-}
 
 - (())dismissModalViewControllerAnimated:(bool)animated {
     // Apple docs: "If you call this method on the modal view controller
@@ -506,13 +512,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this presentModalViewController:moviePlayerViewController animated:false];
 }
 
+// Apple's documentation: "Dismisses a movie player view controller using
+// the standard movie player transition."
+// https://developer.apple.com/documentation/uikit/uiviewcontroller/1619163-dismissmovieplayerviewcontroller
 - (())dismissMoviePlayerViewControllerAnimated {
-    log!("TODO: [(UIViewController*){:?} dismissMoviePlayerViewControllerAnimated]", this);
-    // TODO
+    () = msg![env; this dismissModalViewControllerAnimated:true];
 }
 
 - (bool)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)interface_orientation {
-    interface_orientation == 3 || interface_orientation == 4
+    // Apple's default implementation supports every orientation except
+    // upside-down portrait (UIDeviceOrientationPortraitUpsideDown == 2).
+    // Rejecting plain portrait here broke apps that query it directly.
+    interface_orientation != 2
 }
 
 - (id)nextResponder {
@@ -528,7 +539,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         stored_title
     } else {
         let class: Class = msg![env; this class];
-        NSStringFromClass(env, class)
+        // The class-name string is newly created (+1); autorelease it so
+        // the getter respects the +0 return convention.
+        let class_name = NSStringFromClass(env, class);
+        autorelease(env, class_name)
     }
 }
 
@@ -691,6 +705,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     // directly instead of adding the view to the presenter's view.
     () = msg![env; window addSubview:modal_view];
     () = msg![env; modal_vc viewDidAppear:animated];
+
+    // The modal hierarchy is now fully attached to a window. Any UIWebView
+    // load deferred because the view had no on-screen extent yet (e.g.
+    // Chrome's ToS screen, whose webview never receives -setFrame: again)
+    // gets another chance right now, synchronously — the NSTimer-based
+    // poll has never been observed to fire on Android.
+    crate::frameworks::uikit::ui_view::ui_web_view::retry_pending_loads_in_subtree(
+        env, modal_view,
+    );
 }
 
 - (id)modalViewController {
@@ -758,19 +781,43 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)hidesBottomBarWhenPushed {
-    false
+    env.objc
+        .borrow::<UIViewControllerHostObject>(this)
+        .hides_bottom_bar_when_pushed
 }
 
-- (())setHidesBottomBarWhenPushed:(bool)_value {
-    // TODO
+- (())setHidesBottomBarWhenPushed:(bool)value {
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(this)
+        .hides_bottom_bar_when_pushed = value;
 }
 
 - (id)tabBarItem {
-    msg_class![env; UITabBarItem new]
+    let item = env.objc.borrow::<UIViewControllerHostObject>(this).tab_bar_item;
+    if item != crate::objc::nil {
+        return item;
+    }
+    // Like UIKit, create the item lazily on first access and keep it around
+    // for subsequent queries.
+    let new_item: id = msg_class![env; UITabBarItem new];
+    // The slot owns the +1 from -new; the getter returns +0, matching
+    // Apple's autoreleased lazy item.
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).tab_bar_item = new_item;
+    new_item
 }
 
-- (())setTabBarItem:(id)_item {
-    // TODO
+- (())setTabBarItem:(id)item {
+    let slot = &mut env
+        .objc
+        .borrow_mut::<UIViewControllerHostObject>(this)
+        .tab_bar_item;
+    let old = std::mem::replace(slot, item);
+    if old != crate::objc::nil {
+        release(env, old);
+    }
+    if item != crate::objc::nil {
+        retain(env, item);
+    }
 }
 
 - (id)tabBarController {
@@ -846,20 +893,47 @@ pub const CLASSES: ClassExports = objc_classes! {
     log_dbg!("[(UIViewController*){:?} removeFromParentViewController]", this);
 }
 
-- (())willMoveToParentViewController:(id)_parent {
-    // TODO
+- (())willMoveToParentViewController:(id)parent {
+    // UIKit only allows nil (removal) or an actual view controller here.
+    // touchHLE has no public way to query an object's class here, so trust
+    // the caller (containers always pass a UIViewController subclass).
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(this)
+        .parent_view_controller = parent;
 }
 
-- (())didMoveToParentViewController:(id)_parent {
-    // TODO
+- (())didMoveToParentViewController:(id)parent {
+    // Per Apple's docs the parent pointer passed here is informational;
+    // -willMoveToParentViewController: already stored it. If a container
+    // skips the will-move call, honour the parent given here instead.
+    if parent != crate::objc::nil {
+        let current = env
+            .objc
+            .borrow::<UIViewControllerHostObject>(this)
+            .parent_view_controller;
+        if current == crate::objc::nil {
+            env.objc
+                .borrow_mut::<UIViewControllerHostObject>(this)
+                .parent_view_controller = parent;
+        }
+    }
 }
 
-- (())beginAppearanceTransition:(bool)_appearing animated:(bool)_animated {
-    // TODO
+- (())beginAppearanceTransition:(bool)appearing animated:(bool)_animated {
+    // Forward the transition to the view's `isHidden` state, which drives
+    // the appearance callbacks elsewhere in touchHLE's UIView
+    // implementation. `appearing == true` means the views are about to
+    // become visible.
+    let view: id = env.objc.borrow::<UIViewControllerHostObject>(this).view;
+    if view != crate::objc::nil {
+        let hidden: bool = !appearing;
+        () = msg![env; view setHidden:hidden];
+    }
 }
 
 - (())endAppearanceTransition {
-    // TODO
+    // The transition was already applied in
+    // -beginAppearanceTransition:animated:, so nothing to do here.
 }
 
 - (bool)automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers {

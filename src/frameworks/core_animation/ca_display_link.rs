@@ -33,7 +33,6 @@ use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports,
     HostObject, NSZonePtr, SEL,
 };
-use crate::Environment;
 
 #[derive(Default)]
 struct CADisplayLinkHostObject {
@@ -50,18 +49,8 @@ struct CADisplayLinkHostObject {
     /// and the value must be `>= 1`.
     /// <https://developer.apple.com/documentation/quartzcore/cadisplaylink/1648526-frameinterval>
     frame_interval: NSInteger,
-    added_to_run_loop: bool,
 }
 impl HostObject for CADisplayLinkHostObject {}
-
-fn display_link_refresh_rate(env: &Environment) -> f64 {
-    let display_rate = env.window().display_refresh_rate().max(1.0);
-    env.options.effective_fps_limit(display_rate)
-}
-
-fn display_link_pacing_enabled(env: &Environment) -> bool {
-    env.options.frame_pacing_enabled()
-}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -82,9 +71,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // we need a re-direction: the timer fires on the display link, which then
     // calls the original selector, passing the link as a second argument.
     let redirect_sel: SEL = env.objc.lookup_selector("_touchHLE_displayLinkTimerDidFire:").unwrap();
-    let refresh_rate = display_link_refresh_rate(env);
-    let timer_interval = if display_link_pacing_enabled(env) { 1.0 / refresh_rate } else { 0.0001 };
-    let ns_timer = msg_class![env; NSTimer timerWithTimeInterval:timer_interval
+    let ns_timer = msg_class![env; NSTimer timerWithTimeInterval:(1.0/60.0)
                      target:display_link
                    selector:redirect_sel
                    userInfo:nil
@@ -94,7 +81,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     host_object.target = target;
     host_object.selector = Some(sel);
     host_object.ns_timer = ns_timer;
-    host_object.added_to_run_loop = false;
     log_dbg!("[CADisplayLink displayLinkWithTarget:{:?} selector:{}] => {:?}", target, sel.as_str(&env.mem), display_link);
     autorelease(env, display_link)
 }
@@ -114,7 +100,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // get a plausible positive value rather than 0 or NaN.
 // <https://developer.apple.com/documentation/quartzcore/cadisplaylink/1648478-timestamp>
 - (f64)timestamp {
-    msg_class![env; NSDate timeIntervalSinceReferenceDate]
+    crate::frameworks::core_animation::CACurrentMediaTime(env)
 }
 
 // The time interval between screen refresh updates.
@@ -127,11 +113,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (f64)duration {
     let ns_timer = env.objc.borrow::<CADisplayLinkHostObject>(this).ns_timer;
     if ns_timer == nil {
-        return if display_link_pacing_enabled(env) {
-            1.0 / display_link_refresh_rate(env)
-        } else {
-            0.0
-        };
+        return 1.0 / 60.0;
     }
     msg![env; ns_timer timeInterval]
 }
@@ -150,12 +132,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // rather than raising NSInvalidArgumentException.
     let safe_interval = frameInterval.max(1);
     env.objc.borrow_mut::<CADisplayLinkHostObject>(this).frame_interval = safe_interval;
-    let refresh_rate = display_link_refresh_rate(env);
-    let interval = if display_link_pacing_enabled(env) {
-        safe_interval as f64 / refresh_rate
-    } else {
-        0.0001
-    };
+    let interval = safe_interval as f64 / 60.0;
 
     let ns_timer = env.objc.borrow::<CADisplayLinkHostObject>(this).ns_timer;
     if ns_timer != nil {
@@ -165,20 +142,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSInteger)preferredFramesPerSecond {
     let interval = env.objc.borrow::<CADisplayLinkHostObject>(this).frame_interval;
-    if display_link_pacing_enabled(env) {
-        (display_link_refresh_rate(env) as NSInteger / interval.max(1)).max(1)
-    } else {
-        0
-    }
+    (60 / interval.max(1)).max(1)
 }
 
 - (())setPreferredFramesPerSecond:(NSInteger)fps {
-    let max_fps = display_link_refresh_rate(env) as NSInteger;
-    if !display_link_pacing_enabled(env) {
-        return;
-    }
-    let safe_fps = if fps <= 0 { max_fps } else { fps.min(max_fps) };
-    let interval = (max_fps / safe_fps).max(1);
+    let safe_fps = if fps <= 0 { 60 } else { fps.min(60) };
+    let interval = (60 / safe_fps).max(1);
     () = msg![env; this setFrameInterval:interval];
 }
 
@@ -194,7 +163,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     if ns_timer != nil {
         () = msg![env; run_loop addTimer:ns_timer forMode:mode];
     }
-    env.objc.borrow_mut::<CADisplayLinkHostObject>(this).added_to_run_loop = true;
 }
 
 // Removes the display link from a run loop in a specific mode.
@@ -213,7 +181,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     if ns_timer != nil && run_loop != nil {
         () = msg![env; ns_timer invalidate];
     }
-    env.objc.borrow_mut::<CADisplayLinkHostObject>(this).added_to_run_loop = false;
 }
 
 // Removes the display link from all run loops, releasing the target.
@@ -241,11 +208,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         selector,
         ns_timer,
         paused,
-        added_to_run_loop,
         ..
     } = env.objc.borrow::<CADisplayLinkHostObject>(this);
     assert_eq!(ns_timer, timer);
-    if !added_to_run_loop || paused {
+    if paused {
+        // This could be improved, as we're still running the timer,
+        // but just not passing the actual call.
         return;
     }
     // Signature is `- (void) selector:(CADisplayLink *)sender;`

@@ -172,31 +172,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
-// Zero-area UIKit layers do not cover the fullscreen EAGL surface.
-fn layer_has_visible_area(hidden: bool, opacity: f32, bounds: CGRect) -> bool {
-    !hidden && opacity > 0.0 && bounds.size.width > 0.0 && bounds.size.height > 0.0
-}
-
-fn layer_subtree_may_draw_pixels(env: &Environment, layer: id, depth: usize) -> bool {
-    const MAX_DEPTH: usize = 128;
-    if depth >= MAX_DEPTH {
-        return true;
-    }
-    let (hidden, opacity, bounds, sublayers) = {
-        let host = env.objc.borrow::<CALayerHostObject>(layer);
-        (host.hidden, host.opacity, host.bounds, host.sublayers.clone())
-    };
-    if hidden || opacity <= 0.0 {
-        return false;
-    }
-    if layer_has_visible_area(hidden, opacity, bounds) {
-        return true;
-    }
-    sublayers
-        .into_iter()
-        .any(|child| layer_subtree_may_draw_pixels(env, child, depth + 1))
-}
-
 // =========================================================================
 // MARK: - find_fullscreen_eagl_layer
 // =========================================================================
@@ -351,11 +326,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             return nil;
         }
 
-        let sublayers = layer_host_obj.sublayers.clone();
         parent_to_screen = layer_to_screen;
-        if let Some(next) = sublayers.into_iter().rev().find(|&candidate| {
-            layer_subtree_may_draw_pixels(env, candidate, 0)
-        }) {
+        if let Some(&next) = layer_host_obj.sublayers.last() {
             layer = next;
         } else {
             break;
@@ -527,34 +499,6 @@ mod fullscreen_layer_tests {
 
         assert!(fullscreen_frame_matches_screen(almost_fullscreen, screen));
         assert!(!fullscreen_frame_matches_screen(partial, screen));
-    }
-}
-
-#[cfg(test)]
-mod layer_visibility_tests {
-    use super::*;
-
-    #[test]
-    fn treats_zero_sized_and_invisible_layers_as_non_occluding() {
-        let no_bounds = CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: crate::frameworks::core_graphics::CGSize {
-                width: 0.0,
-                height: 480.0,
-            },
-        };
-        let fullscreen = CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: crate::frameworks::core_graphics::CGSize {
-                width: 320.0,
-                height: 480.0,
-            },
-        };
-
-        assert!(!layer_has_visible_area(false, 1.0, no_bounds));
-        assert!(!layer_has_visible_area(true, 1.0, fullscreen));
-        assert!(!layer_has_visible_area(false, 0.0, fullscreen));
-        assert!(layer_has_visible_area(false, 1.0, fullscreen));
     }
 }
 

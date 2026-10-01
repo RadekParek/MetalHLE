@@ -801,7 +801,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 // NSNetService / NSNetServiceBrowser are implemented in
-// foundation::ns_net_service; not duplicated here.
+// foundation::ns_net_service on top of the real CFNetService mDNS stack.
 
 // NSHTTPURLResponse is defined in foundation::ns_url_response; not
 // duplicated here.

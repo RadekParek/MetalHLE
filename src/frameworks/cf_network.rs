@@ -19,51 +19,109 @@
 //! avoids `no_duplicate_functions` test failures.
 
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
-use crate::frameworks::cf_http_message::CFHTTPMessageRef;
 use crate::frameworks::core_foundation::cf_array::CFArrayRef;
 use crate::frameworks::core_foundation::cf_dictionary::CFDictionaryRef;
-use crate::frameworks::core_foundation::cf_stream::{
-    create_read_stream_with_http_response, CFReadStreamRef,
-};
 use crate::frameworks::core_foundation::CFTypeRef;
 use crate::frameworks::foundation::ns_array;
 use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::frameworks::foundation::ns_url_connection::{log_request_failure, perform_http_request};
-use crate::objc::{id, msg_class, nil};
+use crate::mem::MutPtr;
+use crate::objc::{id, msg_class};
 use crate::Environment;
 
-fn CFReadStreamCopyError(_env: &mut Environment, _stream: CFReadStreamRef) -> CFTypeRef {
-    nil
+fn CFReadStreamCreateForHTTPRequest(env: &mut Environment, _alloc: u32, _request: u32) -> u32 {
+    // Return a real (non-functional) stream object from cf_stream so later
+    // CFReadStream* calls hit registered host objects instead of the
+    // phantom-object fallback path ("SUPER HACK! Faking borrow" warnings).
+    crate::frameworks::core_foundation::cf_stream::alloc_read_stream_for_cf_network(env)
 }
 
-fn CFReadStreamCreateForHTTPRequest(
+/// `CFReadStreamRef CFReadStreamCreateForStreamedHTTPRequest(
+///     CFAllocatorRef alloc, CFHTTPRequestRef request, CFReadStreamRef body)`
+///
+/// Apple docs: like `CFReadStreamCreateForHTTPRequest`, but the request body
+/// is streamed from `body` (used for large uploads). We have no real HTTP
+/// stack, so we hand back the same kind of placeholder read stream used by
+/// `CFReadStreamCreateForHTTPRequest` — a real registered host object (so
+/// later `CFReadStream*` calls behave) whose contents are empty.
+fn CFReadStreamCreateForStreamedHTTPRequest(
     env: &mut Environment,
-    _allocator: u32,
-    request: CFHTTPMessageRef,
-) -> CFReadStreamRef {
-    if !env.ensure_network_access("CFReadStreamCreateForHTTPRequest") {
-        log!("CFReadStreamCreateForHTTPRequest: network access is disabled");
-        return nil;
-    }
-    let Some((method, url, headers, body)) =
-        crate::frameworks::cf_http_message::request_parts(env, request)
-    else {
-        log!("CFReadStreamCreateForHTTPRequest: invalid HTTP request message");
-        return nil;
-    };
-    match perform_http_request(&method, &url, 20.0, &headers, &body) {
-        Ok(response) => create_read_stream_with_http_response(
-            env,
-            response.status_code,
-            response.headers,
-            response.body,
-        ),
-        Err(error) => {
-            log_request_failure(&error);
-            nil
-        }
-    }
+    _alloc: u32,
+    _request: u32,
+    _body: u32,
+) -> u32 {
+    crate::frameworks::core_foundation::cf_stream::alloc_read_stream_for_cf_network(env)
+}
+
+fn CFReadStreamOpen(env: &mut Environment, stream: u32) -> bool {
+    crate::frameworks::core_foundation::cf_stream::cf_network_read_stream_open(env, stream)
+}
+
+fn CFReadStreamHasBytesAvailable(env: &mut Environment, stream: u32) -> bool {
+    crate::frameworks::core_foundation::cf_stream::cf_network_read_stream_has_bytes_available(env, stream)
+}
+
+fn CFReadStreamRead(
+    env: &mut Environment,
+    stream: u32,
+    buffer: MutPtr<u8>,
+    buffer_length: i32,
+) -> i32 {
+    use crate::frameworks::core_foundation::cf_stream;
+    cf_stream::cf_network_read_stream_read(env, stream, buffer, buffer_length)
+}
+
+fn CFReadStreamClose(env: &mut Environment, stream: u32) {
+    use crate::frameworks::core_foundation::cf_stream;
+    cf_stream::cf_network_read_stream_close(env, stream)
+}
+
+fn CFReadStreamSetProperty(
+    _env: &mut Environment,
+    _stream: u32,
+    _property: u32,
+    _value: u32,
+) -> bool {
+    true
+}
+
+fn CFReadStreamCopyProperty(_env: &mut Environment, _stream: u32, _property: u32) -> u32 {
+    0
+}
+
+fn CFReadStreamScheduleWithRunLoop(
+    _env: &mut Environment,
+    _stream: u32,
+    _run_loop: u32,
+    _run_loop_mode: u32,
+) {
+}
+
+fn CFReadStreamUnscheduleFromRunLoop(
+    _env: &mut Environment,
+    _stream: u32,
+    _run_loop: u32,
+    _run_loop_mode: u32,
+) {
+}
+
+fn CFReadStreamSetClient(
+    _env: &mut Environment,
+    _stream: u32,
+    _callback_types: u32,
+    _client_cb: u32,
+    _client_context: u32,
+) -> bool {
+    true
+}
+
+fn CFReadStreamGetStatus(_env: &mut Environment, _stream: u32) -> u32 {
+    // kCFStreamStatusOpen
+    2
+}
+
+fn CFReadStreamCopyError(_env: &mut Environment, _stream: u32) -> u32 {
+    0
 }
 
 /// `CFDictionaryRef CFNetworkCopySystemProxySettings(void)`
@@ -123,6 +181,7 @@ fn CFNetworkCopyProxiesForURL(
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFReadStreamCreateForHTTPRequest(_, _)),
+    export_c_func!(CFReadStreamCreateForStreamedHTTPRequest(_, _, _)),
     // Other CFReadStream* helpers are exported from
     // core_foundation::cf_stream; not duplicated here.
     export_c_func!(CFReadStreamCopyError(_)),

@@ -647,6 +647,12 @@ pub fn CFArrayCreateDescription(env: &mut Environment, array: CFArrayRef) -> CFT
 
 // MARK: - Additional utility functions
 
+pub fn CFArrayGetTypeID(_env: &mut Environment) -> u32 {
+    // Return a fake CFTypeID for CFArray
+    // In real implementation, this would be a unique type identifier
+    0x43464172 // 'CFAr' in hex
+}
+
 pub fn CFMakeCollectable(_env: &mut Environment, cf: CFTypeRef) -> CFTypeRef {
     // In garbage-collected environments, this makes the object collectable
     // In ARC/manual retain-release, this is a no-op

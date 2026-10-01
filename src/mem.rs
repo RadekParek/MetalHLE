@@ -280,6 +280,7 @@ unsafe impl SafeRead for i64 {}
 unsafe impl SafeRead for u64 {}
 unsafe impl SafeRead for f32 {}
 unsafe impl SafeRead for f64 {}
+unsafe impl SafeRead for [u64; 2] {}
 unsafe impl<T, const MUT: bool> SafeRead for Ptr<T, MUT> {}
 
 /// Marker trait for types that can be written to guest memory.
@@ -296,25 +297,15 @@ unsafe impl<T, const MUT: bool> SafeRead for Ptr<T, MUT> {}
 ///
 /// See also [SafeRead] and [crate::abi].
 pub trait SafeWrite: Sized {}
-unsafe impl SafeRead for [u64; 2] {}
 impl<T: SafeRead> SafeWrite for T {}
 
-// Extended one page past the 4 GiB boundary so off-by-one/OOB guest
-// addresses stay addressable instead of tripping range assertions.
+// XaView BypassOOBPanic: extend the guest address space by one page past the
+// 4 GiB boundary so that off-by-one/OOB guest addresses (e.g. computations
+// yielding 0x1_0000_0000..0x1_0000_0fff) stay addressable instead of tripping
+// range assertions in the memory accessors.
 type Bytes = [u8; (1_usize << 32) + 4096];
 pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
-const MAX_DEFENSIVE_GUEST_ACCESS: GuestUSize = 64 * 1024 * 1024;
-// Raised from 512 MiB to 1 GiB: guest memory is mmap-backed and lazily
-// committed, so large-but-sane requests (Man of Steel asks for 0x21c10000,
-// about 540 MiB, up front) no longer need to be refused. Refusing them made
-// the guest proceed with a NULL pointer and crash inside its own handler.
-const MAX_DEFENSIVE_GUEST_ALLOCATION: GuestUSize = 1024 * 1024 * 1024;
-/// Allocations above this size skip the eager zero-fill in `alloc`. Anonymous
-/// mmap memory is already zero on first touch, and filling hundreds of MiB up
-/// front would commit physical RAM the guest may never write to.
-const EAGER_ZERO_FILL_LIMIT: GuestUSize = 128 * 1024 * 1024;
-pub(crate) const ALIGNED_ALLOCATION_MAGIC: u32 = 0xA11C_0CA7;
 
 /// The type that owns the guest memory and provides accessors for it.
 pub struct Mem {
@@ -462,12 +453,8 @@ impl Mem {
         //        this, along with removing this special case.
         assert!(self.null_segment_size == 0);
         assert!(new_null_segment_size.is_multiple_of(0x1000));
-        if new_null_segment_size > PAGE_SIZE {
-            self.allocator.reserve(allocator::Chunk::new(
-                PAGE_SIZE,
-                new_null_segment_size - PAGE_SIZE,
-            ));
-        }
+        self.allocator
+            .reserve(allocator::Chunk::new(0, new_null_segment_size));
         self.null_segment_size = new_null_segment_size;
     }
 
@@ -487,50 +474,50 @@ impl Mem {
         self.bytes.cast()
     }
 
-    #[inline(always)]
     fn bytes(&self) -> &Bytes {
         unsafe { &*self.bytes }
     }
-    #[inline(always)]
     fn bytes_mut(&mut self) -> &mut Bytes {
         unsafe { &mut *self.bytes }
     }
 
-    #[inline]
-    fn invalid_access(&self, addr: VAddr, size: GuestUSize) -> bool {
-        let end = u64::from(addr) + u64::from(size);
-        addr < self.null_segment_size || end > self.bytes().len() as u64
-    }
-
     // Soft handler for null-page accesses. No panic; returns a stub page.
-    // Rate-limited: only the first N unique (page, is_write) pairs are logged,
+    // Rate-limited: only the first N unique (addr, is_write) pairs are logged,
     // further occurrences are silently counted. This prevents the log from
-    // being flooded when a game walks a reserved null segment byte by byte.
+    // being flooded when the game repeatedly probes null-page addresses.
     #[cold]
     fn null_check_fail(at: VAddr, size: GuestUSize, is_write: bool, caller: &str) {
         use std::collections::HashSet;
-        use std::sync::{Mutex, Once};
+        use std::sync::Mutex;
         static SEEN: Mutex<Option<HashSet<(VAddr, bool)>>> = Mutex::new(None);
-        static SUPPRESSION_LOGGED: Once = Once::new();
         const MAX_UNIQUE_LOGS: usize = 64;
 
         let mut guard = SEEN.lock().unwrap();
         let set = guard.get_or_insert_with(HashSet::new);
-        let page = at & !PAGE_SIZE_ALIGN_MASK;
-        let key = (page, is_write);
+        let key = (at, is_write);
         if set.contains(&key) {
             return;
         }
         if set.len() >= MAX_UNIQUE_LOGS {
-            SUPPRESSION_LOGGED.call_once(|| {
+            if set.len() == MAX_UNIQUE_LOGS {
+                // Insert a sentinel to emit the notice only once.
+                set.insert((0xFFFF_FFFE, false));
                 log!(
                     "touchHLE::mem: further NULL-PAGE warnings silenced after {} unique sites",
                     MAX_UNIQUE_LOGS
                 );
-            });
+            }
             return;
         }
         set.insert(key);
+        if size > 0x1000_0000 {
+            // Huge size is almost always a corrupted/-1 length; capture a
+            // backtrace to identify the offending host function.
+            log!(
+                "touchHLE::mem: backtrace for huge-size NULL-PAGE/OOB access:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         let op_type = if is_write { "WRITE" } else { "READ" };
         // Provide helpful context: small offsets are typically field accesses
         // on a nil Objective-C object pointer (nil + ivar offset). This is
@@ -545,7 +532,7 @@ impl Mem {
         };
         log!(
             "touchHLE::mem: NULL-PAGE {} at 0x{:08x} (size: 0x{:x}) from {}{} \
-             (unique pages logged: {}/{})",
+             (unique sites logged: {}/{})",
             op_type,
             at,
             size,
@@ -561,7 +548,7 @@ impl Mem {
     /// Only for use by [crate::gdb::GdbServer].
     pub fn get_bytes_fallible(&self, addr: ConstVoidPtr, count: GuestUSize) -> Option<&[u8]> {
         if addr.to_bits() < self.null_segment_size {
-            // GDB reads on the null page see the stub page instead of failing.
+            // Для GDB возвращаем stub-страницу
             let offset = (addr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let stub_slice = unsafe {
@@ -572,15 +559,9 @@ impl Mem {
             };
             return Some(&stub_slice[..count_usize.min(stub_slice.len())]);
         }
-        // The extension page past the 4 GiB boundary exists only as a safety
-        // margin for the infallible accessors; guest-visible memory ends at
-        // exactly 4 GiB, so report OOB as None here.
-        let start = addr.to_bits() as usize;
-        let end = start.checked_add(count as usize)?;
-        if end > 1usize << 32 {
-            return None;
-        }
-        self.bytes().get(start..end)
+        self.bytes()
+            .get(addr.to_bits() as usize..)?
+            .get(..count as usize)
     }
     /// Special version of [Self::bytes_at_mut] that returns [None] rather than
     /// panicking on failure.
@@ -591,17 +572,12 @@ impl Mem {
         count: GuestUSize,
     ) -> Option<&mut [u8]> {
         if addr.to_bits() < self.null_segment_size {
-            // GDB must not write to the null page.
             return None;
+            // GDB не должен писать в null-page
         }
-        // See `get_bytes_fallible`: guest-visible memory ends at exactly
-        // 4 GiB, so report OOB as None here.
-        let start = addr.to_bits() as usize;
-        let end = start.checked_add(count as usize)?;
-        if end > 1usize << 32 {
-            return None;
-        }
-        self.bytes_mut().get_mut(start..end)
+        self.bytes_mut()
+            .get_mut(addr.to_bits() as usize..)?
+            .get_mut(..count as usize)
     }
 
     /// Get a slice for reading `count` bytes.
@@ -612,21 +588,16 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at] for that).
-    #[inline(always)]
+    #[inline]
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
-        let _perf_scope = crate::perf::memory_scope();
-        if count > MAX_DEFENSIVE_GUEST_ACCESS {
-            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(oversized)");
-            return unsafe { std::slice::from_raw_parts(self.null_stub_page, PAGE_SIZE as usize) };
-        }
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
             Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at");
-            let count_usize = count as usize;
             // Возвращаем данные из stub-страницы вместо реальной памяти
             // Это предотвращает UndefinedInstruction когда игра использует
             // прочитанные значения как указатели на функции
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
+            let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
             return unsafe {
@@ -638,27 +609,18 @@ impl Mem {
         // return the stub page. This prevents panics when a game uses -1 or
         // another near-max address as a pointer (corrupted pointer arithmetic).
         let addr = ptr.to_bits() as usize;
-        let count_usize = count as usize;
-        let Some(end) = addr.checked_add(count_usize) else {
+        let end = addr.saturating_add(count as usize);
+        if end > self.bytes().len() || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)");
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe {
-                std::slice::from_raw_parts(self.null_stub_page.add(offset), actual_count)
-            };
-        };
-        if end > self.bytes().len() {
-            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)");
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
+            let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
             return unsafe {
                 std::slice::from_raw_parts(self.null_stub_page.add(offset), actual_count)
             };
         }
-        let bytes = self.bytes();
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().add(addr), count_usize) }
+        &self.bytes()[addr..][..count as usize]
     }
     /// Get a slice for reading `count` bytes without a null-page check.
     ///
@@ -671,26 +633,18 @@ impl Mem {
         count: GuestUSize,
     ) -> &[u8] {
         let addr = ptr.to_bits() as usize;
-        let count_usize = count as usize;
-        let Some(end) = addr.checked_add(count_usize) else {
+        let end = addr.saturating_add(count as usize);
+        if end > self.bytes().len() || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)");
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
+            let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
             return unsafe {
                 std::slice::from_raw_parts(self.null_stub_page.add(offset), actual_count)
             };
-        };
-        if end > self.bytes().len() {
-            Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)");
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let actual_count = count_usize.min(PAGE_SIZE as usize - offset);
-            return unsafe {
-                std::slice::from_raw_parts(self.null_stub_page.add(offset), actual_count)
-            };
         }
-        let bytes = self.bytes();
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().add(addr), count_usize) }
+        &self.bytes()[addr..][..count as usize]
     }
     /// Get a slice for reading or writing `count` bytes.
     /// This is the basic
@@ -700,16 +654,8 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at_mut] for that).
-    #[inline(always)]
+    #[inline]
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
-        let _perf_scope = crate::perf::memory_scope();
-        if count > MAX_DEFENSIVE_GUEST_ACCESS {
-            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(oversized)");
-            return unsafe {
-                std::slice::from_raw_parts_mut(self.null_write_sink, PAGE_SIZE as usize)
-            };
-        }
-        let count_usize = count as usize;
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
             Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut");
@@ -717,6 +663,7 @@ impl Mem {
             // writes are silently absorbed without corrupting the read stub
             // page's zeros.
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
+            let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
             return unsafe {
@@ -726,26 +673,18 @@ impl Mem {
         // Guard against out-of-bounds writes near the top of the 32-bit
         // address space (e.g. corrupted pointer = 0xFFFFFFFF).
         let addr = ptr.to_bits() as usize;
-        let Some(end) = addr.checked_add(count_usize) else {
+        let end = addr.saturating_add(count as usize);
+        if end > self.bytes().len() || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)");
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe {
-                std::slice::from_raw_parts_mut(self.null_write_sink.add(offset), actual_count)
-            };
-        };
-        if end > self.bytes().len() {
-            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)");
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
+            let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
             return unsafe {
                 std::slice::from_raw_parts_mut(self.null_write_sink.add(offset), actual_count)
             };
         }
-        let bytes = self.bytes_mut();
-        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().add(addr), count_usize) }
+        &mut self.bytes_mut()[addr..][..count as usize]
     }
 
     /// Get a pointer for reading an array of `count` elements of type `T`.
@@ -760,6 +699,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>, count: GuestUSize) -> *const T
     where
         T: SafeRead,
@@ -796,6 +736,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at_mut<T>(&mut self, ptr: MutPtr<T>, count: GuestUSize) -> *mut T
     where
         T: SafeRead + SafeWrite,
@@ -815,8 +756,9 @@ impl Mem {
         let guest_mem_range = self.bytes().as_ptr_range();
         assert!(guest_mem_range.contains(&host_ptr));
         let guest_addr = host_ptr as usize - guest_mem_range.start as usize;
-        // The extended address space (see `Bytes`) can legitimately produce
-        // addresses past 32 bits; truncate instead of panicking.
+        // XaView BypassGuestAddrOverflow: the extended address space (see
+        // `Bytes`) can legitimately produce addresses past 32 bits; truncate
+        // instead of panicking.
         Ptr::from_bits(guest_addr as u32)
     }
 
@@ -832,36 +774,31 @@ impl Mem {
     /// Read a value for memory.
     /// This is the preferred way to read memory in
     /// most cases.
+    #[inline]
     pub fn read<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>) -> T
     where
         T: SafeRead,
     {
-        let addr = ptr.to_bits();
-        let size = guest_size_of::<T>();
-        if self.invalid_access(addr, size) {
-            Self::null_check_fail(addr, size, false, "read");
-            return unsafe { std::mem::zeroed() };
-        }
-        let bytes = self.bytes();
-        let ptr = unsafe { bytes.as_ptr().add(addr as usize).cast::<T>() };
-        unsafe { ptr.read_unaligned() }
+        // This is unsafe unless we are careful with which types SafeRead is
+        // implemented for!
+        // This would also be unsafe if the non-unaligned method was used.
+        unsafe { self.ptr_at(ptr, 1).read_unaligned() }
     }
     /// Write a value to memory.
     /// This is the preferred way to write memory in
     /// most cases.
+    #[inline]
     pub fn write<T>(&mut self, ptr: MutPtr<T>, value: T)
     where
         T: SafeWrite,
     {
-        let addr = ptr.to_bits();
         let size = guest_size_of::<T>();
         assert!(size > 0);
-        if self.invalid_access(addr, size) {
-            Self::null_check_fail(addr, size, true, "write");
-            return;
-        }
-        let bytes = self.bytes_mut();
-        let ptr = unsafe { bytes.as_mut_ptr().add(addr as usize).cast::<T>() };
+        let slice = self.bytes_at_mut(ptr.cast(), size);
+        let ptr: *mut T = slice.as_mut_ptr().cast();
+        // It's unaligned because what is well-aligned for the guest is not
+        // necessarily well-aligned for the host.
+        // This would be unsafe if the non-unaligned method was used.
         unsafe { ptr.write_unaligned(value) }
     }
 
@@ -896,22 +833,11 @@ impl Mem {
             return;
         }
 
-        // A few guest runtimes pass NULL as an optional source while still
-        // supplying a non-zero length. Zero-fill a valid destination instead
-        // of leaving stale bytes there; stale bytes are what later become
-        // bogus string lengths, pointers, and allocation requests.
+        // Also reject NULL source — real memmove(dest, NULL, n) is UB
+        // but guest games (Geometry Dash) trigger it via corrupted strings.
         if src_addr == 0 && size > 0 {
-            let Some(dest_end) = dest_addr.checked_add(size_us).filter(|end| *end <= max) else {
-                log_once_fmt!(
-                    "WARNING: memmove from NULL had an invalid destination (dest={:#x}, size={:#x}); skipping",
-                    dest_addr,
-                    size_us,
-                );
-                return;
-            };
-            self.bytes_mut()[dest_addr..dest_end].fill(0);
-            log_once_fmt!(
-                "WARNING: memmove from NULL (first dest={:#x}, size={:#x}) — zero-filled the destination; repeated NULL-source memmoves are suppressed",
+            log!(
+                "WARNING: memmove from NULL (dest={:#x}, size={:#x}) — skipping",
                 dest_addr,
                 size_us,
             );
@@ -952,32 +878,31 @@ impl Mem {
 
     /// Allocate `size` bytes.
     pub fn alloc(&mut self, size: GuestUSize) -> MutVoidPtr {
-        if size > MAX_DEFENSIVE_GUEST_ALLOCATION {
-            log_once_fmt!(
-                "Warning: guest allocation of {:#x} bytes refused as out of range; repeated invalid allocation sizes are suppressed",
-                size
-            );
-            return MutVoidPtr::null();
-        }
-
         let ptr = Ptr::from_bits(self.allocator.alloc(size));
-        if !ptr.is_null() && !self.zero_memory_on_free && size <= EAGER_ZERO_FILL_LIMIT {
+        if !self.zero_memory_on_free {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
         }
 
-        log_sampled!(1024, "Allocated {:?} ({:#x} bytes)", ptr, size);
+        log_dbg!("Allocated {:?} ({:#x} bytes)", ptr, size);
         ptr
     }
 
     /// Allocate `size` bytes initialized to 0.
     pub fn calloc(&mut self, size: GuestUSize) -> MutVoidPtr {
         let ptr = self.alloc(size);
-        if !ptr.is_null() {
-            self.bytes_at_mut(ptr.cast(), size).fill(0);
-        }
+        self.bytes_at_mut(ptr.cast(), size).fill(0);
         ptr
     }
 
+    /// Implements Apple's documented `malloc_size(3)` contract: returns the
+    /// size of the memory block that backs the allocation pointed to by
+    /// `ptr`, or `0` if `ptr` is `NULL` or doesn't belong to any block
+    /// allocated through malloc. This is deliberately a *silent* lookup —
+    /// it's perfectly normal for apps to call `malloc_size` on arbitrary
+    /// pointers (interior pointers, `__DATA` symbols, stack addresses,
+    /// etc.) and treat a `0` result as "this isn't a heap allocation",
+    /// so we must not flood the log when it happens. See
+    /// <https://developer.apple.com/library/archive/documentation/Performance/Conceptual/ManagingMemory/Articles/MallocDebug.html>.
     pub fn malloc_size(&self, ptr: ConstVoidPtr) -> GuestUSize {
         if ptr.is_null() {
             return 0;
@@ -993,38 +918,23 @@ impl Mem {
         self.allocator.is_known_allocation(addr)
     }
 
-    pub fn allocation_containing(&self, addr: VAddr) -> Option<(VAddr, GuestUSize)> {
-        self.allocator.allocation_containing(addr)
-    }
-
-    /// Return a snapshot of the base address and size of each live allocation.
-    pub fn live_allocations(&self) -> Vec<(VAddr, GuestUSize)> {
+    /// Returns a snapshot of all currently-live heap allocations as
+    /// `(base_address, size_in_bytes)` pairs.
+    ///
+    /// This is used by the RTCV-style memory corruption engine
+    /// ([crate::corrupt]) so it can target only memory the guest has actually
+    /// allocated, which keeps corruption "interesting" (it mangles live game
+    /// state) while avoiding writes to unmapped address space that would just
+    /// crash the emulator immediately.
+    pub fn live_allocations(&self) -> Vec<(GuestUSize, GuestUSize)> {
         self.allocator.live_allocations()
     }
 
-    pub fn was_freed(&self, addr: VAddr) -> bool {
-        self.allocator.was_freed(addr)
-    }
-
-    /// Returns the original allocation for a pointer returned by
-    /// `posix_memalign`/`valloc`, if its bookkeeping header is valid.
-    pub fn aligned_allocation_base(&self, ptr: ConstVoidPtr) -> Option<MutVoidPtr> {
-        let addr = ptr.to_bits();
-        if addr < 8 {
-            return None;
-        }
-        let magic: u32 = self.read(ConstPtr::from_bits(addr - 8));
-        if magic != ALIGNED_ALLOCATION_MAGIC {
-            return None;
-        }
-        let raw_bits: u32 = self.read(ConstPtr::from_bits(addr - 4));
-        if self.allocator.is_known_allocation(raw_bits) {
-            Some(MutVoidPtr::from_bits(raw_bits))
-        } else {
-            None
-        }
-    }
-
+    /// Corrupt a single byte of guest memory at `addr` by replacing it with
+    /// `value`, RTCV "Blast"-style. Returns the previous byte value.
+    ///
+    /// SAFETY/CORRECTNESS: `addr` must lie within a live allocation (see
+    /// [Self::live_allocations]). The corruption engine guarantees this.
     pub fn corrupt_byte(&mut self, addr: GuestUSize, value: u8) -> u8 {
         let ptr: MutPtr<u8> = Ptr::from_bits(addr);
         let slice = self.bytes_at_mut(ptr, 1);
@@ -1038,19 +948,35 @@ impl Mem {
             return self.alloc(size);
         }
 
-        // TODO: for a moment we always assume that we do not have enough size
-        //       to realloc inplace
         let old_size = self.allocator.find_allocated_size(old_ptr.to_bits());
         if old_size >= size {
             return old_ptr;
         }
 
-        let new_ptr = self.alloc(size);
-        if new_ptr.is_null() {
-            // Match libc realloc: a failed resize leaves the original
-            // allocation untouched so callers can recover without losing it.
-            return MutVoidPtr::null();
+        // Fast path: if the memory right after the allocation happens to be
+        // free, grow the allocation in place instead of allocating a new
+        // block, copying everything and freeing the old one. Apps that grow
+        // buffers repeatedly (arrays, string builders, asset loading) hit
+        // this path a lot.
+        if let Some(grown_size) = self
+            .allocator
+            .grow_in_place(old_ptr.to_bits(), old_size, size)
+        {
+            // Mirror `alloc`: memory is only pre-zeroed when the allocator
+            // is configured to hand out zeroed memory; zero just the tail.
+            if self.zero_memory_on_free {
+                self.bytes_at_mut(old_ptr.cast(), grown_size)[old_size as usize..].fill(0);
+            }
+            log_dbg!(
+                "Reallocated in place {:?} ({:#x} -> {:#x} bytes)",
+                old_ptr,
+                old_size,
+                grown_size
+            );
+            return old_ptr;
         }
+
+        let new_ptr = self.alloc(size);
         self.memmove(new_ptr, old_ptr.cast_const(), old_size);
         self.free(old_ptr);
         new_ptr
@@ -1070,39 +996,7 @@ impl Mem {
         }
         // Reject obviously bogus pointers before passing to the allocator.
         if !self.allocator.is_known_allocation(addr) {
-            if let Some(raw) = self.aligned_allocation_base(ptr.cast_const()) {
-                self.free(raw);
-                return;
-            }
-            if let Some((base, size)) = self.allocation_containing(addr) {
-                if base == PAGE_SIZE && addr < self.null_segment_size {
-                    log_dbg_once_fmt!(
-                        "Ignoring free of {:#x} inside the reserved null segment; live allocation {:#x} ({:#x} bytes) was left intact",
-                        addr,
-                        base,
-                        size
-                    );
-                } else {
-                    log_once_fmt!(
-                        "Ignoring invalid interior free {:#x}: live allocation {:#x} ({:#x} bytes) was left intact",
-                        addr,
-                        base,
-                        size
-                    );
-                }
-                return;
-            }
-            if self.was_freed(addr) {
-                log_dbg_once_fmt!(
-                    "Can't free {:#x}: double free detected; repeated invalid frees are suppressed",
-                    addr
-                );
-                return;
-            }
-            log_dbg_once_fmt!(
-                "Can't free {:#x}: unknown allocation; repeated invalid frees are suppressed",
-                addr
-            );
+            log!("Can't free {:#x}, unknown allocation!", addr);
             return;
         }
         let size = self.allocator.free(addr);
@@ -1110,7 +1004,7 @@ impl Mem {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
         }
 
-        log_sampled!(1024, "Freed {:?} ({:#x} bytes)", ptr, size);
+        log_dbg!("Freed {:?} ({:#x} bytes)", ptr, size);
     }
 
     /// Allocate memory large enough for a value of type `T` and write the value
@@ -1252,21 +1146,6 @@ mod mem_tests {
     }
 
     #[test]
-    fn null_page_reads_are_zero_and_writes_are_discarded() {
-        let mut mem = Mem::new();
-        mem.set_null_segment_size(super::PAGE_SIZE);
-
-        let null: Ptr<u32, true> = Ptr::from_bits(0);
-        assert_eq!(mem.read(null.cast_const()), 0);
-        mem.write(null, 0xdead_beef);
-        assert_eq!(mem.read(null.cast_const()), 0);
-
-        let near_top: Ptr<u32, true> = Ptr::from_bits(u32::MAX);
-        assert_eq!(mem.read(near_top.cast_const()), 0);
-        mem.write(near_top, 0xdead_beef);
-    }
-
-    #[test]
     fn ptr_arithmetic_wraps_modulo_2_32() {
         // Real 32-bit ARM computes addresses modulo 2^32 and never traps on
         // the arithmetic itself. These cases previously panicked the host via
@@ -1281,30 +1160,5 @@ mod mem_tests {
         // overflow when the multiplied offset exceeds the address space.
         let p: Ptr<u32, true> = Ptr::from_bits(0xFFFF_FFF0);
         assert_eq!((p + 0x8).to_bits(), 0x0000_0010);
-    }
-
-    #[test]
-    fn oversized_allocations_return_null_without_touching_memory() {
-        let mut mem = Mem::new();
-        let size = super::MAX_DEFENSIVE_GUEST_ALLOCATION + 1;
-        assert!(mem.alloc(size).is_null());
-        assert!(mem.calloc(size).is_null());
-    }
-
-    #[test]
-    fn first_allocation_skips_reserved_null_page() {
-        let mut mem = Mem::new();
-        let ptr = mem.calloc(16);
-        assert_eq!(ptr.to_bits(), super::PAGE_SIZE);
-        mem.free(ptr);
-    }
-
-    #[test]
-    fn allocation_stays_after_extended_null_segment() {
-        let mut mem = Mem::new();
-        mem.set_null_segment_size(super::PAGE_SIZE * 2);
-        let ptr = mem.calloc(16);
-        assert_eq!(ptr.to_bits(), super::PAGE_SIZE * 2);
-        mem.free(ptr);
     }
 }

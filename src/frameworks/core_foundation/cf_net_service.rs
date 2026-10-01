@@ -919,8 +919,8 @@ pub fn CFNetServiceRegisterWithOptions(
     };
 
     let host_name = match socket.local_addr {
-        Some(addr) => format!("{}-metalhle.local", addr.octets()[3]),
-        None => "metalhle.local".to_string(),
+        Some(addr) => format!("{}-hyperhle.local", addr.octets()[3]),
+        None => "hyperhle.local".to_string(),
     };
     // Name-conflict auto-rename: if we are already registered under this
     // name and auto-rename is allowed, append a suffix.

@@ -12,23 +12,18 @@
 use crate::{msg, Environment};
 use std::time::Instant;
 
-use crate::dyld::{FunctionExports, HostConstant};
-use crate::export_c_func;
+use crate::dyld::{export_c_func, FunctionExports, HostConstant};
+use crate::frameworks::core_graphics::cg_geometry::CGSize;
+use crate::mem::{ConstVoidPtr, MutPtr};
 
-/// `BOOL UIAccessibilityIsGuidedAccessEnabled(void)` — guided-access is a
-/// device-administration mode that cannot be enabled inside the emulator;
-/// apps use it to adjust behaviour and must get a plain `false`.
-/// `BOOL UIAccessibilityIsGuidedAccessEnabled(void)` — guided-access is a
-/// device-administration mode that cannot be enabled inside the emulator;
-/// apps use it to adjust behaviour and must get a plain `false`.
+/// HyperHLE does not emulate an active iOS Guided Access session.
 fn UIAccessibilityIsGuidedAccessEnabled(_env: &mut Environment) -> bool {
     false
 }
 
-const UI_ACCESSIBILITY_FUNCTIONS: FunctionExports = &[
+const FUNCTIONS: FunctionExports = &[
     export_c_func!(UIAccessibilityIsGuidedAccessEnabled()),
 ];
-use crate::mem::{ConstVoidPtr, MutPtr};
 
 pub mod ui_accelerometer;
 pub mod ui_action_sheet;
@@ -36,14 +31,13 @@ pub mod ui_activity;
 pub mod ui_activity_indicator_view;
 pub mod ui_alert_controller;
 pub mod ui_application;
-pub mod ui_bezier_path;
 pub mod ui_color;
 pub mod ui_custom_object;
 pub mod ui_device;
 pub mod ui_document;
 pub mod ui_event;
+pub mod ui_bezier_path;
 pub mod ui_font;
-pub mod ui_text_input;
 pub mod ui_geometry;
 pub mod ui_gesture_recognizer;
 pub mod ui_graphics;
@@ -66,6 +60,7 @@ pub mod ui_search_bar;
 pub mod ui_split_view_controller;
 pub mod ui_storyboard;
 pub mod ui_tab_bar_controller;
+pub mod ui_text_input;
 pub mod ui_tab_bar_item;
 pub mod ui_touch;
 pub mod ui_view;
@@ -236,10 +231,25 @@ fn uia_trait_tab_bar(env: &mut Environment) -> ConstVoidPtr {
     write_uiaccessibility_trait(env, 1 << 18)
 }
 
+fn ui_layout_fitting_size(env: &mut Environment, width: f32, height: f32) -> ConstVoidPtr {
+    env.mem
+        .alloc_and_write(crate::frameworks::core_graphics::CGSize { width, height })
+        .cast()
+        .cast_const()
+}
+
 pub const CONSTANTS: &[(&str, HostConstant)] = &[
     (
         "_UIBackgroundTaskInvalid",
         HostConstant::Custom(ui_background_task_invalid),
+    ),
+    (
+        "_UILayoutFittingCompressedSize",
+        HostConstant::Custom(|env| ui_layout_fitting_size(env, 0.0, 0.0)),
+    ),
+    (
+        "_UILayoutFittingExpandedSize",
+        HostConstant::Custom(|env| ui_layout_fitting_size(env, -1.0, -1.0)),
     ),
     (
         "_UIImagePickerControllerOriginalImage",
@@ -916,8 +926,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_activity::CLASSES,
         ui_alert_controller::CLASSES,
         ui_application::CLASSES,
-        ui_bezier_path::CLASSES,
         ui_color::CLASSES,
+        ui_bezier_path::CLASSES,
         ui_custom_object::CLASSES,
         ui_device::CLASSES,
         ui_document::CLASSES,
@@ -930,8 +940,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_launch_delegate::CLASSES,
         ui_local_notification::CLASSES,
         ui_navigation_bar::CLASSES,
-        ui_text_input::CLASSES,
-        ui_view::ui_refresh_control::CLASSES,
         ui_nib::CLASSES,
         ui_pasteboard::CLASSES,
         ui_pinch_gesture_recognizer::CLASSES,
@@ -960,6 +968,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view::ui_image_view::CLASSES,
         ui_view::ui_label::CLASSES,
         ui_view::ui_page_control::CLASSES,
+        ui_view::ui_refresh_control::CLASSES,
+        ui_text_input::CLASSES,
         ui_view::ui_picker_view::CLASSES,
         ui_view::ui_scroll_view::CLASSES,
         ui_view::ui_scroll_view::ui_text_view::CLASSES,
@@ -983,7 +993,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         CONSTANTS,
     ],
     function_exports: &[
-        UI_ACCESSIBILITY_FUNCTIONS,
+        FUNCTIONS,
         ui_application::FUNCTIONS,
         ui_geometry::FUNCTIONS,
         ui_graphics::FUNCTIONS,
@@ -994,10 +1004,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 
 #[derive(Default)]
 pub struct State {
-    /// Set when `-[UIWindow addSubview:]` really applied the auto-rotation
-    /// transform (see `ui_window.rs`). EAGL direct presenters gate their
-    /// 180-degree compensation on this (HyperHLE 0a590067).
-    pub autorotation_transform_applied: bool,
     ui_accelerometer: ui_accelerometer::State,
     ui_application: ui_application::State,
     ui_color: ui_color::State,
@@ -1055,26 +1061,26 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 // returns; only `AppWillTerminate` (Android `onDestroy`) is
                 // treated as a real shutdown.
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillresignactive(_:)
-                log!("Handling app-will-resign-active event.");
+                log_dbg!("Handling app-will-resign-active event.");
                 ui_application::handle_will_resign_active(env);
             }
             Event::AppDidEnterBackground => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidenterbackground(_:)
-                log!("Handling app-did-enter-background event.");
+                log_dbg!("Handling app-did-enter-background event.");
                 ui_application::handle_did_enter_background(env);
             }
             Event::AppWillEnterForeground => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillenterforeground(_:)
-                log!("Handling app-will-enter-foreground event.");
+                log_dbg!("Handling app-will-enter-foreground event.");
                 ui_application::handle_will_enter_foreground(env);
             }
             Event::AppDidBecomeActive => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidbecomeactive(_:)
-                log!("Handling app-did-become-active event.");
+                log_dbg!("Handling app-did-become-active event.");
                 ui_application::handle_did_become_active(env);
             }
             Event::AppWillTerminate => {
-                log!("Handling app-will-terminate event.");
+                log_dbg!("Handling app-will-terminate event.");
                 ui_application::exit(env);
             }
             Event::EnterDebugger => {
@@ -1087,20 +1093,53 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             }
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
-                let class = msg![env; responder class];
-                let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
-
-                if !responder.is_null() && env.objc.class_is_subclass_of(class, ui_text_field_class)
-                {
-                    match text_event {
-                        TextInputEvent::Text(text) => {
-                            ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                if !responder.is_null() {
+                    let class = msg![env; responder class];
+                    let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
+                    if env.objc.class_is_subclass_of(class, ui_text_field_class) {
+                        match text_event {
+                            TextInputEvent::Text(text) => {
+                                ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                            }
+                            TextInputEvent::Backspace => {
+                                ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
+                            }
+                            TextInputEvent::Return => {
+                                ui_view::ui_control::ui_text_field::handle_return(env, responder)
+                            }
                         }
-                        TextInputEvent::Backspace => {
-                            ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
-                        }
-                        TextInputEvent::Return => {
-                            ui_view::ui_control::ui_text_field::handle_return(env, responder)
+                    } else {
+                        let ui_text_view_class = env.objc.get_known_class("UITextView", &mut env.mem);
+                        if env.objc.class_is_subclass_of(class, ui_text_view_class) {
+                            match text_event {
+                                TextInputEvent::Text(text) => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_text(env, responder, text)
+                                }
+                                TextInputEvent::Backspace => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_backspace(env, responder)
+                                }
+                                TextInputEvent::Return => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
+                                }
+                            }
+                        } else {
+                            let ui_search_bar_class =
+                                env.objc.get_known_class("UISearchBar", &mut env.mem);
+                            if env.objc.class_is_subclass_of(class, ui_search_bar_class) {
+                                match text_event {
+                                    TextInputEvent::Text(text) => {
+                                        ui_search_bar::handle_text(env, responder, text)
+                                    }
+                                    TextInputEvent::Backspace => {
+                                        ui_search_bar::handle_backspace(env, responder)
+                                    }
+                                    TextInputEvent::Return => {
+                                        ui_search_bar::handle_return(env, responder)
+                                    }
+                                }
+                            } else if ui_responder::is_text_input_responder(env, responder) {
+                                ui_responder::handle_text_input_event(env, responder, text_event);
+                            }
                         }
                     }
                 }
@@ -1109,4 +1148,16 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     }
 
     ui_accelerometer::handle_accelerometer(env)
+}
+
+#[cfg(test)]
+mod accessibility_export_tests {
+    #[test]
+    fn guided_access_query_is_exported_as_a_function() {
+        let exports: Vec<_> = super::DYLIB.function_exports.iter()
+            .flat_map(|table| table.iter())
+            .filter(|(name, _)| *name == "_UIAccessibilityIsGuidedAccessEnabled")
+            .collect();
+        assert_eq!(exports.len(), 1);
+    }
 }

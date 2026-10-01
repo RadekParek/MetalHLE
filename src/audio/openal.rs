@@ -23,7 +23,6 @@
 // ============================================================
 
 use al_sys::alc_types::{ALCcontext, ALCdevice};
-use std::ffi::CStr;
 use std::marker::PhantomData;
 use touchHLE_openal_soft_wrapper as al_sys;
 use touchHLE_openal_soft_wrapper::alc_types::ALCint;
@@ -44,7 +43,6 @@ static OPENALMANAGER_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
 pub struct OpenALManager {}
 impl OpenALManager {
     pub fn new() -> Result<Self, String> {
-        ensure_openal_backend_available();
         if OPENALMANAGER_INSTANCE_EXISTS.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err("Only one OpenALManager can exist at a time!".to_string());
         }
@@ -66,55 +64,15 @@ impl OpenALManager {
         // env var is read on the first OpenAL call, so it must be set before
         // any device is opened. We only do this if the user hasn't already
         // chosen a driver explicitly.
+        ensure_openal_backend_available();
         Ok(Self {})
     }
 }
 
 fn ensure_openal_backend_available() {
-    // No Android-specific ALSOFT_* overrides: upstream touchHLE relies on
-    // OpenAL Soft's own defaults, and its audio is measurably smoother than
-    // the short 256-sample mixer block this fork used to force (which caused
-    // frequent underruns under guest CPU load). Users can still tune latency
-    // themselves via ALSOFT_UPDATE_SIZE / ALSOFT_BUFFER_SIZE /
-    // ALSOFT_MIXER_THREADS; explicit settings always win.
-
     // Respect any user-provided override.
     if std::env::var_os("ALSOFT_DRIVERS").is_some() {
         return;
-    }
-
-    let requested_backend = std::env::var("TOUCHHLE_AUDIO_BACKEND").unwrap_or_default();
-    if requested_backend == "core" || std::env::var_os("TOUCHHLE_CORE_AUDIO").is_some() {
-        if cfg!(target_os = "macos") {
-            unsafe {
-                std::env::set_var("ALSOFT_DRIVERS", "core");
-            }
-            log!("Core audio selected: OpenAL Soft is using its native CoreAudio driver");
-            return;
-        }
-        log!(
-            "Core audio was selected, but this platform has no native CoreAudio driver; using the host default"
-        );
-    } else if requested_backend == "opensl" {
-        if cfg!(target_os = "android") {
-            unsafe {
-                std::env::set_var("ALSOFT_DRIVERS", "opensl");
-            }
-            log!("Audio backend selected: OpenSL ES");
-            return;
-        }
-        log!("OpenSL ES was selected, but this platform has no OpenSL ES backend; using the host default");
-    } else if requested_backend == "aaudio" {
-        if cfg!(target_os = "android") {
-            unsafe {
-                std::env::set_var("ALSOFT_DRIVERS", "opensl");
-            }
-            log!("AAudio was selected; bundled OpenAL Soft has no AAudio driver, using its Android OpenSL ES compatibility backend");
-            return;
-        }
-        log!(
-            "AAudio was selected, but this platform has no AAudio backend; using the host default"
-        );
     }
 
     if host_audio_backend_available() {
@@ -131,9 +89,6 @@ fn ensure_openal_backend_available() {
     // made. No other thread can be reading the environment concurrently.
     unsafe {
         std::env::set_var("ALSOFT_DRIVERS", "null");
-        if std::env::var_os("ALSOFT_UPDATE_SIZE").is_none() {
-            std::env::set_var("ALSOFT_UPDATE_SIZE", "256");
-        }
         if std::env::var_os("ALSOFT_BUFFER_SIZE").is_none() {
             std::env::set_var("ALSOFT_BUFFER_SIZE", "1024");
         }
@@ -178,24 +133,6 @@ impl Drop for OpenALManager {
     }
 }
 
-fn log_openal_device(device: *mut ALCdevice) {
-    if device.is_null() {
-        return;
-    }
-    let name = unsafe { al_sys::alcGetString(device, ALC_DEVICE_SPECIFIER) };
-    let name = if name.is_null() {
-        "<unknown>".to_string()
-    } else {
-        unsafe { CStr::from_ptr(name.cast()).to_string_lossy().into_owned() }
-    };
-    log!(
-        "OpenAL audio device selected: {:?}; driver preference={:?}; device={}",
-        device,
-        std::env::var("ALSOFT_DRIVERS").unwrap_or_else(|_| "host default".to_string()),
-        name
-    );
-}
-
 #[derive(Debug)]
 pub struct OpenALContext {
     context: *mut ALCcontext,
@@ -229,7 +166,6 @@ impl OpenALContext {
                 );
             }
         }
-        log_openal_device(device);
         match unsafe { Self::new_with_device_and_attrlist(_manager, device, std::ptr::null()) } {
             Ok(ctx) => Ok(ctx),
             Err(e) => {
@@ -272,14 +208,10 @@ impl OpenALContext {
         if context.is_null() {
             return Err("Could not open OpenAL context".to_string());
         }
-        log!(
-            "OpenAL context created: device={:?}, context={:?}, core_audio_mode={}, mixer_threads={:?}, update_size={:?}, buffer_size={:?}",
+        log_dbg!(
+            "New OpenAL device ({:?}) and context ({:?})",
             device,
-            context,
-            std::env::var_os("TOUCHHLE_CORE_AUDIO").is_some(),
-            std::env::var("ALSOFT_MIXER_THREADS").ok(),
-            std::env::var("ALSOFT_UPDATE_SIZE").ok(),
-            std::env::var("ALSOFT_BUFFER_SIZE").ok(),
+            context
         );
         Ok(Self { context, device })
     }

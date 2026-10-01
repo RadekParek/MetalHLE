@@ -8,7 +8,7 @@ version = "2.0.0"
 edition = "2021"
 license = "MPL-2.0"
 authors = ["touchHLE project contributors"]
-homepage = "https://github.com/RadekParek/MetalHLE"
+
 [package]
 name = "touchHLE"
 version = { workspace = true }
@@ -53,8 +53,6 @@ rusttype = "0.9.3"
 # active patent claims. The "aac" feature only enables AAC-LC, so it's should 
 # be ok.
 # (The above statements should not understood as legal claims/advice.)
-openh264 = "0.9.8"
-wgpu = { version = "0.20.1", default-features = false, features = ["wgsl", "metal", "dx12", "glsl", "vulkan-portability"] }
 symphonia = { version = "0.6.0", default-features = false, features = [
     # formats
     "aiff", "caf", "isomp4", "wav",
@@ -102,10 +100,7 @@ encoding_rs = "0.8.35"
 # behind this, but the actual HIDAPI is not used by touchHLE (see window.rs).
 # Note that the submodule in vendor/SDL2/ must use exactly the same revision of
 # SDL2 that rust-sdl2 uses, so that the Android JNI interface matches.
-sdl2 = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", features = ["hidapi", "raw-window-handle"] }
-raw-window-handle = "0.6.2"
-pollster = "0.3.0"
-bytemuck = { version = "1.16.3", features = ["derive"] }
+sdl2 = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", features = ["hidapi"] }
 sdl2-sys = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3" }
 touchHLE_dynarmic_wrapper = { path = "src/cpu/dynarmic_wrapper" }
 touchHLE_gl_bindings = { path = "src/gles/gl_bindings" }
@@ -119,7 +114,6 @@ windows-sys = { version = "0.61.0", features = [
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
-    "Win32_System_Threading",
 ] }
 nibarchive = "0.1.0"
 libc = "0.2.180"

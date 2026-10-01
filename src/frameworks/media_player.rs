@@ -12,10 +12,9 @@ mod media_picker_controller;
 mod media_playlist;
 mod media_query;
 pub mod mf_mail_compose_view_controller;
-mod movie_demux;
 mod movie_player;
-mod mp_volume_view;
 mod movie_video;
+mod mp_volume_view;
 mod music_player;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
@@ -23,7 +22,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     aliases: &[],
     class_exports: &[
         movie_player::CLASSES,
-        mp_volume_view::CLASSES,
         music_player::CLASSES,
         media_entity::CLASSES,
         media_item_collection::CLASSES,
@@ -31,6 +29,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         media_picker_controller::CLASSES,
         media_playlist::CLASSES,
         media_query::CLASSES,
+        mp_volume_view::CLASSES,
         mf_mail_compose_view_controller::CLASSES,
     ],
     constant_exports: &[

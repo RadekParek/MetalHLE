@@ -184,7 +184,6 @@ pub fn pthread_cond_timedwait(
     host_object.curr_mutex = Some(mutex_id);
     host_object.waiting.push_back(current_thread);
 
-    std::thread::yield_now();
     env.yield_thread(ThreadBlock::Condition(cond, Some(deadline)));
 
     let host_object = State::get_mut(env)
@@ -241,7 +240,6 @@ pub fn pthread_cond_wait(
     host_object.curr_mutex = Some(mutex_id);
     host_object.waiting.push_back(current_thread);
 
-    std::thread::yield_now();
     env.yield_thread(ThreadBlock::Condition(cond, None));
 
     let host_object = State::get_mut(env)

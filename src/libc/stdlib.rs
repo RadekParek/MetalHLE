@@ -11,14 +11,13 @@ use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::fs::{resolve_path, GuestPath};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
 use crate::libc::errno::{set_errno, EINVAL};
+use crate::libc::signal::{raise_signal, RaiseOutcome, SIGABRT};
 use crate::libc::string::strlen;
 use crate::libc::wchar::wchar_t;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::objc::id;
 use crate::{impl_GuestRet_for_large_struct, Environment};
-use std::io::Read;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod qsort;
 
@@ -27,7 +26,6 @@ pub struct State {
     rand: u32,
     random: u32,
     arc4random: u32,
-    fcvt_buf: Option<MutPtr<u8>>,
     /// 48-bit linear-congruential PRNG state shared by the `drand48`/`lrand48`/
     /// `mrand48`/`seed48` family. Per the POSIX / Apple `drand48(3)` manpage
     /// (<https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/drand48.3.html>)
@@ -118,8 +116,8 @@ fn malloc(env: &mut Environment, mut size: GuestUSize) -> MutVoidPtr {
     // sometimes compute nonsensical allocation sizes due to NULL pointer
     // arithmetic when upstream issues cause initialization failures).
     if size > 0x2000_0000 {
-        log_once_fmt!(
-            "TouchHLE::libc::stdlib: malloc({:#x}) refused as out of range — returning NULL; repeated invalid sizes are suppressed",
+        log!(
+            "TouchHLE::libc::stdlib: malloc({:#x}) refused as out of range — returning NULL",
             size
         );
         set_errno(env, crate::libc::errno::ENOMEM);
@@ -160,8 +158,8 @@ fn calloc(env: &mut Environment, count: GuestUSize, size: GuestUSize) -> MutVoid
     // Same out-of-range guard as malloc: refuse obviously-corrupted sizes
     // instead of exhausting the guest heap.
     if total > 0x2000_0000 {
-        log_once_fmt!(
-            "TouchHLE::libc::stdlib: calloc total {:#x} refused as out of range — returning NULL; repeated invalid sizes are suppressed",
+        log!(
+            "TouchHLE::libc::stdlib: calloc total {:#x} refused as out of range — returning NULL",
             total
         );
         set_errno(env, crate::libc::errno::ENOMEM);
@@ -248,8 +246,8 @@ fn posix_memalign(
         return 0;
     }
     // Over-allocate so that we definitely have room for an aligned slice
-    // plus an 8-byte header storing a magic value and the original allocation pointer.
-    let header: GuestUSize = (std::mem::size_of::<u32>() * 2) as GuestUSize;
+    // plus a 4-byte header storing the original allocation pointer.
+    let header: GuestUSize = std::mem::size_of::<u32>() as GuestUSize;
     let Some(over) = size
         .checked_add(alignment)
         .and_then(|s| s.checked_add(header))
@@ -262,21 +260,12 @@ fn posix_memalign(
     }
     let raw_bits = raw.to_bits();
     // Align up to `alignment` while leaving at least `header` bytes free
-    // before the aligned address for our bookkeeping words.
-    let Some(aligned_bits) = raw_bits
-        .checked_add(header)
-        .and_then(|value| value.checked_add(alignment - 1))
-        .map(|value| value & !(alignment - 1))
-    else {
-        env.mem.free(raw);
-        return crate::libc::errno::ENOMEM;
-    };
+    // before the aligned address for our bookkeeping word.
+    let aligned_bits = (raw_bits + header + alignment - 1) & !(alignment - 1);
+    debug_assert!(aligned_bits >= raw_bits + header);
     let aligned: MutVoidPtr = MutVoidPtr::from_bits(aligned_bits);
-    let magic_ptr: MutPtr<u32> = MutPtr::from_bits(aligned_bits - header);
-    let raw_ptr: MutPtr<u32> = MutPtr::from_bits(aligned_bits - std::mem::size_of::<u32>() as u32);
-    env.mem
-        .write(magic_ptr, crate::mem::ALIGNED_ALLOCATION_MAGIC);
-    env.mem.write(raw_ptr, raw_bits);
+    let header_ptr: MutPtr<u32> = MutPtr::from_bits(aligned_bits - header);
+    env.mem.write(header_ptr, raw_bits);
     env.mem.write(memptr, aligned);
     0
 }
@@ -362,36 +351,15 @@ fn free(env: &mut Environment, ptr: MutVoidPtr) {
     // This catches cases where a buggy stub returned garbage that the guest
     // later hands back to free() (e.g. misinterpreting a float as a pointer).
     if !env.mem.is_known_allocation(addr) {
-        if let Some(raw) = env.mem.aligned_allocation_base(ptr.cast_const()) {
-            env.mem.free(raw);
-            return;
-        }
         let pc = env.cpu.regs()[crate::cpu::Cpu::PC];
         let lr = env.cpu.regs()[crate::cpu::Cpu::LR];
-        if let Some((base, size)) = env.mem.allocation_containing(addr) {
-            log_once_fmt!(
-                "free({:#x}) rejected: pointer is inside live allocation {:#x} ({:#x} bytes); caller PC={:#x} LR={:#x}",
-                addr,
-                base,
-                size,
-                pc,
-                lr
-            );
-        } else if env.mem.was_freed(addr) {
-            log_once_fmt!(
-                "free({:#x}) rejected: double free; caller PC={:#x} LR={:#x}",
-                addr,
-                pc,
-                lr
-            );
-        } else {
-            log_once_fmt!(
-                "free({:#x}) rejected: not a known allocation (caller PC={:#x} LR={:#x})",
-                addr,
-                pc,
-                lr
-            );
-        }
+        log!(
+            "free({:#x}) rejected: not a known allocation \
+             (caller PC={:#x} LR={:#x})",
+            addr,
+            pc,
+            lr
+        );
         return;
     }
     env.mem.free(ptr);
@@ -474,37 +442,10 @@ fn srand(env: &mut Environment, seed: u32) {
     env.libc_state.stdlib.rand = seed;
 }
 
-fn host_entropy_seed() -> u32 {
-    let mut bytes = [0u8; 4];
-    if let Ok(mut source) = std::fs::File::open("/dev/urandom") {
-        if source.read_exact(&mut bytes).is_ok() {
-            let seed = u32::from_ne_bytes(bytes);
-            if seed != 0 {
-                return seed;
-            }
-        }
-    }
-
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0);
-    let address = (&bytes as *const [u8; 4]) as usize as u64;
-    let mixed = clock ^ address.rotate_left(17) ^ (clock >> 29);
-    let seed = (mixed as u32) ^ ((mixed >> 32) as u32);
-    if seed == 0 {
-        0x6d2b79f5
-    } else {
-        seed
-    }
-}
-
 fn sranddev(env: &mut Environment) {
-    let seed = host_entropy_seed();
+    let seed = arc4random(env);
     env.libc_state.stdlib.rand = seed;
-    env.libc_state.stdlib.random = seed.rotate_left(13);
-    env.libc_state.stdlib.arc4random = seed.rotate_left(7);
-    log_dbg!("sranddev() seeded libc PRNGs from host entropy");
+    log!("sranddev() stubbed: seeded rand with {}", seed);
 }
 
 fn rand(env: &mut Environment) -> i32 {
@@ -857,39 +798,156 @@ fn unsetenv(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
     }
 }
 
-fn exit(env: &mut Environment, exit_code: i32) {
-    set_errno(env, 0);
-
-    // Забираем список функций через mem::take, чтобы избежать проблем с borrow
-    // checker,
-    // так как вызов call_from_host требует мутабельного доступа к env.
-    let handlers = std::mem::take(&mut env.libc_state.stdlib.atexit_handlers);
-
-    // По стандарту atexit вызывает функции в обратном порядке (LIFO), поэтому
-    // делаем .rev()
-    for func in handlers.into_iter().rev() {
-        log_dbg!("Executing atexit handler: {:?}", func);
-        // Вызываем гостевую функцию (она не принимает аргументов и ничего не
-        // возвращает)
-        let _: () = func.call_from_host(env, ());
+/// Try to turn a guest-only termination request into a non-local guest return.
+///
+/// `abort` and the `exit` family are marked `noreturn` by their callers, so
+/// allowing their host-function stubs to return normally tends to execute an
+/// unreachable instruction in the guest. The shared C++ recovery helper instead
+/// validates the frame chain and resumes the nearest caller in the main app.
+pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str) -> bool {
+    if let Some(path) = env.missing_unity_player_archive() {
+        echo!(
+            "Guest {} follows unavailable Unity player archive {:?}; refusing \
+             unsafe frame recovery.",
+            termination,
+            path
+        );
+        return false;
     }
 
     log!(
-        "Guest exit({}) on emulated thread {} (bundle={}, current_pc={:#x})",
-        exit_code,
-        env.current_thread,
-        env.bundle.bundle_identifier(),
-        env.cpu.pc_with_thumb_bit().addr_without_thumb_bit()
+        "Guest {} on emulated thread {}; attempting validated frame recovery.",
+        termination,
+        env.current_thread
     );
     env.stack_trace_current();
-    echo!("App called exit({}); touchHLE will now quit.", exit_code);
-    std::process::exit(exit_code);
+
+    if env.libc_state.signal.fatal_delivered {
+        // A fault-class signal was already delivered to a guest handler this
+        // session: the process crashed in the real-Darwin sense. Resuming a
+        // validated app frame from a crash reporter's stack leaves the app
+        // half-alive with no way to recover (observed: Turbo Dismount froze
+        // on a dead frame after SIGSEGV, then its crash reporter aborted).
+        // Release the session instead; benign abort()/exit() calls never
+        // see this.
+        echo!(
+            "Guest {} follows an earlier fatal hardware signal; refusing \
+             frame recovery and ending the guest session.",
+            termination
+        );
+        return false;
+    }
+
+    let Some(continuation) = crate::libc::cxxabi::unwind_to_app_frame(env) else {
+        return false;
+    };
+
+    echo!(
+        "Guest {} was recovered by unwinding to app frame {:#010x}.",
+        termination,
+        continuation.addr_with_thumb_bit()
+    );
+    true
+}
+
+/// End the guest session after recovery could not find a safe continuation.
+///
+/// This only requests a return through the active host boundary; it never exits
+/// or panics the emulator process directly.
+pub(crate) fn end_guest_termination(env: &mut Environment, termination: &str) {
+    echo!(
+        "App called {}; ending the guest session through the return-to-host \
+         path.",
+        termination
+    );
+    env.request_guest_termination();
+}
+
+/// Resume a validated app caller when possible, otherwise end only the guest.
+pub(crate) fn recover_or_end_guest_termination(env: &mut Environment, termination: &str) {
+    if !recover_guest_termination(env, termination) {
+        end_guest_termination(env, termination);
+    }
+}
+
+/// Follow the C `exit` contract only when the guest cannot be safely resumed.
+///
+/// In the common compatibility case, a nested library or DRM check calls
+/// `exit`; recovery happens before atexit handlers are drained so that the app
+/// can continue with its process state intact. An unrecoverable `exit` still
+/// runs its handlers, but returns through the emulator's controlled host
+/// boundary rather than ending the emulator process directly.
+fn exit(env: &mut Environment, exit_code: i32) {
+    set_errno(env, 0);
+    let termination = format!("exit({exit_code})");
+    if let Some(path) = env.missing_unity_player_archive().map(str::to_owned) {
+        // Unity has already declared engine initialization unrecoverable. Do
+        // not invoke atexit handlers or splice control flow into the caller:
+        // both paths run against partially initialized Unity global state.
+        echo!(
+            "Guest {} follows unavailable Unity player archive {:?}; ending the \
+             guest session without running atexit handlers.",
+            termination,
+            path
+        );
+        end_guest_termination(env, &termination);
+        return;
+    }
+    if recover_guest_termination(env, &termination) {
+        return;
+    }
+
+    // Take the handlers before calling guest code so recursively invoked exit
+    // handlers cannot execute the same registrations more than once.
+    let handlers = std::mem::take(&mut env.libc_state.stdlib.atexit_handlers);
+    for func in handlers.into_iter().rev() {
+        log_dbg!("Executing atexit handler: {:?}", func);
+        let _: () = func.call_from_host(env, ());
+        if env.is_guest_termination_requested() {
+            log_dbg!("An atexit handler requested controlled guest termination.");
+            break;
+        }
+    }
+
+    end_guest_termination(env, &termination);
+}
+
+/// Shared implementation for termination functions that do not run `atexit`
+/// handlers (`_exit`, `_Exit` and `quick_exit`).
+fn immediate_exit(env: &mut Environment, name: &str, exit_code: i32) {
+    set_errno(env, 0);
+    let termination = format!("{name}({exit_code})");
+    recover_or_end_guest_termination(env, &termination);
+}
+
+fn _exit(env: &mut Environment, exit_code: i32) {
+    immediate_exit(env, "_exit", exit_code);
+}
+
+fn _Exit(env: &mut Environment, exit_code: i32) {
+    immediate_exit(env, "_Exit", exit_code);
+}
+
+fn quick_exit(env: &mut Environment, exit_code: i32) {
+    immediate_exit(env, "quick_exit", exit_code);
 }
 
 fn abort(env: &mut Environment) {
-    echo!("App called abort(); the guest encountered a fatal error.");
-    env.stack_trace_current();
-    panic!("guest called abort()")
+    // Some games use abort() for recoverable DRM, networking or asset checks.
+    // The same validated recovery path used by exit avoids the old blind frame
+    // walk and, critically, does not terminate the emulator process.
+    //
+    // POSIX defines abort() as "unblock SIGABRT, raise it, and terminate if
+    // that returns". Raising first means an installed SIGABRT handler (crash
+    // reporters, Unity's unhandled-exception shim, ...) actually runs, which
+    // those apps rely on; the statements below then terminate unless the
+    // signal path already did.
+    let outcome = raise_signal(env, SIGABRT);
+    if outcome == RaiseOutcome::DefaultActionPerformed || env.is_guest_termination_requested()
+    {
+        return;
+    }
+    recover_or_end_guest_termination(env, "abort()");
 }
 
 fn bsearch(
@@ -937,6 +995,46 @@ fn strtof(env: &mut Environment, nptr: ConstPtr<u8>, endptr: MutPtr<ConstPtr<u8>
     number as f32
 }
 
+// `long double` on the iOS armv7 ABI is identical to `double`, so strtold*
+// return f64 exactly like strtod. The `_l` locale-aware variants take a
+// trailing `locale_t` we can ignore: our parsing is already locale-independent
+// (always the C locale). These were previously missing, so the dyld linker
+// installed return-0 stubs for them — which broke every guest that parses
+// numbers through them. Minecraft PE 0.14, for instance, parses its UI layout
+// percentage strings ("100%", "31.25%") with strtold_l; a stubbed 0 collapsed
+// all percentage-sized controls (main-menu buttons, title logo) to zero size,
+// making them invisible and untappable while fixed-pixel controls still worked.
+fn strtold(env: &mut Environment, nptr: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>) -> f64 {
+    strtod(env, nptr, endptr)
+}
+
+fn strtold_l(
+    env: &mut Environment,
+    nptr: ConstPtr<u8>,
+    endptr: MutPtr<MutPtr<u8>>,
+    _locale: ConstVoidPtr,
+) -> f64 {
+    strtod(env, nptr, endptr)
+}
+
+fn strtod_l(
+    env: &mut Environment,
+    nptr: ConstPtr<u8>,
+    endptr: MutPtr<MutPtr<u8>>,
+    _locale: ConstVoidPtr,
+) -> f64 {
+    strtod(env, nptr, endptr)
+}
+
+fn strtof_l(
+    env: &mut Environment,
+    nptr: ConstPtr<u8>,
+    endptr: MutPtr<ConstPtr<u8>>,
+    _locale: ConstVoidPtr,
+) -> f32 {
+    strtof(env, nptr, endptr)
+}
+
 pub fn strtoul(
     env: &mut Environment,
     str: ConstPtr<u8>,
@@ -944,6 +1042,14 @@ pub fn strtoul(
     base: i32,
 ) -> u32 {
     set_errno(env, 0);
+    let base = base as u32;
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            env.mem.write(endptr, str.cast_mut());
+        }
+        set_errno(env, EINVAL);
+        return 0;
+    }
     let parse_res = str_to_int_inner_generic(
         env,
         |env, s, idx| Ok(env.mem.read(s + idx)),
@@ -977,14 +1083,22 @@ fn strtoull(
     base: i32,
 ) -> u64 {
     set_errno(env, 0);
+    let base = base as u32;
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            env.mem.write(endptr, str.cast_mut());
+        }
+        set_errno(env, EINVAL);
+        return 0;
+    }
     let parse_res = str_to_int_inner_generic(
         env,
         |env, s, idx| Ok(env.mem.read(s + idx)),
         |_, _, _| (),
         str.cast_mut(),
-        0, // starting offset
-        base.try_into().unwrap(),
-        u32::MAX, // <--- ИСПРАВЛЕНО НА u32::MAX
+        0,
+        base,
+        u32::MAX,
         |s, base| u64::from_str_radix(s, base).unwrap_or(u64::MAX),
         |num| num.wrapping_neg(),
     );
@@ -1016,6 +1130,14 @@ fn strtoull_l(
 
 fn strtoll(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>, base: i32) -> i64 {
     set_errno(env, 0);
+    let base = base as u32;
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            env.mem.write(endptr, str.cast_mut());
+        }
+        set_errno(env, EINVAL);
+        return 0;
+    }
     let parse_res = str_to_int_inner_generic(
         env,
         |env, s, idx| Ok(env.mem.read(s + idx)),
@@ -1041,6 +1163,16 @@ fn strtoll(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>,
             0
         }
     }
+}
+
+fn strtoll_l(
+    env: &mut Environment,
+    str: ConstPtr<u8>,
+    endptr: MutPtr<MutPtr<u8>>,
+    base: i32,
+    _locale: ConstVoidPtr,
+) -> i64 {
+    strtoll(env, str, endptr, base)
 }
 
 fn strtol(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>, base: i32) -> i32 {
@@ -1085,17 +1217,11 @@ fn dirname(env: &mut Environment, path: MutPtr<u8>) -> MutPtr<u8> {
         b".".to_vec()
     };
 
-    let output_path: MutPtr<u8> = if output.len() > len as usize {
-        env.mem.alloc((output.len() + 1) as GuestUSize).cast()
-    } else {
-        path
-    };
     for (i, byte) in output.iter().enumerate() {
-        env.mem.write(output_path + i as GuestUSize, *byte);
+        env.mem.write(path + i as GuestUSize, *byte);
     }
-    env.mem
-        .write(output_path + output.len() as GuestUSize, b'\0');
-    output_path
+    env.mem.write(path + output.len() as GuestUSize, b'\0');
+    path
 }
 
 fn realpath(
@@ -1293,41 +1419,14 @@ fn __assert_rtn(
     let func_str = read_cstr_safe(env, func);
     let file_str = read_cstr_safe(env, file);
     let expr_str = read_cstr_safe(env, expr);
-    // Dedup by (file, line): a guest assert that throws into our bypass
-    // unwinder usually repeats forever (Terraria 1.0's GetWidget loop), and
-    // the corrupt function-name buffer produces a different garbage string
-    // every time, so keying on the name is useless. Log the first occurrence
-    // in full, then one summary per 200 occurrences.
-    use std::collections::HashSet;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Mutex;
-    static ASSERT_KEYS: Mutex<Option<HashSet<(String, u32)>>> = Mutex::new(None);
-    static ASSERT_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
-    let key = (file_str.clone(), line as u32);
-    let is_new = {
-        let mut guard = ASSERT_KEYS.lock().unwrap();
-        let set = guard.get_or_insert_with(HashSet::new);
-        set.insert(key)
-    };
-    if is_new {
-        log!(
-            "Assertion failed: ({}) in function {}, file {}, line {}.",
-            expr_str,
-            func_str,
-            file_str,
-            line
-        );
-    } else {
-        let suppressed = ASSERT_SUPPRESSED.fetch_add(1, Ordering::Relaxed) + 1;
-        if suppressed % 200 == 0 {
-            log!(
-                "Assertion failed: {} further repeated asserts in {}:{} suppressed so far.",
-                suppressed,
-                file_str,
-                line
-            );
-        }
-    }
+    log!(
+        "Assertion failed: ({}) in function {}, file {}, line {}.",
+        expr_str,
+        func_str,
+        file_str,
+        line
+    );
+    recover_or_end_guest_termination(env, "__assert_rtn()");
 }
 
 fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line: i32) {
@@ -1339,6 +1438,7 @@ fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line:
         file_str,
         line
     );
+    recover_or_end_guest_termination(env, "__assert()");
 }
 
 fn __assert_fail(
@@ -1358,24 +1458,17 @@ fn __assert_fail(
         file_str,
         line
     );
+    recover_or_end_guest_termination(env, "__assert_fail()");
 }
 
 fn read_cstr_safe(env: &mut Environment, ptr: ConstPtr<u8>) -> String {
     if ptr.is_null() {
         return "(null)".to_string();
     }
-    // Read bytes until NUL terminator.
-    let mut bytes = Vec::new();
-    let mut offset = 0u32;
-    loop {
-        let b: u8 = env.mem.read(ptr + offset);
-        if b == 0 {
-            break;
-        }
-        bytes.push(b);
-        offset += 1;
-    }
-    String::from_utf8(bytes).unwrap_or_else(|_| "(invalid utf-8)".to_string())
+    // Assertions can arrive after guest memory corruption. Keep diagnostics
+    // bounded rather than scanning an unterminated guest buffer forever.
+    String::from_utf8(env.mem.cstr_at(ptr).to_vec())
+        .unwrap_or_else(|_| "(invalid utf-8)".to_string())
 }
 
 #[allow(non_snake_case)]
@@ -1433,53 +1526,6 @@ fn _fcvt(
         .copy_from_slice(digits.as_bytes());
     env.mem.write(buf + digits.len() as GuestUSize, b'\0');
     buf
-}
-
-fn fcvt(
-    env: &mut Environment,
-    value: f64,
-    ndigit: i32,
-    decpt: MutPtr<i32>,
-    sign: MutPtr<i32>,
-) -> MutPtr<u8> {
-    log_dbg!("fcvt({}, {}, {:?}, {:?})", value, ndigit, decpt, sign);
-    assert!(ndigit > 0);
-    let fcvt_buf = *env
-        .libc_state
-        .stdlib
-        .fcvt_buf
-        .get_or_insert_with(|| env.mem.alloc(64).cast());
-    env.mem
-        .write(sign, if value.is_sign_negative() { 1 } else { 0 });
-    if value == 0.0 {
-        let ndigit_size = ndigit as GuestUSize;
-        assert!(ndigit_size < 64);
-        env.mem.write(decpt, 0);
-        env.mem.bytes_at_mut(fcvt_buf, ndigit_size).fill(b'0');
-        env.mem.write(fcvt_buf + ndigit_size, b'\0');
-        return fcvt_buf;
-    }
-
-    let mut formatted = format!("{:.1$}", value.abs(), ndigit as usize);
-    assert!(formatted.contains('.'));
-    assert!(formatted.len() < 64);
-
-    let dot_idx = formatted.find('.').unwrap();
-    formatted.remove(dot_idx);
-
-    let leading_zeros_trimmed = formatted.trim_start_matches('0');
-    let leading_zeros_idx = formatted.len() - leading_zeros_trimmed.len();
-
-    env.mem
-        .write(decpt, dot_idx as i32 - leading_zeros_idx as i32);
-
-    let len = leading_zeros_trimmed.len().try_into().unwrap();
-    env.mem
-        .bytes_at_mut(fcvt_buf, len)
-        .copy_from_slice(leading_zeros_trimmed.as_bytes());
-    env.mem.write(fcvt_buf + len, b'\0');
-
-    fcvt_buf
 }
 
 #[allow(non_snake_case)]
@@ -1889,14 +1935,22 @@ pub const FUNCTIONS: FunctionExports = &[
     // <--- ИСПРАВЛЕНИЕ НА 3 АРГУМЕНТА ГОСТЯ
     export_c_func!(unsetenv(_)),
     export_c_func!(exit(_)),
+    export_c_func!(_exit(_)),
+    export_c_func!(_Exit(_)),
+    export_c_func!(quick_exit(_)),
     export_c_func!(abort()),
     export_c_func_aliased!("_abort", abort()),
     export_c_func!(bsearch(_, _, _, _, _)),
     export_c_func!(strtof(_, _)),
+    export_c_func!(strtold(_, _)),
+    export_c_func!(strtold_l(_, _, _)),
+    export_c_func!(strtod_l(_, _, _)),
+    export_c_func!(strtof_l(_, _, _)),
     export_c_func!(strtoul(_, _, _)),
     export_c_func!(strtoull(_, _, _)),
     export_c_func!(strtoull_l(_, _, _, _)),
     export_c_func!(strtoll(_, _, _)),
+    export_c_func!(strtoll_l(_, _, _, _)),
     export_c_func_aliased!("strtoq", strtoll(_, _, _)),
     export_c_func_aliased!("strtouq", strtoull(_, _, _)),
     export_c_func!(strtol(_, _, _)),
@@ -1911,7 +1965,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(__assert(_, _, _)),
     export_c_func!(__assert_fail(_, _, _, _)),
     export_c_func!(_fcvt(_, _, _, _)),
-    export_c_func!(fcvt(_, _, _, _)),
     export_c_func!(_gcvt(_, _, _)),
     export_c_func!(system(_)),
     export_c_func!(dladdr(_, _)),

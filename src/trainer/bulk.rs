@@ -7,7 +7,7 @@
 //! Checked bulk editing: preview a filtered batch, then revalidate on confirm.
 //! This detects structural hazards, not the meaning of a game's memory.
 
-use super::{Mem, ResultFilter, SearchResult, VType};
+use super::{Mem, SearchResult, VType, ResultFilter};
 
 type Allocation = (u32, u32);
 
@@ -47,7 +47,8 @@ pub(super) fn containing_allocation(
 ) -> Option<Allocation> {
     let i = allocations.partition_point(|&(base, _)| base <= addr);
     let &(base, length) = allocations.get(i.checked_sub(1)?)?;
-    (addr as u64 + size as u64 <= base as u64 + length as u64).then_some((base, length))
+    (addr as u64 + size as u64 <= base as u64 + length as u64)
+        .then_some((base, length))
 }
 
 pub(super) fn plan_bulk(
@@ -67,9 +68,7 @@ pub(super) fn plan_bulk(
     let mut candidates = Vec::new();
     let mut matching = 0;
     for (index, result) in results.iter().enumerate() {
-        if !filter.matches(result.analysis.category) {
-            continue;
-        }
+        if !filter.matches(result.analysis.category) { continue; }
         matching += 1;
         let t = result.vtype;
         if t == VType::Auto || (requested_type != VType::Auto && requested_type != t) {
@@ -127,9 +126,7 @@ pub(super) fn plan_bulk(
         }
         first = next;
     }
-    let writes: Vec<_> = candidates
-        .into_iter()
-        .zip(conflicts)
+    let writes: Vec<_> = candidates.into_iter().zip(conflicts)
         .filter_map(|(write, conflict)| (!conflict).then_some(write))
         .collect();
     if writes.is_empty() {
@@ -159,8 +156,7 @@ pub(super) fn apply_bulk(
             return Err("RESULTS CHANGED: PREVIEW AGAIN");
         };
         if !plan.filter.matches(result.analysis.category)
-            || result.addr != write.addr
-            || result.vtype != write.vtype
+            || result.addr != write.addr || result.vtype != write.vtype
             || result.bits != write.before
             || containing_allocation(&allocations, write.addr, write.vtype.size())
                 != Some(write.allocation)
@@ -178,14 +174,10 @@ pub(super) fn apply_bulk(
     // A sorted prefix maximum handles nested/overlapping writes in O(N log W)
     // rather than doing a full results scan once per write. Trainer edits
     // must never be interpreted as evidence of in-game value changes.
-    let ends: Vec<u64> = plan
-        .writes
-        .iter()
-        .scan(0u64, |end, write| {
-            *end = (*end).max(write.end());
-            Some(*end)
-        })
-        .collect();
+    let ends: Vec<u64> = plan.writes.iter().scan(0u64, |end, write| {
+        *end = (*end).max(write.end());
+        Some(*end)
+    }).collect();
     for result in results {
         let end = result.addr as u64 + result.vtype.size() as u64;
         let i = plan.writes.partition_point(|w| (w.addr as u64) < end);

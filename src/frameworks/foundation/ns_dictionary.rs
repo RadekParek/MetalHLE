@@ -24,7 +24,7 @@ use crate::frameworks::foundation::ns_file_manager::{
 };
 use crate::fs::GuestPath;
 use crate::libc::stdlib::qsort::qsort_generic;
-use crate::mem::{ConstPtr, MutPtr, Ptr, SafeRead};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr, SafeRead};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
     todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, SEL,
@@ -290,18 +290,28 @@ pub fn init_with_objects_and_keys(
     first_object: id,
     mut va_args: VaList,
 ) -> id {
-    let first_key: id = va_args.next(env);
-    // Spec: `dictionaryWithObjectsAndKeys:` should @throw if the first key is
-    // nil. We return an empty dictionary instead of panicking the host.
+    // Spec (Apple docs): the list is `(object1, key1, object2, key2, ...)`,
+    // terminated by a nil OBJECT. A nil first object therefore means an empty
+    // dictionary, and we must NOT read any further varargs (reading past the
+    // terminator yields garbage).
     let mut host_object = <DictionaryHostObject as Default>::default();
-    if first_key == nil || first_object == nil {
-        log_once!(
-            "Warning: dictionaryWithObjectsAndKeys:/initWithObjectsAndKeys: first pair is nil; returning empty dictionary."
-        );
+    if first_object == nil {
         *env.objc.borrow_mut(this) = host_object;
         return this;
     }
-    host_object.insert(env, first_key, first_object, /* copy_key: */ true);
+    let first_key: id = va_args.next(env);
+    // Spec: `dictionaryWithObjectsAndKeys:` should @throw if a key is nil.
+    // Instead of discarding the whole dictionary (which loses valid pairs
+    // that follow), skip the nil-keyed pair and keep parsing the rest.
+    if first_key == nil {
+        log!(
+            "Warning: dictionaryWithObjectsAndKeys:/initWithObjectsAndKeys: \
+             first key is nil for value {:?}; skipping pair and continuing.",
+            first_object
+        );
+    } else {
+        host_object.insert(env, first_key, first_object, /* copy_key: */ true);
+    }
 
     loop {
         let object: id = va_args.next(env);
@@ -518,10 +528,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    // The class-cluster allocator has already returned the internal concrete
-    // dictionary object, so initialise that object in place.
-    log_dbg_once!(
-        "NSDictionary class-cluster init: using the internal concrete empty dictionary"
+    // NSDictionary is abstract; calling -init on the base class is unusual but
+    // some buggy apps may still do it. Fall back to an empty mutable dict-
+    // backed host object so the receiver remains usable instead of panicking.
+    log!(
+        "Warning: -[NSDictionary init] called on the abstract base class; \
+         returning empty dictionary."
     );
     *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
     this
@@ -593,23 +605,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this writeToFile:path atomically:atomically]
 }
 
-// TODO
-
-- (id)valueForKey:(id)key { // NSString*
-    let key_str = to_rust_string(env, key);
-    // NSKeyValueCoding: keys starting with '@' (e.g. "@count") are KVC
-    // operators. We don't implement them; just log and fall back to a normal
-    // objectForKey: lookup so the guest doesn't crash.
-    if key_str.starts_with('@') {
-        log!(
-            "Warning: -[NSDictionary valueForKey:] KVC operator {:?} not implemented; \
-             falling back to objectForKey:.",
-            key_str
-        );
-    }
-    msg![env; this objectForKey:key]
-}
-
 // `- (NSArray<ObjectType> *)objectsForKeys:(NSArray<KeyType> *)keys
 //     notFoundMarker:(id)anObject` — per Apple's NSDictionary reference,
 // returns a new array with one entry per key in `keys`: the matching
@@ -635,6 +630,132 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, result);
     autorelease(env, res_imm)
 }
+
+// `- (void)getObjects:(ObjectType *)objects andKeys:(KeyType *)keys` —
+// deprecated Apple API: fills two caller-provided C arrays (each with room
+// for `[dict count]` entries) with the dictionary's objects and keys, in
+// matching order.
+- (())getObjects:(MutPtr<id>)objects andKeys:(MutPtr<id>)keys {
+    let count: NSUInteger = msg![env; this count];
+    let keys_array: id = msg![env; this allKeys];
+    for i in 0..count {
+        let key: id = msg![env; keys_array objectAtIndex:i];
+        let obj: id = msg![env; this objectForKey:key];
+        if !objects.is_null() {
+            env.mem.write(objects + i, obj);
+        }
+        if !keys.is_null() {
+            env.mem.write(keys + i, key);
+        }
+    }
+}
+
+// `- (id)valueForKeyPath:(NSString *)keyPath` — key-value coding with a
+// dot-separated path. For dictionary receivers we walk each component with
+// `-objectForKeyedSubscript:`, returning nil as soon as any component is
+// missing, which matches Apple's behaviour for NSDictionary.
+- (id)valueForKeyPath:(id)key_path {
+    let path = to_rust_string(env, key_path).into_owned();
+    let mut value: id = this;
+    for component in path.split('.') {
+        if value == nil {
+            return nil;
+        }
+        let key = from_rust_string(env, component.to_string());
+        value = msg![env; value objectForKeyedSubscript:key];
+        release(env, key);
+    }
+    value
+}
+
+// `- (NSArray<KeyType> *)keysSortedByValueUsingComparator:(NSComparator)cmptr`
+// — as `-keysSortedByValueUsingSelector:` above, but the comparison comes
+// from an ObjC block `^NSComparisonResult(id obj1, id obj2)` whose `invoke`
+// function pointer sits at offset +12 of the block struct (Apple block ABI,
+// see the enumerateKeysAndObjects... implementation below). A nil or
+// malformed block leaves the keys unsorted instead of crashing.
+- (id)keysSortedByValueUsingComparator:(MutPtr<u8>)comparator {
+    if comparator.is_null() {
+        log!("Warning: -[NSDictionary keysSortedByValueUsingComparator:] \
+             called with nil block; returning unsorted keys");
+        return msg![env; this allKeys];
+    }
+    let invoke_ptr: u32 = env.mem.read(comparator.cast::<u32>() + 3u32);
+    if invoke_ptr == 0 {
+        log!("Warning: -[NSDictionary keysSortedByValueUsingComparator:] \
+             block at {:?} has NULL invoke pointer; returning unsorted keys",
+            comparator
+        );
+        return msg![env; this allKeys];
+    }
+    let invoke = GuestFunction::from_addr_with_thumb_bit(invoke_ptr);
+    // Snapshot keys and values up-front (Apple sorts a copy).
+    let keys_array: id = msg![env; this allKeys];
+    let count: NSUInteger = msg![env; keys_array count];
+    let mut keys: Vec<id> = Vec::with_capacity(count as usize);
+    let mut values: Vec<id> = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let key: id = msg![env; keys_array objectAtIndex:i];
+        let value: id = msg![env; this objectForKey:key];
+        keys.push(key);
+        values.push(value);
+    }
+    let block_arg: crate::mem::ConstVoidPtr =
+        Ptr::from_bits(comparator.to_bits()).cast_const();
+    let len = keys.len().try_into().unwrap();
+    let mut user_data = (env, &mut keys, &mut values);
+    qsort_generic(
+        &mut user_data,
+        len,
+        &mut |(env, _keys, values), l, r| {
+            let (l, r): (usize, usize) = (l.try_into().unwrap(), r.try_into().unwrap());
+            let res: NSComparisonResult =
+                <GuestFunction as CallFromHost<NSComparisonResult, (
+                    crate::mem::ConstVoidPtr, id, id,
+                )>>::call_from_host(
+                    &invoke, env, (block_arg, values[l], values[r]),
+                );
+            res
+        },
+        &mut |(_, keys, values), l, r| {
+            let (l, r): (usize, usize) = (l.try_into().unwrap(), r.try_into().unwrap());
+            keys.swap(l, r);
+            values.swap(l, r);
+        },
+    );
+    let (env, _, _) = user_data;
+    // Keys are owned by the dictionary; the returned array needs its own
+    // strong references.
+    for &key in &keys {
+        retain(env, key);
+    }
+    let res = ns_array::from_vec(env, keys);
+    autorelease(env, res)
+}
+
+// `-keysSortedByValueWithOptions:usingComparator:` — for a plain dictionary
+// the only meaningful option is NSEnumerationReverse, which we ignore (the
+// enumeration order of a plain NSDictionary is unspecified anyway).
+- (id)keysSortedByValueWithOptions:(NSUInteger)_opts
+                    usingComparator:(MutPtr<u8>)comparator {
+    msg![env; this keysSortedByValueUsingComparator:comparator]
+}
+
+- (id)valueForKey:(id)key { // NSString*
+    let key_str = to_rust_string(env, key);
+    // NSKeyValueCoding: keys starting with '@' (e.g. "@count") are KVC
+    // operators. We don't implement them; just log and fall back to a normal
+    // objectForKey: lookup so the guest doesn't crash.
+    if key_str.starts_with('@') {
+        log!(
+            "Warning: -[NSDictionary valueForKey:] KVC operator {:?} not implemented; \
+             falling back to objectForKey:.",
+            key_str
+        );
+    }
+    msg![env; this objectForKey:key]
+}
+
 // NSDictionary(NSFileAttributes) category
 // TODO: implement categories properly
 - (id)fileModificationDate {
@@ -973,6 +1094,83 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
 }
+// Category method used by some ad/analytics SDKs (Burstly-era
+// "NSDictionary+JSON"): serialize the receiver to a JSON string, dropping
+// the keys listed in `exclude_keys` and renaming keys per `translations`
+// (original key -> replacement key). The first argument is treated as an
+// NSError** out-parameter and set to nil, matching the convention callers
+// expect. A missing/failed serialization yields an empty string rather
+// than NULL so string-based call sites don't dereference nil.
+- (id)toJSONAs:(MutPtr<id>)out_error
+     excludingInArray:(id)exclude_keys
+     withTranslations:(id)translations {
+    use crate::frameworks::foundation::ns_json_serialization;
+    use crate::frameworks::foundation::ns_string;
+
+    if !out_error.is_null() {
+        env.mem.write(out_error, nil);
+    }
+
+    // Work on a mutable copy so the receiver is untouched.
+    let working: id = msg![env; this mutableCopy];
+    let keys: id = msg![env; working allKeys];
+    let count: NSUInteger = msg![env; keys count];
+
+    let mut to_remove: Vec<id> = Vec::new();
+    let mut to_add: Vec<(id, id)> = Vec::new();
+
+    for i in 0..count {
+        let key: id = msg![env; keys objectAtIndex:i];
+
+        // Exclusion check (string-compared, tolerating non-string keys).
+        let mut excluded = false;
+        if exclude_keys != nil {
+            let ec: NSUInteger = msg![env; exclude_keys count];
+            for j in 0..ec {
+                let ek: id = msg![env; exclude_keys objectAtIndex:j];
+                let is_eq: bool = msg![env; ek isEqualToString:key];
+                if is_eq {
+                    excluded = true;
+                    break;
+                }
+            }
+        }
+        if excluded {
+            to_remove.push(key);
+            continue;
+        }
+
+        // Key translation: original key -> replacement key.
+        if translations != nil {
+            let mapped: id = msg![env; translations objectForKey:key];
+            if mapped != nil {
+                let value: id = msg![env; working objectForKey:key];
+                to_add.push((mapped, value));
+                to_remove.push(key);
+            }
+        }
+    }
+
+    for &key in &to_remove {
+        () = msg![env; working removeObjectForKey:key];
+    }
+    for &(key, value) in &to_add {
+        () = msg![env; working setObject:value forKey:key];
+    }
+
+    let error_ptr: MutPtr<id> = MutPtr::null();
+    let data: id = msg_class![env; NSJSONSerialization dataWithJSONObject:working options:0u32 error:error_ptr];
+    if data == nil {
+        let empty = ns_string::from_rust_string(env, String::new());
+        return autorelease(env, empty);
+    }
+    let len: NSUInteger = msg![env; data length];
+    let bytes_ptr: ConstVoidPtr = msg![env; data bytes];
+    let bytes = env.mem.bytes_at(bytes_ptr.cast::<u8>(), len);
+    let json = String::from_utf8_lossy(bytes).into_owned();
+    let json_str = ns_string::from_rust_string(env, json);
+    autorelease(env, json_str)
+}
 
 - (id)initWithObjects:(id)objects //NSArray *
               forKeys:(id)keys { //NSArray *
@@ -987,7 +1185,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     init_with_objects_for_keys_count_common(env, this, objects, keys, count)
 }
 
-// TODO: enumeration, more init methods, etc
+// Apple's class clusters tolerate `-initWithCapacity:` on the immutable
+// side too (the capacity is advisory), so accept it instead of failing
+// with "does not respond to selector".
+- (id)initWithCapacity:(NSUInteger)_capacity {
+    msg![env; this init]
+}
+
+// Enumeration is provided via -countByEnumeratingWithState: plus the
+// -keyEnumerator/-objectEnumerator accessors, and the common init methods
+// (objectsAndKeys:, objects:forKeys:, objects:forKeys:count:, coder,
+// contentsOfFile:/OfURL:) are implemented above.
 
 - (NSUInteger)count {
     env.objc.borrow::<DictionaryHostObject>(this).count
@@ -1142,7 +1350,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setDictionary:(id)dict {
-    todo_objc_setter!(this, dict);
+    if dict == this {
+        return;
+    }
+    () = msg![env; this removeAllObjects];
+    () = msg![env; this addEntriesFromDictionary:dict];
 }
 
 - (id)initWithObjectsAndKeys:(id)first_object, ...dots {
@@ -1159,7 +1371,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithCapacity:(NSUInteger)_capacity {
-    // TODO: capacity
+    // The backing store grows on demand, so the capacity hint is ignored.
     msg![env; this init]
 }
 
@@ -1212,7 +1424,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     init_with_objects_for_keys_count_common(env, this, objects, keys, count)
 }
 
-// TODO: enumeration, more init methods, etc
+// Enumeration is provided via -countByEnumeratingWithState: plus the
+// -keyEnumerator/-objectEnumerator accessors, and the common init/mutation
+// methods are implemented above.
 
 - (NSUInteger)count {
     env.objc.borrow::<DictionaryHostObject>(this).count
@@ -1288,7 +1502,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state
                                   objects:(MutPtr<id>)stackbuf
                                     count:(NSUInteger)len {
-    // TODO: check that dict wasn't mutated!
+    // Each batch re-snapshots `allKeys`, so a mutation between batches
+    // cannot invalidate the indices we store in `state`. A mutation made by
+    // the consumer within a single batch may yield stale keys, which we
+    // tolerate rather than raising like Apple would.
     // We assume that order in which objects are reported is consistent
     // between calls!
     let objects: id = msg![env; this allKeys];
@@ -1322,7 +1539,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setValue:(id)value
         forKey:(id)key { // NSString *
-    // TODO: assert that key is a string when using key-value coding
+    // Apple raises NSInvalidArgumentException for non-string keys in KVC.
+    // We log and continue: crashing the emulator would be worse than a
+    // slightly-off dictionary mutation.
+    if key != nil {
+        let nsstring_class = env.objc.get_known_class("NSString", &mut env.mem);
+        let key_class: Class = msg![env; key class];
+        if !env.objc.class_is_subclass_of(key_class, nsstring_class) {
+            // Include the actual class name: ad-SDK code (e.g. PlayHaven) that
+            // passes non-string keys on a real device passes strings, so the
+            // class name tells us which earlier call produced a wrong object.
+            log!(
+                "Warning: -[NSMutableDictionary setValue:forKey:] called \
+                 with non-string key {:?} (class {}); continuing anyway.",
+                key,
+                env.objc.get_class_name(key_class)
+            );
+        }
+    }
     if value == nil {
         msg![env; this removeObjectForKey:key]
     } else {

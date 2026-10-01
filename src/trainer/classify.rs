@@ -22,14 +22,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Self; 6] = [
-        Self::Money,
-        Self::Ammo,
-        Self::Health,
-        Self::Score,
-        Self::Timer,
-        Self::Unknown,
-    ];
+    pub const ALL: [Self; 6] = [Self::Money, Self::Ammo, Self::Health, Self::Score, Self::Timer, Self::Unknown];
 
     pub const fn index(self) -> usize {
         self as usize
@@ -62,10 +55,8 @@ impl ResultFilter {
     pub fn next(self) -> Self {
         match self {
             Self::All => Self::Category(Category::ALL[0]),
-            Self::Category(c) => Category::ALL
-                .get(c.index() + 1)
-                .copied()
-                .map_or(Self::All, Self::Category),
+            Self::Category(c) => Category::ALL.get(c.index() + 1)
+                .copied().map_or(Self::All, Self::Category),
         }
     }
 
@@ -139,9 +130,7 @@ impl Analysis {
 
     pub fn observe_timed(&mut self, t: VType, before: u64, after: u64, seconds: f32) {
         self.quiet_seconds = (self.quiet_seconds + seconds.max(0.0)).min(60.0);
-        if before == after {
-            return;
-        }
+        if before == after { return; }
         let elapsed = self.quiet_seconds.max(0.001);
         self.quiet_seconds = 0.0;
         let a = number(t, before);
@@ -149,9 +138,7 @@ impl Analysis {
         let unit_drop = t != VType::F32 && (1.0..=300.0).contains(&a) && b == a - 1.0;
         if unit_drop {
             if self.unit_drops == 0 {
-                if self.peak != a as u16 {
-                    self.reloads = 0;
-                }
+                if self.peak != a as u16 { self.reloads = 0; }
                 self.peak = a as u16;
             }
             self.unit_drops = self.unit_drops.saturating_add(1);
@@ -164,21 +151,13 @@ impl Analysis {
             self.unit_drops = 0;
         }
         let rate = ((a - b) / elapsed as f64) as f32;
-        if t == VType::F32
-            && a.is_finite()
-            && b.is_finite()
-            && b >= 0.0
-            && a <= 86400.0
-            && a > b
-            && a - b <= 2.0
+        if t == VType::F32 && a.is_finite() && b.is_finite()
+            && b >= 0.0 && a <= 86400.0 && a > b && a - b <= 2.0
             && (a.fract() != 0.0 || b.fract() != 0.0)
         {
-            self.smooth_drops =
-                if self.last_rate > 0.0 && (0.7..=1.3).contains(&(rate / self.last_rate)) {
-                    self.smooth_drops.saturating_add(1)
-                } else {
-                    1
-                };
+            self.smooth_drops = if self.last_rate > 0.0
+                && (0.7..=1.3).contains(&(rate / self.last_rate))
+            { self.smooth_drops.saturating_add(1) } else { 1 };
             self.last_rate = rate;
         } else {
             self.smooth_drops = 0;
@@ -189,11 +168,7 @@ impl Analysis {
 
     fn update_hint(&mut self) {
         self.category = Category::Unknown;
-        self.evidence = if self.inspected {
-            Evidence::None
-        } else {
-            Evidence::Pending
-        };
+        self.evidence = if self.inspected { Evidence::None } else { Evidence::Pending };
         if self.field_mask.count_ones() == 1 {
             self.category = Category::ALL[self.field_mask.trailing_zeros() as usize];
             self.evidence = Evidence::ScalarField;
@@ -203,19 +178,13 @@ impl Analysis {
             self.evidence = Evidence::ConflictingText;
             return;
         }
-        if let Some(category) = Category::ALL[..5]
-            .iter()
-            .copied()
+        if let Some(category) = Category::ALL[..5].iter().copied()
             .find(|c| self.text_mask & (1 << c.index()) != 0)
         {
             self.category = category;
             self.evidence = if (category == Category::Ammo && self.reloads >= 2)
                 || (category == Category::Timer && self.smooth_drops >= 6)
-            {
-                Evidence::TextAndChanges
-            } else {
-                Evidence::NearbyText
-            };
+            { Evidence::TextAndChanges } else { Evidence::NearbyText };
         } else if self.reloads >= 2 {
             self.category = Category::Ammo;
             self.evidence = Evidence::ReloadCycles;
@@ -243,55 +212,14 @@ pub(super) fn number(t: VType, bits: u64) -> f64 {
 
 fn word_category(word: &[u8]) -> Option<Category> {
     let groups: &[(Category, &[&[u8]])] = &[
-        (
-            Category::Money,
-            &[
-                b"money",
-                b"coins",
-                b"coin",
-                b"gold",
-                b"cash",
-                b"currency",
-                b"gems",
-                b"credits",
-                b"moneycount",
-                b"coincount",
-                b"currentcoins",
-            ],
-        ),
-        (
-            Category::Ammo,
-            &[
-                b"ammo",
-                b"ammunition",
-                b"ammocount",
-                b"currentammo",
-                b"bullets",
-                b"bulletcount",
-                b"magazine",
-            ],
-        ),
-        (
-            Category::Health,
-            &[
-                b"health",
-                b"healthpoints",
-                b"hitpoints",
-                b"maxhealth",
-                b"currenthealth",
-            ],
-        ),
+        (Category::Money, &[b"money", b"coins", b"coin", b"gold", b"cash", b"currency", b"gems", b"credits", b"moneycount", b"coincount", b"currentcoins"]),
+        (Category::Ammo, &[b"ammo", b"ammunition", b"ammocount", b"currentammo", b"bullets", b"bulletcount", b"magazine"]),
+        (Category::Health, &[b"health", b"healthpoints", b"hitpoints", b"maxhealth", b"currenthealth"]),
         (Category::Score, &[b"score", b"highscore", b"points"]),
-        (
-            Category::Timer,
-            &[b"timer", b"countdown", b"cooldown", b"remainingtime"],
-        ),
+        (Category::Timer, &[b"timer", b"countdown", b"cooldown", b"remainingtime"]),
     ];
     groups.iter().find_map(|&(category, words)| {
-        words
-            .iter()
-            .any(|w| word.eq_ignore_ascii_case(w))
-            .then_some(category)
+        words.iter().any(|w| word.eq_ignore_ascii_case(w)).then_some(category)
     })
 }
 
@@ -301,18 +229,11 @@ fn ascii_word_mask(bytes: &[u8]) -> u8 {
     let mut mask = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if !bytes[i].is_ascii_alphabetic() {
-            i += 1;
-            continue;
-        }
+        if !bytes[i].is_ascii_alphabetic() { i += 1; continue; }
         let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
-            i += 1;
-        }
+        while i < bytes.len() && bytes[i].is_ascii_alphanumeric() { i += 1; }
         if start > 0 && i < bytes.len() && !bytes[start - 1].is_ascii_alphanumeric() {
-            if let Some(c) = word_category(&bytes[start..i]) {
-                mask |= 1 << c.index();
-            }
+            if let Some(c) = word_category(&bytes[start..i]) { mask |= 1 << c.index(); }
         }
     }
     mask
@@ -325,11 +246,7 @@ fn word_mask(bytes: &[u8]) -> u8 {
         let mut decoded = [0u8; 64];
         let mut len = 0;
         for pair in bytes[offset..].chunks_exact(2).take(decoded.len()) {
-            decoded[len] = if pair[1] == 0 && pair[0].is_ascii() {
-                pair[0]
-            } else {
-                0
-            };
+            decoded[len] = if pair[1] == 0 && pair[0].is_ascii() { pair[0] } else { 0 };
             len += 1;
         }
         mask |= ascii_word_mask(&decoded[..len]);
@@ -345,9 +262,7 @@ fn field_mask(name: &str) -> u8 {
     let mut normalized = Vec::with_capacity(130);
     normalized.push(0);
     let bytes = name.as_bytes();
-    if bytes.len() > 128 {
-        return 0;
-    }
+    if bytes.len() > 128 { return 0; }
     for (i, &byte) in bytes.iter().enumerate() {
         if i > 0 && byte.is_ascii_uppercase() && bytes[i - 1].is_ascii_lowercase() {
             normalized.push(b'_');
@@ -357,23 +272,15 @@ fn field_mask(name: &str) -> u8 {
     normalized.push(0);
     let mut mask = ascii_word_mask(&normalized);
     for word in normalized.split(|b| !b.is_ascii_alphanumeric()) {
-        if word.eq_ignore_ascii_case(b"hp") {
-            mask |= 1 << Category::Health.index();
-        }
+        if word.eq_ignore_ascii_case(b"hp") { mask |= 1 << Category::Health.index(); }
     }
     mask
 }
 
 pub(super) fn encoding(t: VType) -> u8 {
     match t {
-        VType::I8 => b'c',
-        VType::U8 => b'C',
-        VType::I16 => b's',
-        VType::U16 => b'S',
-        VType::I32 => b'i',
-        VType::U32 => b'I',
-        VType::F32 => b'f',
-        VType::Auto => 0,
+        VType::I8 => b'c', VType::U8 => b'C', VType::I16 => b's', VType::U16 => b'S',
+        VType::I32 => b'i', VType::U32 => b'I', VType::F32 => b'f', VType::Auto => 0,
     }
 }
 
@@ -385,15 +292,10 @@ pub(super) fn analyze_batch(mem: &Mem, results: &mut [SearchResult], cursor: &mu
 }
 
 pub(super) fn analyze_batch_with_objects(
-    mem: &Mem,
-    results: &mut [SearchResult],
-    cursor: &mut usize,
+    mem: &Mem, results: &mut [SearchResult], cursor: &mut usize,
     objc: Option<&crate::objc::ObjC>,
 ) {
-    if results.is_empty() {
-        *cursor = 0;
-        return;
-    }
+    if results.is_empty() { *cursor = 0; return; }
     let mut allocations = mem.live_allocations();
     allocations.sort_unstable_by_key(|&(base, _)| base);
     *cursor %= results.len();
@@ -401,10 +303,7 @@ pub(super) fn analyze_batch_with_objects(
         let result = &mut results[*cursor];
         let addr = result.addr;
         let index = allocations.partition_point(|&(base, _)| base <= addr);
-        let allocation = index
-            .checked_sub(1)
-            .and_then(|i| allocations.get(i))
-            .copied();
+        let allocation = index.checked_sub(1).and_then(|i| allocations.get(i)).copied();
         let mask = allocation.and_then(|(base, size)| {
             let end = base as u64 + size as u64;
             if addr < mem.null_segment_size() || addr as u64 + result.vtype.size() as u64 > end {
@@ -414,42 +313,22 @@ pub(super) fn analyze_batch_with_objects(
             let hi = (addr as u64 + result.vtype.size() as u64 + 64).min(end);
             let mut mask = 0;
             // Don't interpret the searched number's own bytes as a field name.
-            for (start, stop) in [
-                (lo, addr as u64),
-                (addr as u64 + result.vtype.size() as u64, hi),
-            ] {
-                if start == stop {
-                    continue;
-                }
-                let bytes = mem.get_bytes_fallible(
-                    ConstVoidPtr::from_bits(start as u32),
-                    (stop - start) as u32,
-                )?;
+            for (start, stop) in [(lo, addr as u64), (addr as u64 + result.vtype.size() as u64, hi)] {
+                if start == stop { continue; }
+                let bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(start as u32), (stop - start) as u32)?;
                 mask |= word_mask(bytes);
             }
             Some(mask)
         });
-        result.analysis.field_mask = allocation
-            .and_then(|(base, size)| {
-                objc?.diagnostic_scalar_field(
-                    mem,
-                    base,
-                    size,
-                    addr,
-                    result.vtype.size(),
-                    encoding(result.vtype),
-                )
-            })
-            .map_or(0, field_mask);
+        result.analysis.field_mask = allocation.and_then(|(base, size)| {
+            objc?.diagnostic_scalar_field(mem, base, size, addr, result.vtype.size(), encoding(result.vtype))
+        }).map_or(0, field_mask);
         if let Some(mask) = mask {
             result.analysis.inspected = true;
             result.analysis.text_mask = mask;
             result.analysis.update_hint();
         } else {
-            result.analysis = Analysis {
-                inspected: true,
-                ..Analysis::default()
-            };
+            result.analysis = Analysis { inspected: true, ..Analysis::default() };
             result.analysis.update_hint();
         }
         *cursor = (*cursor + 1) % results.len();

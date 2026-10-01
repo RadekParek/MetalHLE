@@ -8,12 +8,8 @@
 //! `UIDevice`.
 
 use crate::dyld::{ConstantExports, HostConstant};
-
-use crate::environment::Environment;
 use crate::frameworks::foundation::{ns_string, NSInteger};
-use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, ClassExports, NSZonePtr, TrivialHostObject,
-};
+use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, TrivialHostObject};
 use crate::window::{get_battery_status, BatteryState, DeviceOrientation};
 
 pub const UIDeviceOrientationDidChangeNotification: &str =
@@ -57,12 +53,6 @@ pub struct State {
     generates_device_orientation_notifications: bool,
     /// Lazily-initialised NSUUID returned by `-identifierForVendor`.
     identifier_for_vendor: Option<id>,
-}
-
-impl State {
-    pub fn is_generating_device_orientation_notifications(&self) -> bool {
-        self.generates_device_orientation_notifications
-    }
 }
 
 pub const CONSTANTS: ConstantExports = &[
@@ -118,7 +108,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     if let Some(device) = env.framework_state.uikit.ui_device.current_device {
         device
     } else {
-        let new = msg_class![env; _touchHLE_UIDevice_Static alloc];
+        let new = env.objc.alloc_static_object(
+            this,
+            Box::new(TrivialHostObject),
+            &mut env.mem,
+        );
         env.framework_state.uikit.ui_device.current_device = Some(new);
         new
     }
@@ -153,21 +147,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setOrientation:(UIDeviceOrientation)orientation {
-    let prev_orientation = env.window().current_rotation();
-    let new_orientation = match orientation {
-        UIDeviceOrientationPortrait => DeviceOrientation::Portrait,
+    env.window_mut().rotate_device(match orientation {
+        UIDeviceOrientationPortrait      => DeviceOrientation::Portrait,
         UIDeviceOrientationPortraitUpsideDown => DeviceOrientation::PortraitUpsideDown,
-        UIDeviceOrientationLandscapeLeft => DeviceOrientation::LandscapeLeft,
+        UIDeviceOrientationLandscapeLeft  => DeviceOrientation::LandscapeLeft,
         UIDeviceOrientationLandscapeRight => DeviceOrientation::LandscapeRight,
         _ => {
             log!("Warning: UIDevice setOrientation:{} not handled, ignoring", orientation);
             return;
         }
-    };
-    env.on_parent_stack_in_coroutine(|window, _| window.rotate_device(new_orientation));
-    if prev_orientation != env.window().current_rotation() {
-        generate_device_orientation_notification(env);
-    }
+    });
 }
 
 - (bool)isGeneratingDeviceOrientationNotifications {
@@ -181,7 +170,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad");
     }
     // ULTRAHLE_MINIONJUMP_MODEL_END
@@ -204,7 +193,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad");
     }
     // ULTRAHLE_MINIONJUMP_NAME_END
@@ -231,7 +220,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     ns_string::from_rust_string(env, format!("{major}.{minor}.{patch}"))
 }
 - (id)uniqueIdentifier {
-    ns_string::get_static_str(env, "MetalHLEdevice..........................")
+    ns_string::get_static_str(env, "touchHLEdevice..........................")
 }
 
 // `-identifierForVendor` (iOS 6.0+) — `NSUUID *` that uniquely identifies the
@@ -286,7 +275,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return UIUserInterfaceIdiomPad;
     }
     // ULTRAHLE_MINIONJUMP_IDIOM_END
@@ -354,7 +343,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad2,1");
     }
     // ULTRAHLE_MINIONJUMP_PLATFORM_END
@@ -372,7 +361,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad2,1");
     }
     // ULTRAHLE_MINIONJUMP_HWMODEL_END
@@ -394,28 +383,4 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
-// Private static implementation of UIDevice, used for the current device
-@implementation _touchHLE_UIDevice_Static: UIDevice
-
-+ (id)allocWithZone:(NSZonePtr)_zone {
-    env.objc.alloc_static_object(
-        this,
-        Box::new(TrivialHostObject),
-        &mut env.mem,
-    )
-}
-
-- (id)retain { this }
-- (())release {}
-- (id)autorelease { this }
-
-@end
-
 };
-
-pub fn generate_device_orientation_notification(env: &mut Environment) {
-    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
-    let name = ns_string::get_static_str(env, UIDeviceOrientationDidChangeNotification);
-    let device: id = msg_class![env; UIDevice currentDevice];
-    let _: () = msg![env; center postNotificationName:name object:device];
-}

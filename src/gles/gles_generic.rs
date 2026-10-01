@@ -11,12 +11,48 @@
 
 use crate::window::{GLContext, Window};
 
+use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 
 /// `GLchar` from the ES 2.0 type set. Not defined by the ES 1.1 registry, so
 /// we provide our own alias here for use in the [GLES] trait's ES 2.0 entry
 /// points.
 pub type GLchar = std::os::raw::c_char;
+
+fn tex_storage_2d_parameters(internalformat: GLenum) -> Option<(GLint, GLenum, GLenum)> {
+    let (format, type_) = match internalformat {
+        0x803C => (gles11::ALPHA, gles11::UNSIGNED_BYTE),
+        0x8040 => (gles11::LUMINANCE, gles11::UNSIGNED_BYTE),
+        0x8045 => (gles11::LUMINANCE_ALPHA, gles11::UNSIGNED_BYTE),
+        0x8051 => (gles11::RGB, gles11::UNSIGNED_BYTE),
+        0x8052 => (gles11::RGB, 0x8368),
+        0x8058 => (gles11::RGBA, gles11::UNSIGNED_BYTE),
+        0x8059 => (gles11::RGBA, 0x8368),
+        0x8D62 => (gles11::RGB, gles11::UNSIGNED_SHORT_5_6_5),
+        0x8056 => (gles11::RGBA, gles11::UNSIGNED_SHORT_4_4_4_4),
+        0x8057 => (gles11::RGBA, gles11::UNSIGNED_SHORT_5_5_5_1),
+        0x8814 => (gles11::RGBA, gles11::FLOAT),
+        0x8815 => (gles11::RGB, gles11::FLOAT),
+        0x8816 => (gles11::ALPHA, gles11::FLOAT),
+        0x8818 => (gles11::LUMINANCE, gles11::FLOAT),
+        0x8819 => (gles11::LUMINANCE_ALPHA, gles11::FLOAT),
+        0x881A => (gles11::RGBA, 0x8D61),
+        0x881B => (gles11::RGB, 0x8D61),
+        0x881C => (gles11::ALPHA, 0x8D61),
+        0x881E => (gles11::LUMINANCE, 0x8D61),
+        0x881F => (gles11::LUMINANCE_ALPHA, 0x8D61),
+        0x8229 => (0x1903, gles11::UNSIGNED_BYTE),
+        0x822B => (0x8227, gles11::UNSIGNED_BYTE),
+        0x822D => (0x1903, 0x8D61),
+        0x822E => (0x1903, gles11::FLOAT),
+        0x822F => (0x8227, 0x8D61),
+        0x8230 => (0x8227, gles11::FLOAT),
+        0x8A51 => (0x8A1F, 0x85BA),
+        0x93A1 => (0x80E1, gles11::UNSIGNED_BYTE),
+        _ => return None,
+    };
+    Some((format as GLint, format, type_))
+}
 
 /// Trait representing an OpenGL ES implementation and context.
 ///
@@ -79,8 +115,7 @@ pub trait GLES {
     /// Get some string describing the underlying driver. For OpenGL this is
     /// `GL_VENDOR`, `GL_RENDERER` and `GL_VERSION`.
     unsafe fn driver_description(&self) -> String {
-                log_dbg!("GLES backend does not implement driver_description; returning neutral value");
-        String::new()
+        unimplemented!("driver_description not implemented by this backend")
     }
     /// Returns `true` if this backend is a real OpenGL ES 2.0 / 3.0 driver and
     /// therefore does NOT support fixed-function pipeline calls (`MatrixMode`,
@@ -107,6 +142,26 @@ pub trait GLES {
     fn is_native_es1(&self) -> bool {
         false
     }
+    /// True only on the GLES1-on-GL2 emulation backend, whose GL2 host context
+    /// supports the client vertex-array queries used by the guard.
+    fn is_gles1_on_gl2(&self) -> bool {
+        false
+    }
+    /// Forward the guest's `glDiscardFramebufferEXT` call to the host driver.
+    ///
+    /// `GL_EXT_discard_framebuffer` is a bandwidth hint: the app promises not
+    /// to rely on the contents of the named attachments until they are
+    /// reloaded. Tile-based mobile GPUs (ARM Mali, Qualcomm Adreno, PowerVR)
+    /// can then skip writing tile memory back to system RAM at the end of the
+    /// frame, which is a measurable fragment-bandwidth win — see the
+    /// "External memory bandwidth" / tile write-back sections of ARM's
+    /// Mali-G57 performance counters reference guide.
+    ///
+    /// `attachments` must already be translated to attachment enums the host
+    /// driver accepts (`GL_COLOR_EXT` / `GL_DEPTH_EXT` / `GL_STENCIL_EXT` or
+    /// the equivalent attachment enums). Returns `true` if the host call was
+    /// made, `false` when the backend has no equivalent (callers treat the
+    /// discard as consumed either way — it is only a hint).
     unsafe fn DiscardFramebufferEXT(
         &mut self,
         _target: GLenum,
@@ -115,114 +170,110 @@ pub trait GLES {
     ) -> bool {
         false
     }
-    fn is_software(&self) -> bool {
+    /// Whether this backend can forward `glDiscardFramebufferEXT` to the
+    /// host driver (host extension support was detected).
+    fn discard_ext_supported(&self) -> bool {
         false
-    }
-    fn software_frame(&self) -> Option<(Vec<u8>, u32, u32)> {
-        None
     }
     // Generic state manipulation
     unsafe fn GetError(&mut self) -> GLenum {
-                log_dbg!("GLES backend does not implement GetError; returning neutral value");
-        0
+        unimplemented!("GetError not implemented by this backend")
     }
     unsafe fn Enable(&mut self, _cap: GLenum) {
-                log_dbg!("GLES backend does not implement Enable; ignoring call");
+        unimplemented!("Enable not implemented by this backend")
     }
     unsafe fn IsEnabled(&mut self, _cap: GLenum) -> GLboolean {
-                log_dbg!("GLES backend does not implement IsEnabled; returning neutral value");
-        0
+        unimplemented!("IsEnabled not implemented by this backend")
     }
     unsafe fn Disable(&mut self, _cap: GLenum) {
-                log_dbg!("GLES backend does not implement Disable; ignoring call");
+        unimplemented!("Disable not implemented by this backend")
     }
     unsafe fn ClientActiveTexture(&mut self, _texture: GLenum) {
-                log_dbg!("GLES backend does not implement ClientActiveTexture; ignoring call");
+        unimplemented!("ClientActiveTexture not implemented by this backend")
     }
     unsafe fn EnableClientState(&mut self, _array: GLenum) {
-                log_dbg!("GLES backend does not implement EnableClientState; ignoring call");
+        unimplemented!("EnableClientState not implemented by this backend")
     }
     unsafe fn DisableClientState(&mut self, _array: GLenum) {
-                log_dbg!("GLES backend does not implement DisableClientState; ignoring call");
+        unimplemented!("DisableClientState not implemented by this backend")
     }
     unsafe fn GetBooleanv(&mut self, _pname: GLenum, _params: *mut GLboolean) {
-                log_dbg!("GLES backend does not implement GetBooleanv; ignoring call");
+        unimplemented!("GetBooleanv not implemented by this backend")
     }
     unsafe fn GetFloatv(&mut self, _pname: GLenum, _params: *mut GLfloat) {
-                log_dbg!("GLES backend does not implement GetFloatv; ignoring call");
+        unimplemented!("GetFloatv not implemented by this backend")
     }
     unsafe fn GetIntegerv(&mut self, _pname: GLenum, _params: *mut GLint) {
-                log_dbg!("GLES backend does not implement GetIntegerv; ignoring call");
+        unimplemented!("GetIntegerv not implemented by this backend")
     }
     unsafe fn GetFixedv(&mut self, _pname: GLenum, _params: *mut GLfixed) {
-                log_dbg!("GLES backend does not implement GetFixedv; ignoring call");
+        unimplemented!("GetFixedv not implemented by this backend")
     }
     unsafe fn GetTexEnviv(&mut self, _target: GLenum, _pname: GLenum, _params: *mut GLint) {
-                log_dbg!("GLES backend does not implement GetTexEnviv; ignoring call");
+        unimplemented!("GetTexEnviv not implemented by this backend")
     }
     unsafe fn GetTexEnvfv(&mut self, _target: GLenum, _pname: GLenum, _params: *mut GLfloat) {
-                log_dbg!("GLES backend does not implement GetTexEnvfv; ignoring call");
+        unimplemented!("GetTexEnvfv not implemented by this backend")
     }
     unsafe fn GetTexEnvxv(&mut self, _target: GLenum, _pname: GLenum, _params: *mut GLfixed) {
-                log_dbg!("GLES backend does not implement GetTexEnvxv; ignoring call");
+        unimplemented!("GetTexEnvxv not implemented by this backend")
     }
     unsafe fn GetTexParameteriv(&mut self, _target: GLenum, _pname: GLenum, _params: *mut GLint) {
-                log_dbg!("GLES backend does not implement GetTexParameteriv; ignoring call");
+        unimplemented!("GetTexParameteriv not implemented by this backend")
     }
     unsafe fn GetTexParameterfv(&mut self, _target: GLenum, _pname: GLenum, _params: *mut GLfloat) {
-                log_dbg!("GLES backend does not implement GetTexParameterfv; ignoring call");
+        unimplemented!("GetTexParameterfv not implemented by this backend")
     }
     unsafe fn GetTexParameterxv(&mut self, _target: GLenum, _pname: GLenum, _params: *mut GLfixed) {
-                log_dbg!("GLES backend does not implement GetTexParameterxv; ignoring call");
+        unimplemented!("GetTexParameterxv not implemented by this backend")
     }
     unsafe fn GetClipPlanef(&mut self, _plane: GLenum, _equation: *mut GLfloat) {
-                log_dbg!("GLES backend does not implement GetClipPlanef; ignoring call");
+        unimplemented!("GetClipPlanef not implemented by this backend")
     }
     unsafe fn GetClipPlanex(&mut self, _plane: GLenum, _equation: *mut GLfixed) {
-                log_dbg!("GLES backend does not implement GetClipPlanex; ignoring call");
+        unimplemented!("GetClipPlanex not implemented by this backend")
     }
     unsafe fn GetLightfv(&mut self, _light: GLenum, _pname: GLenum, _params: *mut GLfloat) {
-                log_dbg!("GLES backend does not implement GetLightfv; ignoring call");
+        unimplemented!("GetLightfv not implemented by this backend")
     }
     unsafe fn GetLightxv(&mut self, _light: GLenum, _pname: GLenum, _params: *mut GLfixed) {
-                log_dbg!("GLES backend does not implement GetLightxv; ignoring call");
+        unimplemented!("GetLightxv not implemented by this backend")
     }
     unsafe fn GetMaterialfv(&mut self, _face: GLenum, _pname: GLenum, _params: *mut GLfloat) {
-                log_dbg!("GLES backend does not implement GetMaterialfv; ignoring call");
+        unimplemented!("GetMaterialfv not implemented by this backend")
     }
     unsafe fn GetMaterialxv(&mut self, _face: GLenum, _pname: GLenum, _params: *mut GLfixed) {
-                log_dbg!("GLES backend does not implement GetMaterialxv; ignoring call");
+        unimplemented!("GetMaterialxv not implemented by this backend")
     }
     unsafe fn GetPointerv(&mut self, _pname: GLenum, _params: *mut *const GLvoid) {
-                log_dbg!("GLES backend does not implement GetPointerv; ignoring call");
+        unimplemented!("GetPointerv not implemented by this backend")
     }
     unsafe fn Hint(&mut self, _target: GLenum, _mode: GLenum) {
-                log_dbg!("GLES backend does not implement Hint; ignoring call");
+        unimplemented!("Hint not implemented by this backend")
     }
     unsafe fn Finish(&mut self) {
-                log_dbg!("GLES backend does not implement Finish; ignoring call");
+        unimplemented!("Finish not implemented by this backend")
     }
     unsafe fn Flush(&mut self) {
-                log_dbg!("GLES backend does not implement Flush; ignoring call");
+        unimplemented!("Flush not implemented by this backend")
     }
     #[allow(dead_code)]
     unsafe fn GetString(&mut self, _name: GLenum) -> *const GLubyte {
-                log_dbg!("GLES backend does not implement GetString; returning neutral value");
-        std::ptr::null()
+        unimplemented!("GetString not implemented by this backend")
     }
 
     // Other state manipulation
     unsafe fn AlphaFunc(&mut self, _func: GLenum, _ref_: GLclampf) {
-                log_dbg!("GLES backend does not implement AlphaFunc; ignoring call");
+        unimplemented!("AlphaFunc not implemented by this backend")
     }
     unsafe fn AlphaFuncx(&mut self, _func: GLenum, _ref_: GLclampx) {
-                log_dbg!("GLES backend does not implement AlphaFuncx; ignoring call");
+        unimplemented!("AlphaFuncx not implemented by this backend")
     }
     unsafe fn BlendFunc(&mut self, _sfactor: GLenum, _dfactor: GLenum) {
-                log_dbg!("GLES backend does not implement BlendFunc; ignoring call");
+        unimplemented!("BlendFunc not implemented by this backend")
     }
     unsafe fn BlendEquationOES(&mut self, _mode: GLenum) {
-                log_dbg!("GLES backend does not implement BlendEquationOES; ignoring call");
+        unimplemented!("BlendEquationOES not implemented by this backend")
     }
     unsafe fn ColorMask(
         &mut self,
@@ -231,90 +282,90 @@ pub trait GLES {
         _blue: GLboolean,
         _alpha: GLboolean,
     ) {
-                log_dbg!("GLES backend does not implement ColorMask; ignoring call");
+        unimplemented!("ColorMask not implemented by this backend")
     }
     unsafe fn ClipPlanef(&mut self, _plane: GLenum, _equation: *const GLfloat) {
-                log_dbg!("GLES backend does not implement ClipPlanef; ignoring call");
+        unimplemented!("ClipPlanef not implemented by this backend")
     }
     unsafe fn ClipPlanex(&mut self, _plane: GLenum, _equation: *const GLfixed) {
-                log_dbg!("GLES backend does not implement ClipPlanex; ignoring call");
+        unimplemented!("ClipPlanex not implemented by this backend")
     }
     unsafe fn CullFace(&mut self, _mode: GLenum) {
-                log_dbg!("GLES backend does not implement CullFace; ignoring call");
+        unimplemented!("CullFace not implemented by this backend")
     }
     unsafe fn DepthFunc(&mut self, _func: GLenum) {
-                log_dbg!("GLES backend does not implement DepthFunc; ignoring call");
+        unimplemented!("DepthFunc not implemented by this backend")
     }
     unsafe fn DepthMask(&mut self, _flag: GLboolean) {
-                log_dbg!("GLES backend does not implement DepthMask; ignoring call");
+        unimplemented!("DepthMask not implemented by this backend")
     }
     unsafe fn DepthRangef(&mut self, _near: GLclampf, _far: GLclampf) {
-                log_dbg!("GLES backend does not implement DepthRangef; ignoring call");
+        unimplemented!("DepthRangef not implemented by this backend")
     }
     unsafe fn DepthRangex(&mut self, _near: GLclampx, _far: GLclampx) {
-                log_dbg!("GLES backend does not implement DepthRangex; ignoring call");
+        unimplemented!("DepthRangex not implemented by this backend")
     }
     unsafe fn FrontFace(&mut self, _mode: GLenum) {
-                log_dbg!("GLES backend does not implement FrontFace; ignoring call");
+        unimplemented!("FrontFace not implemented by this backend")
     }
     unsafe fn PolygonOffset(&mut self, _factor: GLfloat, _units: GLfloat) {
-                log_dbg!("GLES backend does not implement PolygonOffset; ignoring call");
+        unimplemented!("PolygonOffset not implemented by this backend")
     }
     unsafe fn PolygonOffsetx(&mut self, _factor: GLfixed, _units: GLfixed) {
-                log_dbg!("GLES backend does not implement PolygonOffsetx; ignoring call");
+        unimplemented!("PolygonOffsetx not implemented by this backend")
     }
     unsafe fn SampleCoverage(&mut self, _value: GLclampf, _invert: GLboolean) {
-                log_dbg!("GLES backend does not implement SampleCoverage; ignoring call");
+        unimplemented!("SampleCoverage not implemented by this backend")
     }
     unsafe fn SampleCoveragex(&mut self, _value: GLclampx, _invert: GLboolean) {
-                log_dbg!("GLES backend does not implement SampleCoveragex; ignoring call");
+        unimplemented!("SampleCoveragex not implemented by this backend")
     }
     unsafe fn ShadeModel(&mut self, _mode: GLenum) {
-                log_dbg!("GLES backend does not implement ShadeModel; ignoring call");
+        unimplemented!("ShadeModel not implemented by this backend")
     }
     unsafe fn Scissor(&mut self, _x: GLint, _y: GLint, _width: GLsizei, _height: GLsizei) {
-                log_dbg!("GLES backend does not implement Scissor; ignoring call");
+        unimplemented!("Scissor not implemented by this backend")
     }
     unsafe fn Viewport(&mut self, _x: GLint, _y: GLint, _width: GLsizei, _height: GLsizei) {
-                log_dbg!("GLES backend does not implement Viewport; ignoring call");
+        unimplemented!("Viewport not implemented by this backend")
     }
     unsafe fn LineWidth(&mut self, _val: GLfloat) {
-                log_dbg!("GLES backend does not implement LineWidth; ignoring call");
+        unimplemented!("LineWidth not implemented by this backend")
     }
     unsafe fn LineWidthx(&mut self, _val: GLfixed) {
-                log_dbg!("GLES backend does not implement LineWidthx; ignoring call");
+        unimplemented!("LineWidthx not implemented by this backend")
     }
     unsafe fn StencilFunc(&mut self, _func: GLenum, _ref_: GLint, _mask: GLuint) {
-                log_dbg!("GLES backend does not implement StencilFunc; ignoring call");
+        unimplemented!("StencilFunc not implemented by this backend")
     }
     unsafe fn StencilOp(&mut self, _sfail: GLenum, _dpfail: GLenum, _dppass: GLenum) {
-                log_dbg!("GLES backend does not implement StencilOp; ignoring call");
+        unimplemented!("StencilOp not implemented by this backend")
     }
     unsafe fn StencilMask(&mut self, _mask: GLuint) {
-                log_dbg!("GLES backend does not implement StencilMask; ignoring call");
+        unimplemented!("StencilMask not implemented by this backend")
     }
     unsafe fn LogicOp(&mut self, _opcode: GLenum) {
-                log_dbg!("GLES backend does not implement LogicOp; ignoring call");
+        unimplemented!("LogicOp not implemented by this backend")
     }
 
     // Points
     unsafe fn PointSize(&mut self, _size: GLfloat) {
-                log_dbg!("GLES backend does not implement PointSize; ignoring call");
+        unimplemented!("PointSize not implemented by this backend")
     }
     unsafe fn PointSizex(&mut self, _size: GLfixed) {
-                log_dbg!("GLES backend does not implement PointSizex; ignoring call");
+        unimplemented!("PointSizex not implemented by this backend")
     }
     unsafe fn PointParameterf(&mut self, _pname: GLenum, _param: GLfloat) {
-                log_dbg!("GLES backend does not implement PointParameterf; ignoring call");
+        unimplemented!("PointParameterf not implemented by this backend")
     }
     unsafe fn PointParameterx(&mut self, _pname: GLenum, _param: GLfixed) {
-                log_dbg!("GLES backend does not implement PointParameterx; ignoring call");
+        unimplemented!("PointParameterx not implemented by this backend")
     }
     unsafe fn PointParameterfv(&mut self, _pname: GLenum, _params: *const GLfloat) {
-                log_dbg!("GLES backend does not implement PointParameterfv; ignoring call");
+        unimplemented!("PointParameterfv not implemented by this backend")
     }
     unsafe fn PointParameterxv(&mut self, _pname: GLenum, _params: *const GLfixed) {
-                log_dbg!("GLES backend does not implement PointParameterxv; ignoring call");
+        unimplemented!("PointParameterxv not implemented by this backend")
     }
 
     // Lighting and materials
@@ -337,17 +388,16 @@ pub trait GLES {
 
     // Buffers
     unsafe fn IsBuffer(&mut self, _buffer: GLuint) -> GLboolean {
-                log_dbg!("GLES backend does not implement IsBuffer; returning neutral value");
-        0
+        unimplemented!("IsBuffer not implemented by this backend")
     }
     unsafe fn GenBuffers(&mut self, _n: GLsizei, _buffers: *mut GLuint) {
-                log_dbg!("GLES backend does not implement GenBuffers; ignoring call");
+        unimplemented!("GenBuffers not implemented by this backend")
     }
     unsafe fn DeleteBuffers(&mut self, _n: GLsizei, _buffers: *const GLuint) {
-                log_dbg!("GLES backend does not implement DeleteBuffers; ignoring call");
+        unimplemented!("DeleteBuffers not implemented by this backend")
     }
     unsafe fn BindBuffer(&mut self, _target: GLenum, _buffer: GLuint) {
-                log_dbg!("GLES backend does not implement BindBuffer; ignoring call");
+        unimplemented!("BindBuffer not implemented by this backend")
     }
     unsafe fn BufferData(
         &mut self,
@@ -356,7 +406,7 @@ pub trait GLES {
         _data: *const GLvoid,
         _usage: GLenum,
     ) {
-                log_dbg!("GLES backend does not implement BufferData; ignoring call");
+        unimplemented!("BufferData not implemented by this backend")
     }
     unsafe fn BufferSubData(
         &mut self,
@@ -365,24 +415,24 @@ pub trait GLES {
         _size: GLsizeiptr,
         _data: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement BufferSubData; ignoring call");
+        unimplemented!("BufferSubData not implemented by this backend")
     }
 
     // Non-pointers
     unsafe fn Color4f(&mut self, _red: GLfloat, _green: GLfloat, _blue: GLfloat, _alpha: GLfloat) {
-                log_dbg!("GLES backend does not implement Color4f; ignoring call");
+        unimplemented!("Color4f not implemented by this backend")
     }
     unsafe fn Color4x(&mut self, _red: GLfixed, _green: GLfixed, _blue: GLfixed, _alpha: GLfixed) {
-                log_dbg!("GLES backend does not implement Color4x; ignoring call");
+        unimplemented!("Color4x not implemented by this backend")
     }
     unsafe fn Color4ub(&mut self, _red: GLubyte, _green: GLubyte, _blue: GLubyte, _alpha: GLubyte) {
-                log_dbg!("GLES backend does not implement Color4ub; ignoring call");
+        unimplemented!("Color4ub not implemented by this backend")
     }
     unsafe fn Normal3f(&mut self, _nx: GLfloat, _ny: GLfloat, _nz: GLfloat) {
-                log_dbg!("GLES backend does not implement Normal3f; ignoring call");
+        unimplemented!("Normal3f not implemented by this backend")
     }
     unsafe fn Normal3x(&mut self, _nx: GLfixed, _ny: GLfixed, _nz: GLfixed) {
-                log_dbg!("GLES backend does not implement Normal3x; ignoring call");
+        unimplemented!("Normal3x not implemented by this backend")
     }
 
     // Pointers
@@ -393,10 +443,10 @@ pub trait GLES {
         _stride: GLsizei,
         _pointer: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement ColorPointer; ignoring call");
+        unimplemented!("ColorPointer not implemented by this backend")
     }
     unsafe fn NormalPointer(&mut self, _type_: GLenum, _stride: GLsizei, _pointer: *const GLvoid) {
-                log_dbg!("GLES backend does not implement NormalPointer; ignoring call");
+        unimplemented!("NormalPointer not implemented by this backend")
     }
     unsafe fn TexCoordPointer(
         &mut self,
@@ -405,7 +455,7 @@ pub trait GLES {
         _stride: GLsizei,
         _pointer: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement TexCoordPointer; ignoring call");
+        unimplemented!("TexCoordPointer not implemented by this backend")
     }
     unsafe fn VertexPointer(
         &mut self,
@@ -414,7 +464,7 @@ pub trait GLES {
         _stride: GLsizei,
         _pointer: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement VertexPointer; ignoring call");
+        unimplemented!("VertexPointer not implemented by this backend")
     }
     /// `glPointSizePointerOES` from `GL_OES_point_size_array`. Lets the
     /// app supply per-vertex point sizes alongside the regular vertex
@@ -463,7 +513,7 @@ pub trait GLES {
 
     // Drawing
     unsafe fn DrawArrays(&mut self, _mode: GLenum, _first: GLint, _count: GLsizei) {
-                log_dbg!("GLES backend does not implement DrawArrays; ignoring call");
+        unimplemented!("DrawArrays not implemented by this backend")
     }
     unsafe fn DrawElements(
         &mut self,
@@ -472,7 +522,7 @@ pub trait GLES {
         _type_: GLenum,
         _indices: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement DrawElements; ignoring call");
+        unimplemented!("DrawElements not implemented by this backend")
     }
     /// `glDrawTex{s,i,x,f}OES` from `GL_OES_draw_texture` — blit the
     /// currently bound 2D texture (using `GL_TEXTURE_CROP_RECT_OES`) to a
@@ -494,7 +544,7 @@ pub trait GLES {
 
     // Clearing
     unsafe fn Clear(&mut self, _mask: GLbitfield) {
-                log_dbg!("GLES backend does not implement Clear; ignoring call");
+        unimplemented!("Clear not implemented by this backend")
     }
     unsafe fn ClearColor(
         &mut self,
@@ -503,7 +553,7 @@ pub trait GLES {
         _blue: GLclampf,
         _alpha: GLclampf,
     ) {
-                log_dbg!("GLES backend does not implement ClearColor; ignoring call");
+        unimplemented!("ClearColor not implemented by this backend")
     }
     unsafe fn ClearColorx(
         &mut self,
@@ -512,21 +562,21 @@ pub trait GLES {
         _blue: GLclampx,
         _alpha: GLclampx,
     ) {
-                log_dbg!("GLES backend does not implement ClearColorx; ignoring call");
+        unimplemented!("ClearColorx not implemented by this backend")
     }
     unsafe fn ClearDepthf(&mut self, _depth: GLclampf) {
-                log_dbg!("GLES backend does not implement ClearDepthf; ignoring call");
+        unimplemented!("ClearDepthf not implemented by this backend")
     }
     unsafe fn ClearDepthx(&mut self, _depth: GLclampx) {
-                log_dbg!("GLES backend does not implement ClearDepthx; ignoring call");
+        unimplemented!("ClearDepthx not implemented by this backend")
     }
     unsafe fn ClearStencil(&mut self, _s: GLint) {
-                log_dbg!("GLES backend does not implement ClearStencil; ignoring call");
+        unimplemented!("ClearStencil not implemented by this backend")
     }
 
     // Textures
     unsafe fn PixelStorei(&mut self, _pname: GLenum, _param: GLint) {
-                log_dbg!("GLES backend does not implement PixelStorei; ignoring call");
+        unimplemented!("PixelStorei not implemented by this backend")
     }
     unsafe fn ReadPixels(
         &mut self,
@@ -538,41 +588,40 @@ pub trait GLES {
         _type_: GLenum,
         _pixels: *mut GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement ReadPixels; ignoring call");
+        unimplemented!("ReadPixels not implemented by this backend")
     }
     unsafe fn GenTextures(&mut self, _n: GLsizei, _textures: *mut GLuint) {
-                log_dbg!("GLES backend does not implement GenTextures; ignoring call");
+        unimplemented!("GenTextures not implemented by this backend")
     }
     unsafe fn DeleteTextures(&mut self, _n: GLsizei, _textures: *const GLuint) {
-                log_dbg!("GLES backend does not implement DeleteTextures; ignoring call");
+        unimplemented!("DeleteTextures not implemented by this backend")
     }
     unsafe fn ActiveTexture(&mut self, _texture: GLenum) {
-                log_dbg!("GLES backend does not implement ActiveTexture; ignoring call");
+        unimplemented!("ActiveTexture not implemented by this backend")
     }
     unsafe fn IsTexture(&mut self, _texture: GLuint) -> GLboolean {
-                log_dbg!("GLES backend does not implement IsTexture; returning neutral value");
-        0
+        unimplemented!("IsTexture not implemented by this backend")
     }
     unsafe fn BindTexture(&mut self, _target: GLenum, _texture: GLuint) {
-                log_dbg!("GLES backend does not implement BindTexture; ignoring call");
+        unimplemented!("BindTexture not implemented by this backend")
     }
     unsafe fn TexParameteri(&mut self, _target: GLenum, _pname: GLenum, _param: GLint) {
-                log_dbg!("GLES backend does not implement TexParameteri; ignoring call");
+        unimplemented!("TexParameteri not implemented by this backend")
     }
     unsafe fn TexParameterf(&mut self, _target: GLenum, _pname: GLenum, _param: GLfloat) {
-                log_dbg!("GLES backend does not implement TexParameterf; ignoring call");
+        unimplemented!("TexParameterf not implemented by this backend")
     }
     unsafe fn TexParameterx(&mut self, _target: GLenum, _pname: GLenum, _param: GLfixed) {
-                log_dbg!("GLES backend does not implement TexParameterx; ignoring call");
+        unimplemented!("TexParameterx not implemented by this backend")
     }
     unsafe fn TexParameteriv(&mut self, _target: GLenum, _pname: GLenum, _params: *const GLint) {
-                log_dbg!("GLES backend does not implement TexParameteriv; ignoring call");
+        unimplemented!("TexParameteriv not implemented by this backend")
     }
     unsafe fn TexParameterfv(&mut self, _target: GLenum, _pname: GLenum, _params: *const GLfloat) {
-                log_dbg!("GLES backend does not implement TexParameterfv; ignoring call");
+        unimplemented!("TexParameterfv not implemented by this backend")
     }
     unsafe fn TexParameterxv(&mut self, _target: GLenum, _pname: GLenum, _params: *const GLfixed) {
-                log_dbg!("GLES backend does not implement TexParameterxv; ignoring call");
+        unimplemented!("TexParameterxv not implemented by this backend")
     }
     unsafe fn TexImage2D(
         &mut self,
@@ -586,7 +635,7 @@ pub trait GLES {
         _type_: GLenum,
         _pixels: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement TexImage2D; ignoring call");
+        unimplemented!("TexImage2D not implemented by this backend")
     }
     unsafe fn TexSubImage2D(
         &mut self,
@@ -600,7 +649,7 @@ pub trait GLES {
         _type_: GLenum,
         _pixels: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement TexSubImage2D; ignoring call");
+        unimplemented!("TexSubImage2D not implemented by this backend")
     }
     unsafe fn CompressedTexImage2D(
         &mut self,
@@ -613,21 +662,23 @@ pub trait GLES {
         _image_size: GLsizei,
         _data: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement CompressedTexImage2D; ignoring call");
+        unimplemented!("CompressedTexImage2D not implemented by this backend")
     }
     unsafe fn CompressedTexSubImage2D(
         &mut self,
-        _target: GLenum,
-        _level: GLint,
-        _xoffset: GLint,
-        _yoffset: GLint,
-        _width: GLsizei,
-        _height: GLsizei,
-        _format: GLenum,
-        _image_size: GLsizei,
-        _data: *const GLvoid,
+        target: GLenum,
+        level: GLint,
+        xoffset: GLint,
+        yoffset: GLint,
+        width: GLsizei,
+        height: GLsizei,
+        format: GLenum,
+        image_size: GLsizei,
+        data: *const GLvoid,
     ) {
-                log_dbg!("GLES backend does not implement CompressedTexSubImage2D; ignoring call");
+        gles11::CompressedTexSubImage2D(
+            target, level, xoffset, yoffset, width, height, format, image_size, data,
+        )
     }
     unsafe fn CopyTexImage2D(
         &mut self,
@@ -640,7 +691,7 @@ pub trait GLES {
         _height: GLsizei,
         _border: GLint,
     ) {
-                log_dbg!("GLES backend does not implement CopyTexImage2D; ignoring call");
+        unimplemented!("CopyTexImage2D not implemented by this backend")
     }
     unsafe fn CopyTexSubImage2D(
         &mut self,
@@ -653,25 +704,25 @@ pub trait GLES {
         _width: GLsizei,
         _height: GLsizei,
     ) {
-                log_dbg!("GLES backend does not implement CopyTexSubImage2D; ignoring call");
+        unimplemented!("CopyTexSubImage2D not implemented by this backend")
     }
     unsafe fn TexEnvf(&mut self, _target: GLenum, _pname: GLenum, _param: GLfloat) {
-                log_dbg!("GLES backend does not implement TexEnvf; ignoring call");
+        unimplemented!("TexEnvf not implemented by this backend")
     }
     unsafe fn TexEnvx(&mut self, _target: GLenum, _pname: GLenum, _param: GLfixed) {
-                log_dbg!("GLES backend does not implement TexEnvx; ignoring call");
+        unimplemented!("TexEnvx not implemented by this backend")
     }
     unsafe fn TexEnvi(&mut self, _target: GLenum, _pname: GLenum, _param: GLint) {
-                log_dbg!("GLES backend does not implement TexEnvi; ignoring call");
+        unimplemented!("TexEnvi not implemented by this backend")
     }
     unsafe fn TexEnvfv(&mut self, _target: GLenum, _pname: GLenum, _params: *const GLfloat) {
-                log_dbg!("GLES backend does not implement TexEnvfv; ignoring call");
+        unimplemented!("TexEnvfv not implemented by this backend")
     }
     unsafe fn TexEnvxv(&mut self, _target: GLenum, _pname: GLenum, _params: *const GLfixed) {
-                log_dbg!("GLES backend does not implement TexEnvxv; ignoring call");
+        unimplemented!("TexEnvxv not implemented by this backend")
     }
     unsafe fn TexEnviv(&mut self, _target: GLenum, _pname: GLenum, _params: *const GLint) {
-                log_dbg!("GLES backend does not implement TexEnviv; ignoring call");
+        unimplemented!("TexEnviv not implemented by this backend")
     }
     unsafe fn DrawTexsOES(&mut self, x: i16, y: i16, z: i16, width: i16, height: i16) {
         self.DrawTexfOES(
@@ -753,7 +804,7 @@ pub trait GLES {
         _r: GLfloat,
         _q: GLfloat,
     ) {
-                log_dbg!("GLES backend does not implement MultiTexCoord4f; ignoring call");
+        unimplemented!("MultiTexCoord4f not implemented by this backend")
     }
     unsafe fn MultiTexCoord4x(
         &mut self,
@@ -763,33 +814,33 @@ pub trait GLES {
         _r: GLfixed,
         _q: GLfixed,
     ) {
-                log_dbg!("GLES backend does not implement MultiTexCoord4x; ignoring call");
+        unimplemented!("MultiTexCoord4x not implemented by this backend")
     }
 
     // Matrix stack operations
     unsafe fn MatrixMode(&mut self, _mode: GLenum) {
-                log_dbg!("GLES backend does not implement MatrixMode; ignoring call");
+        unimplemented!("MatrixMode not implemented by this backend")
     }
     unsafe fn LoadIdentity(&mut self) {
-                log_dbg!("GLES backend does not implement LoadIdentity; ignoring call");
+        unimplemented!("LoadIdentity not implemented by this backend")
     }
     unsafe fn LoadMatrixf(&mut self, _m: *const GLfloat) {
-                log_dbg!("GLES backend does not implement LoadMatrixf; ignoring call");
+        unimplemented!("LoadMatrixf not implemented by this backend")
     }
     unsafe fn LoadMatrixx(&mut self, _m: *const GLfixed) {
-                log_dbg!("GLES backend does not implement LoadMatrixx; ignoring call");
+        unimplemented!("LoadMatrixx not implemented by this backend")
     }
     unsafe fn MultMatrixf(&mut self, _m: *const GLfloat) {
-                log_dbg!("GLES backend does not implement MultMatrixf; ignoring call");
+        unimplemented!("MultMatrixf not implemented by this backend")
     }
     unsafe fn MultMatrixx(&mut self, _m: *const GLfixed) {
-                log_dbg!("GLES backend does not implement MultMatrixx; ignoring call");
+        unimplemented!("MultMatrixx not implemented by this backend")
     }
     unsafe fn PushMatrix(&mut self) {
-                log_dbg!("GLES backend does not implement PushMatrix; ignoring call");
+        unimplemented!("PushMatrix not implemented by this backend")
     }
     unsafe fn PopMatrix(&mut self) {
-                log_dbg!("GLES backend does not implement PopMatrix; ignoring call");
+        unimplemented!("PopMatrix not implemented by this backend")
     }
     unsafe fn Orthof(
         &mut self,
@@ -800,7 +851,7 @@ pub trait GLES {
         _near: GLfloat,
         _far: GLfloat,
     ) {
-                log_dbg!("GLES backend does not implement Orthof; ignoring call");
+        unimplemented!("Orthof not implemented by this backend")
     }
     unsafe fn Orthox(
         &mut self,
@@ -811,7 +862,7 @@ pub trait GLES {
         _near: GLfixed,
         _far: GLfixed,
     ) {
-                log_dbg!("GLES backend does not implement Orthox; ignoring call");
+        unimplemented!("Orthox not implemented by this backend")
     }
     unsafe fn Frustumf(
         &mut self,
@@ -822,7 +873,7 @@ pub trait GLES {
         _near: GLfloat,
         _far: GLfloat,
     ) {
-                log_dbg!("GLES backend does not implement Frustumf; ignoring call");
+        unimplemented!("Frustumf not implemented by this backend")
     }
     unsafe fn Frustumx(
         &mut self,
@@ -833,47 +884,45 @@ pub trait GLES {
         _near: GLfixed,
         _far: GLfixed,
     ) {
-                log_dbg!("GLES backend does not implement Frustumx; ignoring call");
+        unimplemented!("Frustumx not implemented by this backend")
     }
     unsafe fn Rotatef(&mut self, _angle: GLfloat, _x: GLfloat, _y: GLfloat, _z: GLfloat) {
-                log_dbg!("GLES backend does not implement Rotatef; ignoring call");
+        unimplemented!("Rotatef not implemented by this backend")
     }
     unsafe fn Rotatex(&mut self, _angle: GLfixed, _x: GLfixed, _y: GLfixed, _z: GLfixed) {
-                log_dbg!("GLES backend does not implement Rotatex; ignoring call");
+        unimplemented!("Rotatex not implemented by this backend")
     }
     unsafe fn Scalef(&mut self, _x: GLfloat, _y: GLfloat, _z: GLfloat) {
-                log_dbg!("GLES backend does not implement Scalef; ignoring call");
+        unimplemented!("Scalef not implemented by this backend")
     }
     unsafe fn Scalex(&mut self, _x: GLfixed, _y: GLfixed, _z: GLfixed) {
-                log_dbg!("GLES backend does not implement Scalex; ignoring call");
+        unimplemented!("Scalex not implemented by this backend")
     }
     unsafe fn Translatef(&mut self, _x: GLfloat, _y: GLfloat, _z: GLfloat) {
-                log_dbg!("GLES backend does not implement Translatef; ignoring call");
+        unimplemented!("Translatef not implemented by this backend")
     }
     unsafe fn Translatex(&mut self, _x: GLfixed, _y: GLfixed, _z: GLfixed) {
-                log_dbg!("GLES backend does not implement Translatex; ignoring call");
+        unimplemented!("Translatex not implemented by this backend")
     }
 
     // OES_framebuffer_object (incomplete)
     unsafe fn GenFramebuffersOES(&mut self, _n: GLsizei, _framebuffers: *mut GLuint) {
-                log_dbg!("GLES backend does not implement GenFramebuffersOES; ignoring call");
+        unimplemented!("GenFramebuffersOES not implemented by this backend")
     }
     unsafe fn GenRenderbuffersOES(&mut self, _n: GLsizei, _renderbuffers: *mut GLuint) {
-                log_dbg!("GLES backend does not implement GenRenderbuffersOES; ignoring call");
+        unimplemented!("GenRenderbuffersOES not implemented by this backend")
     }
     unsafe fn IsFramebufferOES(&mut self, _framebuffer: GLuint) -> GLboolean {
-                log_dbg!("GLES backend does not implement IsFramebufferOES; returning neutral value");
-        0
+        unimplemented!("IsFramebufferOES not implemented by this backend")
     }
     unsafe fn IsRenderbufferOES(&mut self, _renderbuffer: GLuint) -> GLboolean {
-                log_dbg!("GLES backend does not implement IsRenderbufferOES; returning neutral value");
-        0
+        unimplemented!("IsRenderbufferOES not implemented by this backend")
     }
     unsafe fn BindFramebufferOES(&mut self, _target: GLenum, _framebuffer: GLuint) {
-                log_dbg!("GLES backend does not implement BindFramebufferOES; ignoring call");
+        unimplemented!("BindFramebufferOES not implemented by this backend")
     }
     unsafe fn BindRenderbufferOES(&mut self, _target: GLenum, _renderbuffer: GLuint) {
-                log_dbg!("GLES backend does not implement BindRenderbufferOES; ignoring call");
+        unimplemented!("BindRenderbufferOES not implemented by this backend")
     }
     unsafe fn RenderbufferStorageOES(
         &mut self,
@@ -882,7 +931,7 @@ pub trait GLES {
         _width: GLsizei,
         _height: GLsizei,
     ) {
-                log_dbg!("GLES backend does not implement RenderbufferStorageOES; ignoring call");
+        unimplemented!("RenderbufferStorageOES not implemented by this backend")
     }
     unsafe fn FramebufferRenderbufferOES(
         &mut self,
@@ -891,19 +940,17 @@ pub trait GLES {
         _renderbuffertarget: GLenum,
         _renderbuffer: GLuint,
     ) {
-                log_dbg!("GLES backend does not implement FramebufferRenderbufferOES; ignoring call");
+        unimplemented!("FramebufferRenderbufferOES not implemented by this backend")
     }
     unsafe fn FramebufferTexture2DOES(
         &mut self,
-        target: GLenum,
-        attachment: GLenum,
+        _target: GLenum,
+        _attachment: GLenum,
         _textarget: GLenum,
-        texture: GLuint,
-        level: i32,
+        _texture: GLuint,
+        _level: i32,
     ) {
-        eprintln!(
-            "STUB: glFramebufferTexture2DOES(target=0x{target:x}, attachment=0x{attachment:x}, texture={texture}, level={level})"
-        );
+        unimplemented!("FramebufferTexture2DOES not implemented by this backend")
     }
     unsafe fn GetFramebufferAttachmentParameterivOES(
         &mut self,
@@ -912,7 +959,7 @@ pub trait GLES {
         _pname: GLenum,
         _params: *mut GLint,
     ) {
-                log_dbg!("GLES backend does not implement GetFramebufferAttachmentParameterivOES; ignoring call");
+        unimplemented!("GetFramebufferAttachmentParameterivOES not implemented by this backend")
     }
     unsafe fn GetRenderbufferParameterivOES(
         &mut self,
@@ -920,20 +967,19 @@ pub trait GLES {
         _pname: GLenum,
         _params: *mut GLint,
     ) {
-                log_dbg!("GLES backend does not implement GetRenderbufferParameterivOES; ignoring call");
+        unimplemented!("GetRenderbufferParameterivOES not implemented by this backend")
     }
     unsafe fn CheckFramebufferStatusOES(&mut self, _target: GLenum) -> GLenum {
-                log_dbg!("GLES backend does not implement CheckFramebufferStatusOES; returning neutral value");
-        0
+        unimplemented!("CheckFramebufferStatusOES not implemented by this backend")
     }
     unsafe fn DeleteFramebuffersOES(&mut self, _n: GLsizei, _framebuffers: *const GLuint) {
-                log_dbg!("GLES backend does not implement DeleteFramebuffersOES; ignoring call");
+        unimplemented!("DeleteFramebuffersOES not implemented by this backend")
     }
     unsafe fn DeleteRenderbuffersOES(&mut self, _n: GLsizei, _renderbuffers: *const GLuint) {
-                log_dbg!("GLES backend does not implement DeleteRenderbuffersOES; ignoring call");
+        unimplemented!("DeleteRenderbuffersOES not implemented by this backend")
     }
     unsafe fn GenerateMipmapOES(&mut self, _target: GLenum) {
-                log_dbg!("GLES backend does not implement GenerateMipmapOES; ignoring call");
+        unimplemented!("GenerateMipmapOES not implemented by this backend")
     }
 
     // GL_APPLE_framebuffer_multisample
@@ -988,24 +1034,22 @@ pub trait GLES {
     // Non-OES aliases for OES_framebuffer_object functions.
     // Some GLES1 apps call the suffix-free ES2-style names directly.
     unsafe fn GenFramebuffers(&mut self, _n: GLsizei, _framebuffers: *mut GLuint) {
-                log_dbg!("GLES backend does not implement GenFramebuffers; ignoring call");
+        unimplemented!("GenFramebuffers not implemented by this backend")
     }
     unsafe fn GenRenderbuffers(&mut self, _n: GLsizei, _renderbuffers: *mut GLuint) {
-                log_dbg!("GLES backend does not implement GenRenderbuffers; ignoring call");
+        unimplemented!("GenRenderbuffers not implemented by this backend")
     }
     unsafe fn IsFramebuffer(&mut self, _framebuffer: GLuint) -> GLboolean {
-                log_dbg!("GLES backend does not implement IsFramebuffer; returning neutral value");
-        0
+        unimplemented!("IsFramebuffer not implemented by this backend")
     }
     unsafe fn IsRenderbuffer(&mut self, _renderbuffer: GLuint) -> GLboolean {
-                log_dbg!("GLES backend does not implement IsRenderbuffer; returning neutral value");
-        0
+        unimplemented!("IsRenderbuffer not implemented by this backend")
     }
     unsafe fn BindFramebuffer(&mut self, _target: GLenum, _framebuffer: GLuint) {
-                log_dbg!("GLES backend does not implement BindFramebuffer; ignoring call");
+        unimplemented!("BindFramebuffer not implemented by this backend")
     }
     unsafe fn BindRenderbuffer(&mut self, _target: GLenum, _renderbuffer: GLuint) {
-                log_dbg!("GLES backend does not implement BindRenderbuffer; ignoring call");
+        unimplemented!("BindRenderbuffer not implemented by this backend")
     }
     unsafe fn RenderbufferStorage(
         &mut self,
@@ -1014,7 +1058,7 @@ pub trait GLES {
         _width: GLsizei,
         _height: GLsizei,
     ) {
-                log_dbg!("GLES backend does not implement RenderbufferStorage; ignoring call");
+        unimplemented!("RenderbufferStorage not implemented by this backend")
     }
     unsafe fn FramebufferRenderbuffer(
         &mut self,
@@ -1023,32 +1067,29 @@ pub trait GLES {
         _renderbuffertarget: GLenum,
         _renderbuffer: GLuint,
     ) {
-                log_dbg!("GLES backend does not implement FramebufferRenderbuffer; ignoring call");
+        unimplemented!("FramebufferRenderbuffer not implemented by this backend")
     }
     unsafe fn FramebufferTexture2D(
         &mut self,
-        target: GLenum,
-        attachment: GLenum,
+        _target: GLenum,
+        _attachment: GLenum,
         _textarget: GLenum,
-        texture: GLuint,
-        level: i32,
+        _texture: GLuint,
+        _level: i32,
     ) {
-        eprintln!(
-            "STUB: glFramebufferTexture2D(target=0x{target:x}, attachment=0x{attachment:x}, texture={texture}, level={level})"
-        );
+        unimplemented!("FramebufferTexture2D not implemented by this backend")
     }
     unsafe fn CheckFramebufferStatus(&mut self, _target: GLenum) -> GLenum {
-                log_dbg!("GLES backend does not implement CheckFramebufferStatus; returning neutral value");
-        0
+        unimplemented!("CheckFramebufferStatus not implemented by this backend")
     }
     unsafe fn DeleteFramebuffers(&mut self, _n: GLsizei, _framebuffers: *const GLuint) {
-                log_dbg!("GLES backend does not implement DeleteFramebuffers; ignoring call");
+        unimplemented!("DeleteFramebuffers not implemented by this backend")
     }
     unsafe fn DeleteRenderbuffers(&mut self, _n: GLsizei, _renderbuffers: *const GLuint) {
-                log_dbg!("GLES backend does not implement DeleteRenderbuffers; ignoring call");
+        unimplemented!("DeleteRenderbuffers not implemented by this backend")
     }
     unsafe fn GenerateMipmap(&mut self, _target: GLenum) {
-                log_dbg!("GLES backend does not implement GenerateMipmap; ignoring call");
+        unimplemented!("GenerateMipmap not implemented by this backend")
     }
     unsafe fn GetFramebufferAttachmentParameteriv(
         &mut self,
@@ -1057,7 +1098,7 @@ pub trait GLES {
         _pname: GLenum,
         _params: *mut GLint,
     ) {
-                log_dbg!("GLES backend does not implement GetFramebufferAttachmentParameteriv; ignoring call");
+        unimplemented!("GetFramebufferAttachmentParameteriv not implemented by this backend")
     }
     unsafe fn GetRenderbufferParameteriv(
         &mut self,
@@ -1065,7 +1106,7 @@ pub trait GLES {
         _pname: GLenum,
         _params: *mut GLint,
     ) {
-                log_dbg!("GLES backend does not implement GetRenderbufferParameteriv; ignoring call");
+        unimplemented!("GetRenderbufferParameteriv not implemented by this backend")
     }
 
     unsafe fn GetBufferParameteriv(
@@ -1074,15 +1115,13 @@ pub trait GLES {
         _pname: GLenum,
         _params: *mut GLint,
     ) {
-                log_dbg!("GLES backend does not implement GetBufferParameteriv; ignoring call");
+        unimplemented!("GetBufferParameteriv not implemented by this backend")
     }
     unsafe fn MapBufferOES(&mut self, _target: GLenum, _access: GLenum) -> *mut GLvoid {
-                log_dbg!("GLES backend does not implement MapBufferOES; returning neutral value");
-        std::ptr::null_mut()
+        unimplemented!("MapBufferOES not implemented by this backend")
     }
     unsafe fn UnmapBufferOES(&mut self, _target: GLenum) -> GLboolean {
-                log_dbg!("GLES backend does not implement UnmapBufferOES; returning neutral value");
-        0
+        unimplemented!("UnmapBufferOES not implemented by this backend")
     }
 
     // OpenGL ES 2.0 entry points. Every shader-capable backend
@@ -1721,13 +1760,74 @@ pub trait GLES {
     }
     unsafe fn TexStorage2D(
         &mut self,
-        _target: GLenum,
-        _levels: GLsizei,
-        _internalformat: GLenum,
-        _width: GLsizei,
-        _height: GLsizei,
+        target: GLenum,
+        levels: GLsizei,
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei,
     ) {
-        log_once!("TexStorage2D (OpenGL ES 3.0) not supported by this backend [stubbed]");
+        let (image_internalformat, format, type_) = tex_storage_2d_parameters(internalformat)
+            .unwrap_or((
+                internalformat as GLint,
+                internalformat,
+                gles11::UNSIGNED_BYTE,
+            ));
+        let targets = if target == 0x8513 {
+            [0x8515, 0x8516, 0x8517, 0x8518, 0x8519, 0x851A]
+        } else {
+            [target; 6]
+        };
+        let target_count = if target == 0x8513 { 6 } else { 1 };
+        if levels <= 0 || width <= 0 || height <= 0 {
+            let invalid_width = if levels <= 0 || width <= 0 { -1 } else { width };
+            let invalid_height = if height <= 0 { -1 } else { height };
+            self.TexImage2D(
+                targets[0],
+                0,
+                image_internalformat,
+                invalid_width,
+                invalid_height,
+                0,
+                format,
+                type_,
+                std::ptr::null(),
+            );
+            return;
+        }
+        let max_levels = 32 - (width.max(height) as u32).leading_zeros() as i32;
+        if levels > max_levels {
+            self.TexImage2D(
+                targets[0],
+                0,
+                image_internalformat,
+                -1,
+                height,
+                0,
+                format,
+                type_,
+                std::ptr::null(),
+            );
+            return;
+        }
+        for image_target in targets.iter().take(target_count) {
+            let mut level_width = width;
+            let mut level_height = height;
+            for level in 0..levels {
+                self.TexImage2D(
+                    *image_target,
+                    level,
+                    image_internalformat,
+                    level_width,
+                    level_height,
+                    0,
+                    format,
+                    type_,
+                    std::ptr::null(),
+                );
+                level_width = (level_width / 2).max(1);
+                level_height = (level_height / 2).max(1);
+            }
+        }
     }
     unsafe fn TexStorage3D(
         &mut self,

@@ -30,9 +30,9 @@ use std::time::{Duration, Instant};
 mod bulk;
 pub mod classify;
 pub mod watch;
-use bulk::{apply_bulk, plan_bulk, BulkPlan};
-use classify::{analyze_batch, Analysis, ResultFilter};
 use watch::{Activity, Change, Snapshot};
+use classify::{analyze_batch, Analysis, ResultFilter};
+use bulk::{apply_bulk, plan_bulk, BulkPlan};
 
 struct PendingBulk {
     plan: BulkPlan,
@@ -155,9 +155,14 @@ impl VType {
         value
     }
 
+    fn address_range_is_valid(self, mem: &Mem, addr: u32) -> bool {
+        addr >= mem.null_segment_size()
+            && (addr as u64 + self.size() as u64) <= u32::MAX as u64 + 1
+    }
+
     /// Read the raw bits at `addr` for this type.
     pub fn read_at(self, mem: &Mem, addr: u32) -> Option<u64> {
-        if addr < mem.null_segment_size() {
+        if !self.address_range_is_valid(mem, addr) {
             return None;
         }
         let bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), self.size())?;
@@ -167,9 +172,10 @@ impl VType {
 
     /// Write raw bits without falling back to Mem's invalid-address sink.
     pub fn write_at(self, mem: &mut Mem, addr: u32, bits: u64) -> bool {
-        let Some(bytes) = mem.get_bytes_fallible_mut(
-            ConstVoidPtr::from_bits(addr), self.size(),
-        ) else {
+        if !self.address_range_is_valid(mem, addr) {
+            return false;
+        }
+        let Some(bytes) = mem.get_bytes_fallible_mut(ConstVoidPtr::from_bits(addr), self.size()) else {
             return false;
         };
         bytes.copy_from_slice(&bits.to_le_bytes()[..self.size() as usize]);
@@ -196,6 +202,7 @@ pub struct Patch {
     pub addr: u32,
     pub vtype: VType,
     pub bits: u64,
+    pub freeze: bool,
 }
 
 /// Per-app trainer state. Rebuilt whenever the running app changes.
@@ -264,6 +271,7 @@ impl Trainer {
                 "trainer: app changed to {:?}; resetting search state",
                 app_id
             );
+            let enabled = self.enabled;
             self.state = TrainerState::default();
             self.state.app_id = app_id.map(String::from);
             self.load_and_apply_hacks(mem);
@@ -271,12 +279,9 @@ impl Trainer {
             self.last_file_check = Instant::now();
         }
 
-        if self
-            .state
-            .pending_bulk
-            .as_ref()
-            .is_some_and(|pending| pending.created_at.elapsed() >= BULK_CONFIRM_TIMEOUT)
-        {
+        if self.state.pending_bulk.as_ref().is_some_and(|pending| {
+            pending.created_at.elapsed() >= BULK_CONFIRM_TIMEOUT
+        }) {
             self.state.pending_bulk = None;
             trainer_ui::publish_bulk_preview(false);
             trainer_ui::publish_status("PREVIEW EXPIRED: TAP SET ALL".to_string());
@@ -286,9 +291,7 @@ impl Trainer {
         for cmd in trainer_ui::take_commands() {
             let inspect = matches!(&cmd, TrainerCmd::InspectSelection);
             self.handle_command(mem, cmd);
-            if inspect {
-                self.describe_selection(mem, objc);
-            }
+            if inspect { self.describe_selection(mem, objc); }
         }
 
         // Re-assert frozen values ~20 times per second.
@@ -321,53 +324,24 @@ impl Trainer {
         if let Some((base, size)) = mem.live_allocations().into_iter().find(|&(base, size)| {
             base <= addr && addr as u64 + t.size() as u64 <= base as u64 + size as u64
         }) {
-            if let Some(name) =
-                objc.diagnostic_scalar_field(mem, base, size, addr, t.size(), classify::encoding(t))
-            {
-                trainer_ui::publish_status(format!(
-                    "FIELD {} [{}]; verify in game",
-                    name,
-                    t.name()
-                ));
+            if let Some(name) = objc.diagnostic_scalar_field(mem, base, size, addr, t.size(), classify::encoding(t)) {
+                trainer_ui::publish_status(format!("FIELD {} [{}]; verify in game", name, t.name()));
             }
         }
     }
 
     fn refresh_watch_value(&self, mem: &Mem) {
         let Some(target @ (addr, vtype)) = trainer_ui::watch_target() else { return; };
-        let found = self
-            .state
-            .results
-            .iter()
-            .any(|r| r.addr == addr && r.vtype == vtype);
+        let found = self.state.results.iter().any(|r| r.addr == addr && r.vtype == vtype);
         let live = mem.live_allocations().iter().any(|&(base, size)| {
             base <= addr && addr as u64 + vtype.size() as u64 <= base as u64 + size as u64
         });
-        trainer_ui::publish_watch_value(
-            target,
-            if found && live {
-                vtype.read_at(mem, addr)
-            } else {
-                None
-            },
-        );
+        trainer_ui::publish_watch_value(target, if found && live { vtype.read_at(mem, addr) } else { None });
     }
 
     /// Explicit address/type from WATCH, never the main editor's selection.
-    fn set_watch_value(
-        &mut self,
-        mem: &mut Mem,
-        addr: u32,
-        vtype: VType,
-        text: &str,
-    ) -> Result<u64, &'static str> {
-        if vtype == VType::Auto
-            || !self
-                .state
-                .results
-                .iter()
-                .any(|r| r.addr == addr && r.vtype == vtype)
-        {
+    fn set_watch_value(&mut self, mem: &mut Mem, addr: u32, vtype: VType, text: &str) -> Result<u64, &'static str> {
+        if vtype == VType::Auto || !self.state.results.iter().any(|r| r.addr == addr && r.vtype == vtype) {
             return Err("RESULT EXPIRED: SEARCH AGAIN");
         }
         let bits = vtype.parse(text).ok_or("BAD VALUE: CHECK TYPE / RANGE")?;
@@ -379,19 +353,14 @@ impl Trainer {
             return Err("ADDRESS NO LONGER LIVE");
         }
         let end = addr as u64 + vtype.size() as u64;
-        if self
-            .state
-            .frozen
-            .iter()
-            .any(|p| (p.addr as u64) < end && (addr as u64) < p.addr as u64 + p.vtype.size() as u64)
-        {
+        if self.state.frozen.iter().any(|p| {
+            (p.addr as u64) < end && (addr as u64) < p.addr as u64 + p.vtype.size() as u64
+        }) {
             return Err("FROZEN RANGE: UNFREEZE FIRST");
         }
         // A changing value is expected here. Validate identity/range, not
         // equality with a historical event's old value.
-        if !vtype.write_at(mem, addr, bits) {
-            return Err("WRITE FAILED");
-        }
+        if !vtype.write_at(mem, addr, bits) { return Err("WRITE FAILED"); }
         self.state.snapshot = None;
         record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
         Ok(bits)
@@ -405,10 +374,8 @@ impl Trainer {
             trainer_ui::publish_bulk_preview(false);
         }
         // A comparison experiment must not include the trainer's own edits.
-        if matches!(
-            &cmd,
-            TrainerCmd::Set { .. } | TrainerCmd::SetAll { .. } | TrainerCmd::Freeze { .. }
-        ) {
+        if matches!(&cmd, TrainerCmd::Set { .. } | TrainerCmd::SetAll { .. }
+            | TrainerCmd::Freeze { .. } | TrainerCmd::ApplyHack { .. }) {
             self.state.snapshot = None;
         }
         match cmd {
@@ -428,9 +395,7 @@ impl Trainer {
                     trainer_ui::publish_status("SEARCH FIRST, THEN MARK".to_string());
                 } else {
                     self.state.snapshot = Some(Snapshot::capture(mem, &self.state.results));
-                    trainer_ui::publish_status(
-                        "MARKED: PLAY, THEN CHANGED / SAME / UP / DOWN".to_string(),
-                    );
+                    trainer_ui::publish_status("MARKED: PLAY, THEN CHANGED / SAME / UP / DOWN".to_string());
                 }
             }
             TrainerCmd::Compare(filter) => {
@@ -443,10 +408,7 @@ impl Trainer {
                 self.state.activity = Activity::default();
                 trainer_ui::clear_activity();
                 trainer_ui::publish_results(&self.state.results, self.state.results.len());
-                trainer_ui::publish_status(format!(
-                    "KEPT {}: BASELINE UPDATED",
-                    self.state.results.len()
-                ));
+                trainer_ui::publish_status(format!("KEPT {}: BASELINE UPDATED", self.state.results.len()));
             }
             TrainerCmd::ClearActivity => {
                 self.state.activity = Activity::default();
@@ -476,12 +438,7 @@ impl Trainer {
                     vtype.name(),
                     results.len()
                 ));
-                log!(
-                    "trainer: search {} {} -> {} hits",
-                    vtype.name(),
-                    text,
-                    results.len()
-                );
+                log!("trainer: search {} {} -> {} hits", vtype.name(), text, results.len());
             }
             TrainerCmd::Refine { vtype, text } => {
                 if !self.state.searched {
@@ -536,59 +493,40 @@ impl Trainer {
                 });
                 log!("trainer: set 0x{:X} = {} ({})", addr, text, t.name());
             }
-            TrainerCmd::SetAll {
-                vtype,
-                text,
-                confirm,
-                safe_mode,
-                filter,
-            } => {
+            TrainerCmd::SetAll { vtype, text, confirm, safe_mode, filter } => {
                 let previous = self.state.pending_bulk.take();
                 trainer_ui::publish_bulk_preview(false);
-                let plan =
-                    match plan_bulk(mem, &self.state.results, vtype, &text, safe_mode, filter) {
-                        Ok(plan) => plan,
-                        Err(reason) => {
-                            trainer_ui::publish_status(reason.to_string());
-                            return;
-                        }
-                    };
+                let plan = match plan_bulk(mem, &self.state.results, vtype, &text, safe_mode, filter) {
+                    Ok(plan) => plan,
+                    Err(reason) => {
+                        trainer_ui::publish_status(reason.to_string());
+                        return;
+                    }
+                };
                 // Re-plan even on confirmation: if anything changed, show
                 // the new counts and require a fresh explicit confirmation.
-                if confirm
-                    && previous.as_ref().is_some_and(|pending| {
-                        pending.created_at.elapsed() < BULK_CONFIRM_TIMEOUT && pending.plan == plan
-                    })
-                {
+                if confirm && previous.as_ref().is_some_and(|pending| {
+                    pending.created_at.elapsed() < BULK_CONFIRM_TIMEOUT
+                        && pending.plan == plan
+                }) {
                     match apply_bulk(mem, &mut self.state.results, &plan) {
                         Ok(written) => {
                             trainer_ui::publish_live_values(&self.state.results);
                             trainer_ui::publish_status(format!(
-                                "WROTE {} SKIPPED {}",
-                                written, plan.skipped,
+                                "WROTE {} SKIPPED {}", written, plan.skipped,
                             ));
-                            log!(
-                                "trainer: bulk wrote {}, skipped {}, safe mode {}",
-                                written,
-                                plan.skipped,
-                                safe_mode
-                            );
+                            log!("trainer: bulk wrote {}, skipped {}, safe mode {}", written, plan.skipped, safe_mode);
                         }
                         Err(reason) => trainer_ui::publish_status(reason.to_string()),
                     }
                 } else {
                     trainer_ui::publish_status(if safe_mode {
-                        format!(
-                            "CHECKED {} SKIP {}: STILL RISKY",
-                            plan.writes.len(),
-                            plan.skipped
-                        )
+                        format!("CHECKED {} SKIP {}: STILL RISKY", plan.writes.len(), plan.skipped)
                     } else {
                         format!("SAFE OFF: {} WRITES / CRASH RISK", plan.writes.len())
                     });
                     self.state.pending_bulk = Some(PendingBulk {
-                        plan,
-                        created_at: Instant::now(),
+                        plan, created_at: Instant::now(),
                     });
                     trainer_ui::publish_bulk_preview(true);
                 }
@@ -611,7 +549,12 @@ impl Trainer {
                 };
                 let vtype = t;
                 /* frozen handled by tick */
-                self.state.frozen.push(Patch { addr, vtype, bits });
+                self.state.frozen.push(Patch {
+                    addr,
+                    vtype,
+                    bits,
+                    freeze: true,
+                });
                 if vtype.write_at(mem, addr, bits) {
                     record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
                     trainer_ui::publish_live_values(&self.state.results);
@@ -641,6 +584,19 @@ impl Trainer {
                 let status = self.save_hack_line(addr, vtype, bits, frozen);
                 trainer_ui::publish_status(status);
             }
+            TrainerCmd::ApplyHack { addr, vtype, bits } => {
+                let ok = vtype.write_at(mem, addr, bits);
+                if ok {
+                    record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
+                }
+                log!(
+                    "trainer: hack {} 0x{:X}={} -> {}",
+                    vtype.name(),
+                    addr,
+                    vtype.format(bits),
+                    ok
+                );
+            }
         }
     }
 
@@ -648,7 +604,7 @@ impl Trainer {
     /// Auto: use the selected result's own type.
     fn resolve_value(
         &self,
-        _mem: &Mem,
+        mem: &Mem,
         vtype: VType,
         text: &str,
         addr: u32,
@@ -747,7 +703,7 @@ impl Trainer {
         watched.push((global_path, global_mtime));
         // Per-app file.
         if let Some(app_id) = current_app.clone() {
-            let app_path = dir.join(format!("{}.txt", safe_app_tag(&app_id)));
+            let app_path = dir.join(format!("{}.txt", app_id));
             if let Ok(text) = std::fs::read_to_string(&app_path) {
                 for (addr, vtype, bits, freeze) in
                     Self::parse_hack_text(&text, Some(&app_id), Some(&app_id))
@@ -755,7 +711,9 @@ impl Trainer {
                     Self::apply_patch(mem, &mut self.state, addr, vtype, bits, freeze);
                 }
             }
-            let app_mtime = std::fs::metadata(&app_path).and_then(|m| m.modified()).ok();
+            let app_mtime = std::fs::metadata(&app_path)
+                .and_then(|m| m.modified())
+                .ok();
             watched.push((app_path, app_mtime));
         }
         self.state.watched_files = watched;
@@ -784,7 +742,12 @@ impl Trainer {
             vtype.format(bits)
         );
         if freeze {
-            state.frozen.push(Patch { addr, vtype, bits });
+            state.frozen.push(Patch {
+                addr,
+                vtype,
+                bits,
+                freeze: true,
+            });
             trainer_ui::publish_frozen(state.frozen.len());
         }
     }
@@ -818,22 +781,14 @@ impl Trainer {
     /// the updated list to the UI, marking rows whose value changed since the
     /// previous refresh. This makes the right address "light up" when the
     /// in-game value changes (e.g. coins are spent).
-    fn refresh_live_values(
-        &mut self,
-        mem: &mut Mem,
-        objc: Option<&crate::objc::ObjC>,
-        seconds: f32,
-    ) {
+    fn refresh_live_values(&mut self, mem: &mut Mem, objc: Option<&crate::objc::ObjC>, seconds: f32) {
         if self.state.results.is_empty() {
             return;
         }
         // Include aliases of frozen values, not only exact start addresses.
-        let frozen: HashSet<_> = self
-            .state
-            .frozen
-            .iter()
-            .flat_map(|p| (0..p.vtype.size()).filter_map(move |offset| p.addr.checked_add(offset)))
-            .collect();
+        let frozen: HashSet<_> = self.state.frozen.iter().flat_map(|p| {
+            (0..p.vtype.size()).filter_map(move |offset| p.addr.checked_add(offset))
+        }).collect();
         self.state.activity.changed_last_sample = 0;
         let now = Instant::now();
         let mut allocations = mem.live_allocations();
@@ -849,10 +804,8 @@ impl Trainer {
                 continue;
             }
             if let Some(current) = r.vtype.read_at(mem, r.addr) {
-                if !frozen.is_empty()
-                    && (0..r.vtype.size())
-                        .filter_map(|offset| r.addr.checked_add(offset))
-                        .any(|addr| frozen.contains(&addr))
+                if !frozen.is_empty() && (0..r.vtype.size()).filter_map(|offset| r.addr.checked_add(offset))
+                    .any(|addr| frozen.contains(&addr))
                 {
                     r.analysis.reset_history();
                 } else {
@@ -860,11 +813,7 @@ impl Trainer {
                         // Bound feed work even if every stored hit is changing.
                         if self.state.activity.changed_last_sample < 256 {
                             self.state.activity.record(Change {
-                                addr: r.addr,
-                                vtype: r.vtype,
-                                before: r.bits,
-                                after: current,
-                                at: now,
+                                addr: r.addr, vtype: r.vtype, before: r.bits, after: current, at: now,
                             });
                         } else {
                             self.state.activity.changed_last_sample += 1;
@@ -879,18 +828,9 @@ impl Trainer {
             }
         }
         self.state.activity_cursor = (self.state.activity_cursor + 67) % len;
-        classify::analyze_batch_with_objects(
-            mem,
-            &mut self.state.results,
-            &mut self.state.analysis_cursor,
-            objc,
-        );
+        classify::analyze_batch_with_objects(mem, &mut self.state.results, &mut self.state.analysis_cursor, objc);
         self.refresh_watch_value(mem);
-        trainer_ui::publish_activity(
-            &self.state.activity.entries,
-            self.state.activity.changed_last_sample,
-            len,
-        );
+        trainer_ui::publish_activity(&self.state.activity.entries, self.state.activity.changed_last_sample, len);
         trainer_ui::publish_live_values(&self.state.results);
     }
 
@@ -904,9 +844,17 @@ impl Trainer {
         if std::fs::create_dir_all(&dir).is_err() {
             return "DUMP FAILED (NO DIR)".to_string();
         }
-        let app_tag = safe_app_tag(self.state.app_id.as_deref().unwrap_or("unknown"));
+        let app_tag = self
+            .state
+            .app_id
+            .as_deref()
+            .unwrap_or("unknown")
+            .replace(['/', '\\', ':'], "_");
         self.dump_counter += 1;
-        let path = dir.join(format!("dump_{}_{}.txt", app_tag, self.dump_counter));
+        let path = dir.join(format!(
+            "dump_{}_{}.txt",
+            app_tag, self.dump_counter
+        ));
         let mut text = String::new();
         let count = results.len().min(MAX_DUMP_LINES);
         for result in &results[..count] {
@@ -923,11 +871,7 @@ impl Trainer {
         match std::fs::write(&path, text) {
             Ok(()) => {
                 log!("trainer: dumped {} results to {:?}", count, path);
-                format!(
-                    "DUMPED {} -> {:?}",
-                    count,
-                    path.file_name().unwrap_or_default()
-                )
+                format!("DUMPED {} -> {:?}", count, path.file_name().unwrap_or_default())
             }
             Err(e) => {
                 log!("trainer: dump failed: {}", e);
@@ -944,7 +888,7 @@ impl Trainer {
         let Some(app_id) = self.state.app_id.clone() else {
             return "NO APP (CANNOT SAVE)".to_string();
         };
-        let path = dir.join(format!("{}.txt", safe_app_tag(&app_id)));
+        let path = dir.join(format!("{}.txt", app_id));
         let line = format!(
             "0x{:X}={} # {}{}",
             addr,
@@ -1023,9 +967,7 @@ fn record_trainer_write(mem: &Mem, results: &mut [SearchResult], addr: u32, size
     let end = addr as u64 + size as u64;
     for r in results {
         if (r.addr as u64) < end && (addr as u64) < r.addr as u64 + r.vtype.size() as u64 {
-            if let Some(bits) = r.vtype.read_at(mem, r.addr) {
-                r.bits = bits;
-            }
+            if let Some(bits) = r.vtype.read_at(mem, r.addr) { r.bits = bits; }
             r.changed = false;
             r.analysis.reset_history();
         }
@@ -1041,35 +983,21 @@ fn search_all(
     previous: Option<&[SearchResult]>,
 ) -> Vec<SearchResult> {
     if let Some(previous) = previous {
-        return previous
-            .iter()
-            .filter_map(|result| {
-                let t = if vtype == VType::Auto {
-                    result.vtype
-                } else {
-                    vtype
-                };
-                let wanted = t.parse(text)?;
-                let bits = t.read_at(mem, result.addr)?;
-                (bits == wanted).then_some(SearchResult {
-                    addr: result.addr,
-                    vtype: t,
-                    bits,
-                    changed: false,
-                    analysis: if t == result.vtype {
-                        result.analysis
-                    } else {
-                        Analysis::default()
-                    },
-                })
+        return previous.iter().filter_map(|result| {
+            let t = if vtype == VType::Auto { result.vtype } else { vtype };
+            let wanted = t.parse(text)?;
+            let bits = t.read_at(mem, result.addr)?;
+            (bits == wanted).then_some(SearchResult {
+                addr: result.addr,
+                vtype: t,
+                bits,
+                changed: false,
+                analysis: if t == result.vtype { result.analysis } else { Analysis::default() },
             })
-            .take(MAX_RESULTS)
-            .collect();
+        }).take(MAX_RESULTS).collect();
     }
     if vtype != VType::Auto {
-        return vtype
-            .parse(text)
-            .map_or_else(Vec::new, |bits| scan_bits(mem, vtype, bits));
+        return vtype.parse(text).map_or_else(Vec::new, |bits| scan_bits(mem, vtype, bits));
     }
 
     let mut results = Vec::new();
@@ -1088,24 +1016,6 @@ fn search_all(
         }
     }
     results
-}
-
-fn safe_app_tag(app_id: &str) -> String {
-    let tag: String = app_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if tag.is_empty() || tag == "." || tag == ".." {
-        "unknown".to_string()
-    } else {
-        tag
-    }
 }
 
 /// Directory for hack/dump files: `<user data>/touchHLE_hacks/`.
@@ -1137,7 +1047,10 @@ fn scan_bits(mem: &Mem, vtype: VType, want_bits: u64) -> Vec<SearchResult> {
         {
             continue;
         }
-        let bytes = match mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr as _), alloc_size) {
+        let bytes = match mem.get_bytes_fallible(
+            ConstVoidPtr::from_bits(addr as _),
+            alloc_size,
+        ) {
             Some(bytes) => bytes,
             None => continue,
         };

@@ -29,33 +29,14 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(super) struct State {
-    texture_framebuffer: Option<(GLuint, GLuint)>,
+    /// (texture, framebuffer, width, height). Keeping the dimensions here is
+    /// important because Android can recreate/resize the SDL surface while the
+    /// compositor state survives; reusing the old-sized texture otherwise
+    /// makes the compositor sample undefined texels (often a black screen).
+    texture_framebuffer: Option<(GLuint, GLuint, u32, u32)>,
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
-    /// Set when the guest renders directly into the default framebuffer (the
-    /// window surface) instead of its own framebuffer objects — detected via
-    /// the "presents with renderbuffer binding 0 / unbacked renderbuffer"
-    /// signature (e.g. Dead Space). The compositor must then never write the
-    /// window surface (it would feed the guest's next readback its own
-    /// previous composite, rotating and shrinking the image every frame), so
-    /// the composite is read out of the texture framebuffer and presented
-    /// through the host pixel path instead.
-    guest_owns_default_framebuffer: bool,
-}
-
-/// Marks the guest as a default-framebuffer renderer (see [State]). Sticky
-/// for the rest of the app run: no guest ever expects the compositor to write
-/// the window surface, so leaving it on is always safe.
-pub fn guest_owns_default_framebuffer(env: &Environment) -> bool {
-    env.framework_state
-        .core_animation
-        .composition
-        .guest_owns_default_framebuffer
-}
-
-pub fn set_guest_owns_default_framebuffer(env: &mut Environment, value: bool) {
-    env.framework_state.core_animation.composition.guest_owns_default_framebuffer = value;
 }
 
 struct MiscGlObjects {
@@ -104,13 +85,21 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Advance any UIImageView frame animations before compositing.
     crate::frameworks::uikit::ui_view::ui_image_view::update_animations(env);
 
-    if !force && find_fullscreen_eagl_layer(env) != nil {
-        // No composition is needed for the normal direct EAGL path. A forced
-        // recomposite is used by native ES1 readback presentation, where the
-        // frame is already in the layer's RAM backing store and must still be
-        // uploaded to the host window.
-        log_dbg!("Using CAEAGLLayer fast path, skipping composition");
-        return None;
+    let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
+    if fullscreen_eagl_layer != nil {
+        let has_presented_pixels = env
+            .objc
+            .borrow::<CALayerHostObject>(fullscreen_eagl_layer)
+            .presented_pixels
+            .is_some();
+        if !force || !has_presented_pixels {
+            // No composition is needed during the normal run-loop tick:
+            // EAGLContext presents the fullscreen drawable directly. A forced
+            // tick only composes this layer when native ES1 readback has stored
+            // a resolved frame in its RAM-backed pixel buffer.
+            log_dbg!("Using CAEAGLLayer fast path, skipping composition");
+            return None;
+        }
     }
 
     if env.options.print_fps {
@@ -119,27 +108,12 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .composition
             .fps_counter
             .get_or_insert_with(FpsCounter::start)
-            .count_frame(format_args!("Core Animation compositor"), false);
+            .count_frame(format_args!("Core Animation compositor"));
     }
 
     let now = Instant::now();
-    let display_rate = env.window().display_refresh_rate().max(1.0);
-    let capped_rate = env.options.effective_fps_limit(display_rate);
-    let pacing_enabled = env.options.frame_pacing_enabled();
-    let interval = if pacing_enabled {
-        1.0 / capped_rate
-    } else {
-        0.0
-    };
-    if !pacing_enabled {
-        env.framework_state
-            .core_animation
-            .composition
-            .recomposite_next = None;
-    }
-    let new_recomposite_next = if !pacing_enabled {
-        None
-    } else if let Some(recomposite_next) = env
+    let interval = 1.0 / 60.0; // 60Hz
+    let new_recomposite_next = if let Some(recomposite_next) = env
         .framework_state
         .core_animation
         .composition
@@ -154,11 +128,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         let overdue_by = now.duration_since(recomposite_next);
         log_dbg!("Recompositing, overdue by {:?}", overdue_by);
         // TODO: Use `.div_duration_f64()` once that is stabilized.
-        let advance_by = if interval <= 0.0 {
-            1.0
-        } else {
-            (overdue_by.as_secs_f64() / interval).max(1.0).ceil()
-        };
+        let advance_by = (overdue_by.as_secs_f64() / interval).max(1.0).ceil();
         assert!(advance_by == (advance_by as u32) as f64);
         let advance_by = advance_by as u32;
         if advance_by > 1 {
@@ -202,13 +172,13 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         let screen: id = msg_class![env; UIScreen mainScreen];
         msg![env; screen bounds]
     };
-    let (fb_width, fb_height) = env.window().framebuffer_size();
-    let software_presentation = env.window().is_software_presentation();
+    let scale_hack: u32 = env.options.scale_hack.get();
+    let ui_scale: u32 = env.options.ui_scale.get();
+    let fb_width = screen_bounds.size.width as u32 * scale_hack * ui_scale;
+    let fb_height = screen_bounds.size.height as u32 * scale_hack * ui_scale;
     let present_frame_args = (
         env.window().viewport(),
-        // Same pipeline as HyperHLE: a single device-orientation quarter-turn
-        // (plus user render rotation/axis reverts) for everything composited.
-        env.window().presentation_matrix(),
+        env.window().rotation_matrix(),
         env.window().virtual_cursor_visible_at(),
     );
 
@@ -218,17 +188,27 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     let cumulative_transform = Matrix::<4>::identity();
     let opacity = 1.0;
 
-    if software_presentation {
-        return new_recomposite_next;
-    }
-
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
-    let mut saved_array_buffer = 0;
-    let mut saved_element_array_buffer = 0;
+    // The compositor shares the GL context with the guest app, but on real
+    // iOS Core Animation composites on its own render queue: the app's GL
+    // state (buffer bindings in particular) is never disturbed. The guest
+    // relies on that — cocos2d-style engines bind a vertex/index VBO once
+    // during initialisation and then pass pointer *offsets* every frame
+    // without re-binding. Saving and restoring the bindings here keeps that
+    // assumption valid, and keeps the guest-visible GLShadowState mirror
+    // (see eagl::GLShadowState) consistent with the driver: leaving both
+    // bindings at 0 (the old behaviour) made the next gl*Pointer(offset)
+    // call be classified as a client pointer while the app meant it as an
+    // offset into its still-bound VBO — sprite geometry then read garbage
+    // and 2D games rendered only their clear colour.
+    let mut saved_array_buffer: GLint = 0;
+    let mut saved_element_array_buffer: GLint = 0;
     unsafe {
         gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut saved_array_buffer);
+        // Swallow errors: some strict drivers reject individual binding
+        // queries, and a wrong "0" only degrades to the old behaviour.
         let _ = gles.GetError();
         gles.GetIntegerv(
             gles11::ELEMENT_ARRAY_BUFFER_BINDING,
@@ -240,14 +220,46 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
     // rotating the screen and drawing the virtual cursor.
-    let texture = if let Some((texture, framebuffer)) = env
+    let cached_texture_framebuffer = env
         .framework_state
         .core_animation
         .composition
-        .texture_framebuffer
+        .texture_framebuffer;
+    let cached_target_was_resized = cached_texture_framebuffer
+        .map(|(_, _, old_width, old_height)| (old_width, old_height) != (fb_width, fb_height))
+        .unwrap_or(false);
+    let texture = if let Some((texture, framebuffer, old_width, old_height)) =
+        cached_texture_framebuffer
     {
         unsafe {
             gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+            if (old_width, old_height) != (fb_width, fb_height) {
+                // Reallocate the compositor target when the Android surface or
+                // scale changes. Sampling an old-sized texture is undefined on
+                // strict native GLES1 drivers and commonly presents as black.
+                gles.BindTexture(gles11::TEXTURE_2D, texture);
+                gles.TexImage2D(
+                    gles11::TEXTURE_2D,
+                    0,
+                    gles11::RGBA as _,
+                    fb_width as _,
+                    fb_height as _,
+                    0,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_S,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_T,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+            }
         };
         texture
     } else {
@@ -277,6 +289,19 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 gles11::TEXTURE_MAG_FILTER,
                 gles11::LINEAR as _,
             );
+            // This texture is the compositor's final frame. It is frequently
+            // NPOT on phones, and GL_REPEAT makes strict GLES1 drivers mark it
+            // incomplete and sample black.
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_S,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_T,
+                gles11::CLAMP_TO_EDGE as _,
+            );
 
             gles.GenFramebuffersOES(1, &mut framebuffer);
             gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
@@ -291,14 +316,30 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             // ХАК: Убраны вызовы assert_eq!, которые убивали приложение
             // при ошибках GL (типа GL_OUT_OF_MEMORY = 1285)
             let _ = gles.GetError(); // Просто сбрасываем флаг текущей ошибки, чтобы он не висел
-            let _ = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES); // Проверяем, но не крашимся
+            let status = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES);
+            if status != gles11::FRAMEBUFFER_COMPLETE_OES {
+                log!(
+                    "Warning: Core Animation compositor framebuffer is incomplete: {status:#x} ({fb_width}x{fb_height})"
+                );
+            }
         }
         env.framework_state
             .core_animation
             .composition
-            .texture_framebuffer = Some((texture, framebuffer));
+            .texture_framebuffer = Some((texture, framebuffer, fb_width, fb_height));
         texture
     };
+    if cached_target_was_resized {
+        env.framework_state
+            .core_animation
+            .composition
+            .texture_framebuffer = Some((
+                texture,
+                cached_texture_framebuffer.unwrap().1,
+                fb_width,
+                fb_height,
+            ));
+    }
 
     // Set up various other GL objects that will be reused on every frame.
     let misc_gl_objects = env
@@ -324,7 +365,12 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                     gles11::GENERATE_MIPMAP,
                     gles11::TRUE as _,
                 );
-                upload_rgba8_pixels(gles.as_mut(), image.pixels(), (dimension as _, dimension as _));
+                upload_rgba8_pixels(
+                    gles.as_mut(),
+                    image.pixels(),
+                    (dimension as _, dimension as _),
+                    None,
+                );
                 gles.TexParameteri(
                     gles11::TEXTURE_2D,
                     gles11::TEXTURE_MIN_FILTER,
@@ -383,6 +429,17 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Clear the framebuffer and set up state to prepare for rendering
     unsafe {
         gles.Viewport(0, 0, fb_width as _, fb_height as _);
+        // The compositor owns this internal context, but its state persists
+        // across frames. Reset the tests/masks that can make every fragment
+        // fail or every color channel unwritable after a previous layer or
+        // presentation pass. Native Adreno GLES1 is particularly strict here.
+        gles.Disable(gles11::DEPTH_TEST);
+        gles.Disable(gles11::STENCIL_TEST);
+        gles.Disable(gles11::SCISSOR_TEST);
+        gles.Disable(gles11::CULL_FACE);
+        gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+        gles.DepthMask(gles11::TRUE);
+        gles.StencilMask(!0);
         gles.ClearColor(0.0, 0.0, 0.0, 1.0);
         gles.Clear(gles11::COLOR_BUFFER_BIT);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
@@ -470,7 +527,6 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     }
 
     // Re-borrow
-    let frame_generation = env.window().is_frame_generation_enabled();
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
@@ -493,82 +549,26 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     // Present our rendered frame (bound to TEXTURE_2D). This copies it to the
     // default framebuffer (0) so we need to unbind our internal framebuffer.
-    let guest_owns_default_fb = env
-        .framework_state
-        .core_animation
-        .composition
-        .guest_owns_default_framebuffer;
     unsafe {
         gles.BindTexture(gles11::TEXTURE_2D, texture);
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+        present_frame(
+            gles.as_mut(),
+            present_frame_args.0,
+            present_frame_args.1,
+            present_frame_args.2,
+        );
+        // Hand the context back to the guest with the buffer bindings it
+        // left behind (see the save at the top of this function).
         gles.BindBuffer(gles11::ARRAY_BUFFER, saved_array_buffer as _);
         gles.BindBuffer(
             gles11::ELEMENT_ARRAY_BUFFER,
             saved_element_array_buffer as _,
         );
+        let _ = gles.GetError();
     }
-    if guest_owns_default_fb {
-        // The guest renders straight into the default framebuffer (the window
-        // surface), so writing our composite there would poison the guest's
-        // next readback with the previous composite — every cycle would add
-        // another quarter-turn and another scale-down (seen as an endlessly
-        // rotating, shrinking image in Dead Space). Instead, read the
-        // composite out of the texture framebuffer and hand it to the host
-        // pixel presentation path, which never touches the window surface.
-        // This also covers frame generation, whose interpolation lives
-        // inside `present_native_frame`.
-        let mut pixels = vec![0u8; fb_width as usize * fb_height as usize * 4];
-        unsafe {
-            gles.Finish();
-            gles.ReadPixels(
-                0,
-                0,
-                fb_width as _,
-                fb_height as _,
-                gles11::RGBA,
-                gles11::UNSIGNED_BYTE,
-                pixels.as_mut_ptr().cast(),
-            );
-            // Hand the default framebuffer back to the guest exactly as it
-            // had it (it presents with framebuffer 0 bound).
-            gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
-            let _ = gles.GetError();
-        }
-        std::mem::drop(gles);
-        window.present_native_frame(pixels, fb_width, fb_height, true);
-    } else {
-        unsafe {
-            gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
-            present_frame(
-                gles.as_mut(),
-                present_frame_args.0,
-                present_frame_args.1,
-                present_frame_args.2,
-            );
-            let _ = gles.GetError();
-        }
-        if frame_generation {
-            unsafe {
-                gles.Finish();
-            }
-            let mut pixels = vec![0u8; fb_width as usize * fb_height as usize * 4];
-            unsafe {
-                gles.ReadPixels(
-                    0,
-                    0,
-                    fb_width as _,
-                    fb_height as _,
-                    gles11::RGBA,
-                    gles11::UNSIGNED_BYTE,
-                    pixels.as_mut_ptr().cast(),
-                );
-            }
-            std::mem::drop(gles);
-            window.present_native_frame(pixels, fb_width, fb_height, true);
-        } else {
-            std::mem::drop(gles);
-            window.swap_window();
-        }
-    }
+    std::mem::drop(gles);
+    window.swap_window();
 
     animation_state.update_started_and_finished_animations(env);
 
@@ -615,7 +615,25 @@ unsafe fn composite_layer_recursive(
 
     // This is both acting as the presentationLayer and the private render layer
     // It might need to be reworked in the future into a guest presentationLayer
-    let host_obj = animation_state.create_presentation_layer(env, layer);
+    //
+    // PERF: the presentation layer is a clone of the layer's host object.
+    // For a CAEAGLLayer presented through the compositor that would clone a
+    // full frame of pixels (hundreds of KB to several MB) every time it is
+    // composited, so take the pixels out for the duration of the clone and
+    // leave only a placeholder (with the real dimensions) in the copy — the
+    // upload below reads the pixels from the original layer anyway.
+    let presented_pixels = env
+        .objc
+        .borrow_mut::<CALayerHostObject>(layer)
+        .presented_pixels
+        .take();
+    let mut host_obj = animation_state.create_presentation_layer(env, layer);
+    if let Some((pixels, width, height)) = presented_pixels {
+        host_obj.presented_pixels = Some((Vec::new(), width, height));
+        env.objc
+            .borrow_mut::<CALayerHostObject>(layer)
+            .presented_pixels = Some((pixels, width, height));
+    }
 
     if host_obj.hidden {
         return;
@@ -742,7 +760,7 @@ unsafe fn composite_layer_recursive(
             gles.GenTextures(1, &mut t);
             gles.BindTexture(gles11::TEXTURE_2D, t);
             let pixels = image.pixels();
-            upload_rgba8_pixels(gles.as_mut(), pixels, (img_w, img_h));
+            upload_rgba8_pixels(gles.as_mut(), pixels, (img_w, img_h), None);
             gles.TexParameteri(
                 gles11::TEXTURE_2D,
                 gles11::TEXTURE_WRAP_S,
@@ -826,6 +844,10 @@ unsafe fn composite_layer_recursive(
         }
     }
 
+    // Dimensions of the texture storage that already exists (if any), so the
+    // uploads below can update it in place.
+    let mut texture_size = host_obj.gles_texture_size;
+
     // Update original layer texture with CAEAGLLayer pixels (slow path), if any
     if need_update {
         let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
@@ -841,7 +863,12 @@ unsafe fn composite_layer_recursive(
                 }
             }
 
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                pixels,
+                (width, height),
+                texture_size,
+            ));
         }
     }
 
@@ -852,22 +879,32 @@ unsafe fn composite_layer_recursive(
 
             // No special handling for opacity is needed here: the alpha channel
             // on an image is meaningful and won't be ignored.
-            upload_rgba8_pixels(gles.as_mut(), image.pixels(), image.dimensions());
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                image.pixels(),
+                image.dimensions(),
+                texture_size,
+            ));
         } else if let Some(cg_context) = host_obj.cg_context {
             // Make sure this is in sync with the code in ca_layer.rs that
             // sets up the context!
             let (width, height, data) = cg_bitmap_context::get_data(&env.objc, cg_context);
             let size = width * height * 4;
             let pixels = env.mem.bytes_at(data.cast(), size);
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                pixels,
+                (width, height),
+                texture_size,
+            ));
         }
     }
 
     if need_update {
-        // Update original layer field
-        env.objc
-            .borrow_mut::<CALayerHostObject>(layer)
-            .gles_texture_is_up_to_date = true;
+        // Update original layer fields
+        let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+        original_host_obj.gles_texture_is_up_to_date = true;
+        original_host_obj.gles_texture_size = texture_size;
     }
 
     // Draw texture, if any
@@ -1000,7 +1037,37 @@ unsafe fn upload_slice<T: SafeWrite>(
     )
 }
 
-unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u32, u32)) {
+/// Upload RGBA8 `pixels` to the texture bound to `GL_TEXTURE_2D`.
+///
+/// `current_size` is the size of the storage the texture already has (if it
+/// was uploaded to before); when it matches, the contents are replaced in
+/// place with `glTexSubImage2D`, which lets the driver update the existing
+/// allocation instead of orphaning it and allocating a new one on every
+/// change (a measurable per-frame cost for layers that update continuously,
+/// e.g. a CAEAGLLayer presented through the compositor). Returns the size of
+/// the texture storage afterwards.
+unsafe fn upload_rgba8_pixels(
+    gles: &mut dyn GLES,
+    pixels: &[u8],
+    dimensions: (u32, u32),
+    current_size: Option<(u32, u32)>,
+) -> (u32, u32) {
+    if current_size == Some(dimensions) {
+        gles.TexSubImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            0,
+            0,
+            dimensions.0 as _,
+            dimensions.1 as _,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            pixels.as_ptr() as *const _,
+        );
+        // The parameters below were already applied when the storage was
+        // first created.
+        return dimensions;
+    }
     gles.TexImage2D(
         gles11::TEXTURE_2D,
         0,
@@ -1039,4 +1106,5 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
         gles11::TEXTURE_WRAP_T,
         gles11::CLAMP_TO_EDGE as _,
     );
+    dimensions
 }

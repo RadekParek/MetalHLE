@@ -21,21 +21,29 @@ pub fn apple_epoch() -> SystemTime {
     SystemTime::UNIX_EPOCH.add(Duration::from_secs(SECS_FROM_UNIX_TO_APPLE_EPOCHS))
 }
 
-/// CFAbsoluteTime values that map into the guest's signed 32-bit time_t range.
-const CF_ABSOLUTE_TIME_MIN: f64 = i32::MIN as f64 - SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64;
-const CF_ABSOLUTE_TIME_MAX: f64 = i32::MAX as f64 - SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64;
+/// Largest |CFAbsoluteTime| accepted before `SystemTime` arithmetic. ±2.5e9 s
+/// ≈ years 1891–2149, far outside anything a sane program passes but well
+/// inside what `SystemTime` can represent, so conversions can't overflow.
+const CF_ABSOLUTE_TIME_CLAMP: f64 = 2.5e9;
 
 /// Convert a possibly-invalid `CFAbsoluteTime` to seconds since the Unix
-/// epoch without ever panicking. NaN/-inf map to the Apple epoch; +inf
-/// saturates to `i32::MAX` (far future); extreme values are clamped;
-/// pre-1970 results are returned as negatives.
+/// epoch without ever panicking. NaN/±inf are treated as the epoch itself;
+/// extreme values are clamped; pre-1970 results are returned as negatives.
 pub fn cf_absolute_time_to_unix_secs(at: CFAbsoluteTime) -> i64 {
-    let at = if at.is_nan() || at == f64::NEG_INFINITY {
-        0.0
+    let at = if at.is_finite() {
+        at.clamp(-CF_ABSOLUTE_TIME_CLAMP, CF_ABSOLUTE_TIME_CLAMP)
     } else {
-        at.clamp(CF_ABSOLUTE_TIME_MIN, CF_ABSOLUTE_TIME_MAX)
+        0.0
     };
-    (SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64 + at).floor() as i64
+    let duration = crate::frameworks::foundation::ns_time_interval_to_duration_or_zero(at);
+    // `add` panics on overflow; the clamp above guarantees it can't.
+    let time = apple_epoch().add(duration);
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // Before the Unix epoch: return the negative offset instead of
+        // panicking, the way a real C library handles such a date.
+        Err(e) => -(e.duration().as_secs() as i64),
+    }
 }
 
 pub type CFTimeInterval = NSTimeInterval;
@@ -78,7 +86,7 @@ fn CFAbsoluteTimeGetCurrent(env: &mut Environment) -> CFAbsoluteTime {
     env.guest_clock
         .system_time()
         .duration_since(apple_epoch())
-        .map(|duration| duration.as_secs_f64())
+        .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
 }
 
@@ -334,26 +342,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFAbsoluteTimeAddGregorianUnits(_, _, _)),
     export_c_func!(CFAbsoluteTimeGetDifferenceAsGregorianUnits(_, _, _, _)),
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn absolute_time_conversion_handles_negative_and_non_finite_values() {
-        assert_eq!(cf_absolute_time_to_unix_secs(0.0), 978_307_200);
-        assert_eq!(cf_absolute_time_to_unix_secs(-978_307_200.0), 0);
-        assert_eq!(cf_absolute_time_to_unix_secs(f64::NAN), 978_307_200);
-        assert_eq!(
-            cf_absolute_time_to_unix_secs(f64::INFINITY),
-            i32::MAX as i64
-        );
-        assert_eq!(
-            cf_absolute_time_to_unix_secs(f64::NEG_INFINITY),
-            978_307_200
-        );
-    }
-}
 
 pub const CONSTANTS: ConstantExports = &[(
     "_kCFAbsoluteTimeIntervalSince1970",

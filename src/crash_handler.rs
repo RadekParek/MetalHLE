@@ -79,11 +79,7 @@ pub fn append_to_log(msg: &str) {
 /// where a panic unwinding out of a guest-thread coroutine ends in
 /// SIGABRT — see the FATAL SIGNAL marker in the log).
 pub fn install_panic_hook() {
-    // Chain the previously-installed hook (if any) instead of replacing it:
-    // on Android, SDL_main installs a richer hook that writes a crash banner
-    // to the on-disk log; it must keep running.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    std::panic::set_hook(Box::new(|info| {
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
         let msg = format!(
@@ -99,7 +95,6 @@ pub fn install_panic_hook() {
                 .unwrap_or_else(|| "unknown panic payload".to_string()),
         );
         append_to_log(&msg);
-        prev_hook(info);
     }));
 }
 
@@ -174,7 +169,7 @@ mod imp {
         unsafe { libc::close(fd) };
         let text = String::from_utf8_lossy(&buf[..off]).into_owned();
         let mut out = String::from("relevant /proc/self/maps entries:\n");
-        // Track the lowest mapping of libmetalhle.so together with its file
+        // Track the lowest mapping of libtouchHLE.so together with its file
         // offset, so native backtrace frames can be converted to ELF file
         // addresses for offline symbolization:
         //   file_vaddr = frame_addr - load_base, load_base = map_start - map_offset
@@ -193,7 +188,7 @@ mod imp {
                 ) else {
                     continue;
                 };
-                if line.contains("libmetalhle.so") && touchhle_load_base.is_none() {
+                if line.contains("libtouchHLE.so") && touchhle_load_base.is_none() {
                     // Offset is the third field.
                     let offset = line
                         .split_whitespace()
@@ -347,24 +342,11 @@ mod imp {
     }
 
     /// Install the diagnostic handlers for the fatal native signals.
-    ///
-    /// ANDROID: only SIGABRT is hooked. ART owns SIGSEGV/SIGBUS/SIGILL on
-    /// Android (null checks, stack overflow, JNI fatal errors), and JIT-host
-    /// interop means a host fault handler here can convert handled faults
-    /// into fatal ones — this handler landed in the same commit as
-    /// GLES2-game SIGSEGV regressions. Desktop gets the full set.
     pub fn install() {
         resolve_backtrace();
         let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
         act.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
         act.sa_sigaction = handler as usize;
-        #[cfg(target_os = "android")]
-        {
-            unsafe {
-                libc::sigaction(libc::SIGABRT, &act, std::ptr::null_mut());
-            }
-        }
-        #[cfg(not(target_os = "android"))]
         for &sig in &[libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGABRT] {
             unsafe {
                 libc::sigaction(sig, &act, std::ptr::null_mut());

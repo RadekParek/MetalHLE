@@ -8,38 +8,6 @@
 use super::gles11_raw as gles11; // constants only
 use super::gles11_raw::types::{GLenum, GLfixed, GLfloat, GLint, GLsizei};
 use super::GLES;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
-
-/// Return `(is_2bit, is_opaque)` for a PVRTC v1 internal format.
-pub fn pvrtc_format_properties(internalformat: GLenum) -> Option<(bool, bool)> {
-    match internalformat {
-        gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG => Some((true, true)),
-        gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG => Some((true, false)),
-        gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG => Some((false, true)),
-        gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG => Some((false, false)),
-        _ => None,
-    }
-}
-
-/// Compute the compressed byte size for a PVRTC v1 level without overflowing.
-pub fn pvrtc_payload_size(
-    internalformat: GLenum,
-    width: GLsizei,
-    height: GLsizei,
-) -> Option<usize> {
-    let (is_2bit, _) = pvrtc_format_properties(internalformat)?;
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
-    width
-        .max(if is_2bit { 16 } else { 8 })
-        .checked_mul(height.max(8))?
-        .checked_mul(if is_2bit { 2 } else { 4 })?
-        .checked_add(7)
-        .map(|bits| bits / 8)
-}
 
 #[cfg(test)]
 mod pvrtc_payload_size_tests {
@@ -78,6 +46,34 @@ mod pvrtc_payload_size_tests {
             None
         );
     }
+}
+
+/// Return `(is_2bit, is_opaque)` for a PVRTC v1 internal format.
+pub fn pvrtc_format_properties(internalformat: GLenum) -> Option<(bool, bool)> {
+    match internalformat {
+        gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG => Some((true, true)),
+        gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG => Some((true, false)),
+        gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG => Some((false, true)),
+        gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG => Some((false, false)),
+        _ => None,
+    }
+}
+
+/// Compute the compressed byte size for a PVRTC v1 level without overflowing.
+pub fn pvrtc_payload_size(
+    internalformat: GLenum,
+    width: GLsizei,
+    height: GLsizei,
+) -> Option<usize> {
+    let (is_2bit, _) = pvrtc_format_properties(internalformat)?;
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    width
+        .max(if is_2bit { 16 } else { 8 })
+        .checked_mul(height.max(8))?
+        .checked_mul(if is_2bit { 2 } else { 4 })?
+        .checked_add(7)
+        .map(|bits| bits / 8)
 }
 
 /// Convert a fixed-point scalar to a floating-point scalar.
@@ -122,6 +118,13 @@ pub enum ParamType {
     Float,
     /// `GLint`
     Int,
+    /// Normalized floating-point color components (RGBA in [0, 1]).
+    ///
+    /// Per the GLES 1.1 spec (Table 6.1, type "C"), color state is clamped
+    /// to [0, 1] on set; when queried with an integer getter the components
+    /// are scaled to the full integer range (see [ParamTable::get_type_info]
+    /// users), unlike plain `Float` state which is rounded to nearest.
+    Color,
     /// Placeholder type for things like colors which are floating-point
     /// but don't have the usual conversion behavior to/from integers etc.
     /// [ParamTable] will accept it for floating-point inputs only.
@@ -196,7 +199,9 @@ impl ParamTable {
         // On the other hand, fixed-to-float/float-to-fixed conversion is always
         // the same even for the weird float-ish values.
         match type_ {
-            ParamType::Float | ParamType::FloatSpecial => setf(fixed_to_float(param)),
+            ParamType::Float | ParamType::Color | ParamType::FloatSpecial => {
+                setf(fixed_to_float(param))
+            }
             _ => seti(param),
         }
     }
@@ -221,7 +226,7 @@ impl ParamTable {
         match type_ {
             // Fixed-to-float/float-to-fixed conversion is always the same even
             // for the weird float-ish values.
-            ParamType::Float | ParamType::FloatSpecial => {
+            ParamType::Float | ParamType::Color | ParamType::FloatSpecial => {
                 let mut params_float = [0.0; 16]; // probably the max?
                 let params_float = &mut params_float[..usize::from(count)];
                 for (i, param_float) in params_float.iter_mut().enumerate() {
@@ -254,69 +259,6 @@ impl ParamTable {
 /// return `true` *without* uploading anything, so the caller doesn't
 /// re-attempt (the data is unusable either way) and the rest of the frame
 /// can still draw.
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
-struct PvrtcCacheKey {
-    digest: u64,
-    width: u32,
-    height: u32,
-    is_2bit: bool,
-    is_opaque: bool,
-}
-
-static PVRTC_CACHE: OnceLock<Mutex<HashMap<PvrtcCacheKey, Vec<u32>>>> = OnceLock::new();
-
-fn cached_pvrtc_pixels(
-    data: &[u8],
-    is_2bit: bool,
-    width: u32,
-    height: u32,
-    is_opaque: bool,
-) -> Option<Vec<u32>> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut hasher);
-    let key = PvrtcCacheKey {
-        digest: hasher.finish(),
-        width,
-        height,
-        is_2bit,
-        is_opaque,
-    };
-    let cache = PVRTC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(pixels) = cache.lock().unwrap().get(&key) {
-        return Some(pixels.clone());
-    }
-
-    let pixels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::image::decode_pvrtc_with_alpha(data, is_2bit, width, height, is_opaque)
-    }))
-    .ok()?;
-    let mut cache = cache.lock().unwrap();
-    const MAX_ENTRIES: usize = 64;
-    const MAX_BYTES: usize = 16 * 1024 * 1024;
-    let pixel_bytes = pixels.len().saturating_mul(std::mem::size_of::<u32>());
-    if pixel_bytes <= MAX_BYTES {
-        let mut cached_bytes: usize = cache
-            .values()
-            .map(|value| value.len().saturating_mul(std::mem::size_of::<u32>()))
-            .sum();
-        while !cache.is_empty()
-            && (cache.len() >= MAX_ENTRIES
-                || cached_bytes.saturating_add(pixel_bytes) > MAX_BYTES)
-        {
-            let Some(evicted) = cache.keys().next().copied() else {
-                break;
-            };
-            if let Some(value) = cache.remove(&evicted) {
-                cached_bytes = cached_bytes.saturating_sub(
-                    value.len().saturating_mul(std::mem::size_of::<u32>()),
-                );
-            }
-        }
-        cache.insert(key, pixels.clone());
-    }
-    Some(pixels)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn try_decode_pvrtc(
     gles: &mut dyn GLES,
@@ -328,7 +270,6 @@ pub fn try_decode_pvrtc(
     border: GLint,
     pvrtc_data: &[u8],
 ) -> bool {
-    let mut pvrtc_data: Cow<'_, [u8]> = Cow::Borrowed(pvrtc_data);
     let Some((is_2bit, is_opaque)) = pvrtc_format_properties(internalformat) else {
         return false;
     };
@@ -371,162 +312,36 @@ pub fn try_decode_pvrtc(
         return true;
     };
     if pvrtc_data.len() != expected_size {
-        // Games sometimes upload padded or slightly truncated PVRTC payloads
-        // (off-by-one mip math, trailing-zero padding). Skipping the upload
-        // leaves a permanently black texture. Instead, pad or trim to the
-        // spec size and decode anyway — matching what the driver would have
-        // read from memory.
         log!(
             "Warning: try_decode_pvrtc: PVRTC payload size mismatch for \
              {width}x{height} (level {level}, format {internalformat:#x}, \
              is_2bit={is_2bit}): got {} bytes, expected {expected_size}; \
-             padding/trimming and decoding anyway.",
+             skipping upload.",
             pvrtc_data.len(),
         );
-        let mut padded: Vec<u8> = pvrtc_data.to_vec();
-        padded.resize(expected_size, 0);
-        pvrtc_data = Cow::Owned(padded);
+        return true;
     }
 
     let upload_format = gles11::RGBA;
-    let Some(pixels) = cached_pvrtc_pixels(
-        pvrtc_data.as_ref(),
+
+    let pixels = crate::image::decode_pvrtc_with_alpha(
+        pvrtc_data,
         is_2bit,
         width_u,
         height_u,
         is_opaque,
-    ) else {
-        log_once_fmt!(
-            "Warning: PVRTC decoder rejected malformed texture data; upload skipped and repeated failures are suppressed"
-        );
-        return true;
-    };
-    let (upload_pixels, upload_width, upload_height) =
-        upscale_rgba8_words(&pixels, width_u, height_u, crate::gles::texture_upscaler())
-            .map_or((pixels, width_u, height_u), |value| value);
+    );
     unsafe {
         gles.TexImage2D(
             target,
             level,
             upload_format as _,
-            upload_width as GLsizei,
-            upload_height as GLsizei,
+            width,
+            height,
             border,
             upload_format,
             gles11::UNSIGNED_BYTE,
-            upload_pixels.as_ptr() as *const _,
-        )
-    };
-    true
-}
-
-/// Software-decode a PVRTC sub-image upload (`glCompressedTexSubImage2D`) and
-/// upload it as plain RGBA via `glTexSubImage2D`.
-///
-/// Games that stream compressed textures (BioShock's level loader updates
-/// PVRTC mips in place) hit this path constantly: without it, every update
-/// fails with `GL_INVALID_VALUE`/`GL_INVALID_ENUM` on host drivers that lack
-/// `GL_IMG_texture_compression_pvrtc`, and the streamed-in textures never
-/// appear. Per the GL spec the sub-image payload is the block data for the
-/// sub-rectangle in the format's native (Morton) order, so it can be decoded
-/// exactly like a standalone (width x height) image.
-///
-/// Returns true when the payload was handled (decoded or recognised-but-
-/// skipped); false when the format is not PVRTC and the caller should pass
-/// the call through to the host driver.
-#[allow(clippy::too_many_arguments)]
-pub fn try_decode_pvrtc_sub(
-    gles: &mut dyn GLES,
-    target: GLenum,
-    level: GLint,
-    xoffset: GLint,
-    yoffset: GLint,
-    width: GLsizei,
-    height: GLsizei,
-    internalformat: GLenum,
-    pvrtc_data: &[u8],
-) -> bool {
-    let mut pvrtc_data: Cow<'_, [u8]> = Cow::Borrowed(pvrtc_data);
-    let Some((is_2bit, is_opaque)) = pvrtc_format_properties(internalformat) else {
-        return false;
-    };
-
-    let Ok(width_u) = u32::try_from(width) else {
-        log!(
-            "Warning: try_decode_pvrtc_sub: invalid width {width} for PVRTC sub-upload \
-             (level {level}, format {internalformat:#x}); skipping upload."
-        );
-        return true;
-    };
-    let Ok(height_u) = u32::try_from(height) else {
-        log!(
-            "Warning: try_decode_pvrtc_sub: invalid height {height} for PVRTC sub-upload \
-             (level {level}, format {internalformat:#x}); skipping upload."
-        );
-        return true;
-    };
-
-    let Some(expected_size) = pvrtc_payload_size(internalformat, width, height) else {
-        log!(
-            "Warning: try_decode_pvrtc_sub: payload size overflows for \
-             {width}x{height} (level {level}, format {internalformat:#x}); skipping upload."
-        );
-        return true;
-    };
-    if pvrtc_data.len() != expected_size {
-        log_once_fmt!(
-            "Warning: try_decode_pvrtc_sub: PVRTC sub-image payload size mismatch \
-             ({width}x{height}, level {level}, format {internalformat:#x}): got {} bytes, \
-             expected {expected_size}; padding/trimming and decoding anyway (repeats suppressed).",
-            pvrtc_data.len(),
-        );
-        let mut padded: Vec<u8> = pvrtc_data.to_vec();
-        padded.resize(expected_size, 0);
-        pvrtc_data = Cow::Owned(padded);
-    }
-
-    let Some(pixels) = cached_pvrtc_pixels(
-        pvrtc_data.as_ref(),
-        is_2bit,
-        width_u,
-        height_u,
-        is_opaque,
-    ) else {
-        log_once_fmt!(
-            "Warning: PVRTC decoder rejected malformed sub-image data; upload skipped \
-             and repeated failures are suppressed"
-        );
-        return true;
-    };
-    let (upload_pixels, upload_width, upload_height) =
-        upscale_rgba8_words(&pixels, width_u, height_u, crate::gles::texture_upscaler())
-            .map_or((pixels, width_u, height_u), |value| value);
-    // When the scale hack upscaled the decoded pixels, the sub-image offset
-    // must be scaled by the same factor or the update lands in the wrong
-    // region of the (already upscaled) uncompressed texture.
-    let x_scale = if width_u != 0 {
-        upload_width / width_u
-    } else {
-        1
-    };
-    let y_scale = if height_u != 0 {
-        upload_height / height_u
-    } else {
-        1
-    };
-    let upload_xoffset = xoffset * x_scale as i32;
-    let upload_yoffset = yoffset * y_scale as i32;
-    unsafe {
-        gles.TexSubImage2D(
-            target,
-            level,
-            upload_xoffset,
-            upload_yoffset,
-            upload_width as GLsizei,
-            upload_height as GLsizei,
-            gles11::RGBA,
-            gles11::UNSIGNED_BYTE,
-            upload_pixels.as_ptr() as *const _,
+            pixels.as_ptr() as *const _,
         )
     };
     true
@@ -558,10 +373,7 @@ pub unsafe fn decode_texture_to_rgba8(
         },
         gles11::UNSIGNED_SHORT_5_6_5
         | gles11::UNSIGNED_SHORT_4_4_4_4
-        | gles11::UNSIGNED_SHORT_5_5_5_1
-        | 0x8365
-        | 0x8366 => 2,
-        0x8367 => 4,
+        | gles11::UNSIGNED_SHORT_5_5_5_1 => 2,
         _ => return None,
     };
     let alignment = unpack_alignment.max(1) as usize;
@@ -602,9 +414,7 @@ pub unsafe fn decode_texture_to_rgba8(
                 },
                 gles11::UNSIGNED_SHORT_5_6_5
                 | gles11::UNSIGNED_SHORT_4_4_4_4
-                | gles11::UNSIGNED_SHORT_5_5_5_1
-                | 0x8365
-                | 0x8366 => {
+                | gles11::UNSIGNED_SHORT_5_5_5_1 => {
                     let value = (src as *const u16).read_unaligned();
                     match type_ {
                         gles11::UNSIGNED_SHORT_5_6_5 => (
@@ -619,18 +429,6 @@ pub unsafe fn decode_texture_to_rgba8(
                             ((((value >> 4) & 0xf) as u8) * 17),
                             (((value & 0xf) as u8) * 17),
                         ),
-                        0x8365 => (
-                            (((value & 0xf) as u8) * 17),
-                            ((((value >> 4) & 0xf) as u8) * 17),
-                            ((((value >> 8) & 0xf) as u8) * 17),
-                            ((((value >> 12) & 0xf) as u8) * 17),
-                        ),
-                        0x8366 => (
-                            ((value & 0x1f) as u32 * 255 / 31) as u8,
-                            (((value >> 5) & 0x1f) as u32 * 255 / 31) as u8,
-                            (((value >> 10) & 0x1f) as u32 * 255 / 31) as u8,
-                            if value & 0x8000 == 0 { 0 } else { 255 },
-                        ),
                         _ => (
                             ((((value >> 11) & 0x1f) as u32 * 255 / 31) as u8),
                             ((((value >> 6) & 0x1f) as u32 * 255 / 31) as u8),
@@ -639,122 +437,12 @@ pub unsafe fn decode_texture_to_rgba8(
                         ),
                     }
                 }
-                0x8367 => {
-                    let value = (src as *const u32).read_unaligned();
-                    (
-                        (value & 0xff) as u8,
-                        ((value >> 8) & 0xff) as u8,
-                        ((value >> 16) & 0xff) as u8,
-                        ((value >> 24) & 0xff) as u8,
-                    )
-                }
                 _ => return None,
             };
             std::slice::from_raw_parts_mut(dst, 4).copy_from_slice(&[r, g, b, a]);
         }
     }
     Some(output)
-}
-
-/// Nearest-neighbour upscale for decoded RGBA8 byte pixels.
-pub fn upscale_rgba8(
-    pixels: &[u8],
-    width: u32,
-    height: u32,
-    scale: u8,
-) -> Option<(Vec<u8>, u32, u32)> {
-    if scale <= 1 || width == 0 || height == 0 {
-        return None;
-    }
-    let maximum_scale = match crate::gles::memory_management() {
-        0 => 2,
-        1 => 3,
-        _ => 4,
-    };
-    let scale = u32::from(scale.min(maximum_scale));
-    if scale <= 1 {
-        return None;
-    }
-    let output_width = width.checked_mul(scale)?;
-    let output_height = height.checked_mul(scale)?;
-    let source_width = usize::try_from(width).ok()?;
-    let source_height = usize::try_from(height).ok()?;
-    let output_width_usize = usize::try_from(output_width).ok()?;
-    let output_height_usize = usize::try_from(output_height).ok()?;
-    let source_len = source_width.checked_mul(source_height)?.checked_mul(4)?;
-    if pixels.len() < source_len {
-        return None;
-    }
-    let output_len = output_width_usize
-        .checked_mul(output_height_usize)?
-        .checked_mul(4)?;
-    let scale_usize = usize::try_from(scale).ok()?;
-    let mut output = vec![0; output_len];
-    let mut expanded_row = Vec::with_capacity(output_width_usize * 4);
-    for source_y in 0..source_height {
-        let source_row_start = source_y * source_width * 4;
-        let source_row = &pixels[source_row_start..source_row_start + source_width * 4];
-        expanded_row.clear();
-        for source_pixel in source_row.chunks_exact(4) {
-            for _ in 0..scale_usize {
-                expanded_row.extend_from_slice(source_pixel);
-            }
-        }
-        for row_repeat in 0..scale_usize {
-            let target_row = (source_y * scale_usize + row_repeat) * output_width_usize * 4;
-            output[target_row..target_row + expanded_row.len()].copy_from_slice(&expanded_row);
-        }
-    }
-    Some((output, output_width, output_height))
-}
-
-/// Nearest-neighbour upscale for decoded RGBA8 words.
-pub fn upscale_rgba8_words(
-    pixels: &[u32],
-    width: u32,
-    height: u32,
-    scale: u8,
-) -> Option<(Vec<u32>, u32, u32)> {
-    if scale <= 1 || width == 0 || height == 0 {
-        return None;
-    }
-    let maximum_scale = match crate::gles::memory_management() {
-        0 => 2,
-        1 => 3,
-        _ => 4,
-    };
-    let scale = u32::from(scale.min(maximum_scale));
-    if scale <= 1 {
-        return None;
-    }
-    let output_width = width.checked_mul(scale)?;
-    let output_height = height.checked_mul(scale)?;
-    let source_width = usize::try_from(width).ok()?;
-    let source_height = usize::try_from(height).ok()?;
-    let output_width_usize = usize::try_from(output_width).ok()?;
-    let output_height_usize = usize::try_from(output_height).ok()?;
-    let source_len = source_width.checked_mul(source_height)?;
-    if pixels.len() < source_len {
-        return None;
-    }
-    let output_len = output_width_usize.checked_mul(output_height_usize)?;
-    let scale_usize = usize::try_from(scale).ok()?;
-    let mut output = vec![0; output_len];
-    let mut expanded_row = Vec::with_capacity(output_width_usize);
-    for source_y in 0..source_height {
-        expanded_row.clear();
-        let source_row = &pixels[source_y * source_width..(source_y + 1) * source_width];
-        for &pixel in source_row {
-            for _ in 0..scale_usize {
-                expanded_row.push(pixel);
-            }
-        }
-        for row_repeat in 0..scale_usize {
-            let target_row = (source_y * scale_usize + row_repeat) * output_width_usize;
-            output[target_row..target_row + output_width_usize].copy_from_slice(&expanded_row);
-        }
-    }
-    Some((output, output_width, output_height))
 }
 
 pub struct PalettedTextureFormat {
@@ -910,56 +598,4 @@ impl PalettedTextureFormat {
             _ => None,
         }
     }
-}
-
-
-/// Record the host-side format/type a texture level was created with, so
-/// later glTexSubImage2D calls can match it (strict Adreno drivers reject
-/// mismatched sub-image formats with GL_INVALID_OPERATION).
-pub fn record_texture_level_format(
-    gles: &mut dyn crate::gles::GLES,
-    target: u32,
-    level: i32,
-    format: u32,
-    type_: u32,
-) {
-    use std::sync::Mutex;
-    static LEVEL_FORMATS: Mutex<Option<std::collections::HashMap<(u32, u32, i32), (u32, u32)>>> =
-        Mutex::new(None);
-    let texture = unsafe {
-        let mut t: i32 = 0;
-        gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut t);
-        t
-    };
-    if texture <= 0 {
-        return;
-    }
-    let mut guard = LEVEL_FORMATS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    if map.len() > 4096 {
-        map.clear();
-    }
-    map.insert((texture as u32, target as u32, level as i32), (format, type_));
-}
-
-/// Look up the host-side format/type previously recorded for a texture level.
-pub fn texture_level_format(
-    gles: &mut dyn crate::gles::GLES,
-    target: u32,
-    level: i32,
-) -> Option<(u32, u32)> {
-    use std::sync::Mutex;
-    static LEVEL_FORMATS: Mutex<Option<std::collections::HashMap<(u32, u32, i32), (u32, u32)>>> =
-        Mutex::new(None);
-    let texture = unsafe {
-        let mut t: i32 = 0;
-        gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut t);
-        t
-    };
-    if texture <= 0 {
-        return None;
-    }
-    let guard = LEVEL_FORMATS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.as_ref()?;
-    map.get(&(texture as u32, target as u32, level as i32)).copied()
 }

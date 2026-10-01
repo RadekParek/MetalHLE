@@ -21,7 +21,7 @@
 //! of GLKit import.
 
 use crate::dyld::{ConstantExports, FunctionExports, HostConstant};
-use crate::frameworks::core_graphics::CGRect;
+use crate::frameworks::core_graphics::{CGFloat, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval};
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
@@ -192,11 +192,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSInteger)drawableWidth {
     let bounds: CGRect = msg![env; this bounds];
-    bounds.size.width as NSInteger
+    let scale: CGFloat = msg![env; this contentScaleFactor];
+    (bounds.size.width * scale) as NSInteger
 }
 - (NSInteger)drawableHeight {
     let bounds: CGRect = msg![env; this bounds];
-    bounds.size.height as NSInteger
+    let scale: CGFloat = msg![env; this contentScaleFactor];
+    (bounds.size.height * scale) as NSInteger
 }
 
 - (bool)enableSetNeedsDisplay {
@@ -259,18 +261,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSInteger)preferredFramesPerSecond {
-    let preferred = env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second;
-    preferred.min(env.options.effective_fps_limit(preferred as f64) as NSInteger)
+    env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second
 }
 - (())setPreferredFramesPerSecond:(NSInteger)fps {
     // Apple docs: setting 0 (or a negative value) means "use the default",
     // which is 30 fps.
-    let fps = if fps <= 0 {
-        env.options.effective_fps_limit(30.0) as NSInteger
-    } else {
-        fps
-    };
-    let fps = fps.min(env.options.effective_fps_limit(fps as f64) as NSInteger);
+    let fps = if fps <= 0 { 30 } else { fps };
     env.objc
         .borrow_mut::<GLKViewControllerHostObject>(this)
         .preferred_frames_per_second = fps;

@@ -26,10 +26,6 @@ pub struct State {
     /// Whether shake to edit is enabled
     pub(super) application_supports_shake_to_edit: bool,
     pub(super) ignoring_interaction_events_count: u32,
-    // NOTE: the `autorotation_transform_applied` flag lives on the top-level
-    // `uikit::State` (src/frameworks/uikit.rs), not here — both the writer
-    // (`-[UIWindow addSubview:]`) and the reader (`present_renderbuffer`)
-    // access it through `env.framework_state.uikit`.
 }
 
 #[derive(Default)]
@@ -186,23 +182,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setStatusBarOrientation:(UIInterfaceOrientation)orientation {
-    let prev_orientation = env.window().current_rotation();
-    let new_orientation = match orientation {
-        // Per Apple docs UIDeviceOrientationUnknown (0) means the orientation
-        // cannot be determined; apps (e.g. BioShock's init) pass it routinely.
-        UIDeviceOrientationUnknown => return,
-        UIDeviceOrientationPortrait => DeviceOrientation::Portrait,
-        UIDeviceOrientationPortraitUpsideDown => DeviceOrientation::PortraitUpsideDown,
-        UIDeviceOrientationLandscapeLeft => DeviceOrientation::LandscapeLeft,
-        UIDeviceOrientationLandscapeRight => DeviceOrientation::LandscapeRight,
+    match orientation {
+        UIDeviceOrientationUnknown => {
+            // Per Apple docs UIDeviceOrientationUnknown (0) means the
+            // orientation cannot be determined.  Ignore it.
+        }
+        UIDeviceOrientationPortrait => {
+            env.on_parent_stack_in_coroutine(|window, _| window.rotate_device(DeviceOrientation::Portrait));
+        }
+        UIDeviceOrientationPortraitUpsideDown => {
+            env.on_parent_stack_in_coroutine(|window, _| window.rotate_device(DeviceOrientation::PortraitUpsideDown));
+        }
+        UIDeviceOrientationLandscapeLeft => {
+            env.on_parent_stack_in_coroutine(|window, _| window.rotate_device(DeviceOrientation::LandscapeLeft));
+        }
+        UIDeviceOrientationLandscapeRight => {
+            env.on_parent_stack_in_coroutine(|window, _| window.rotate_device(DeviceOrientation::LandscapeRight));
+        }
         _ => {
             log!("Warning: Orientation {} not handled yet (ignoring to prevent panic)", orientation);
-            return;
         }
-    };
-    env.on_parent_stack_in_coroutine(|window, _| window.rotate_device(new_orientation));
-    if prev_orientation != env.window().current_rotation() {
-        generate_device_orientation_notification(env);
     }
 }
 
@@ -235,9 +234,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     // gate sharing buttons on `canOpenURL:` (Talking Carl's social
     // links, the Bubble Witch share sheet, the Imobamoba "rate me"
     // popup) take the "yes, link the user out" branch instead of
-    // greying out the button. Application-specific schemes (e.g.
-    // `fb://`, `twitter://`) we report as unavailable because no
-    // host-side app responds to them.
+    // greying out the button. Schemes in the app's own
+    // `CFBundleURLTypes` are checked below. Other application-specific
+    // schemes (e.g. `fb://`, `twitter://`) remain unavailable because
+    // no host-side app responds to them.
     if url == nil {
         return false;
     }
@@ -276,14 +276,46 @@ pub const CLASSES: ClassExports = objc_classes! {
         return true;
     }
 
-    // Honour the Info.plist allow-list (`LSApplicationQueriesSchemes`).
-    // Real iOS uses this only to *gate* the query, not to answer it,
-    // but if the app lists a scheme there it almost always genuinely
-    // expects the answer to be NO when the corresponding app is not
-    // installed. We therefore log a debug note and return false so the
-    // app's "app isn't installed" fallback runs.
     let main_bundle: id = msg_class![env; NSBundle mainBundle];
     if main_bundle != nil {
+        let url_types_key = ns_string::get_static_str(env, "CFBundleURLTypes");
+        let url_types: id = msg![env; main_bundle objectForInfoDictionaryKey:url_types_key];
+        if url_types != nil {
+            let schemes_key = ns_string::get_static_str(env, "CFBundleURLSchemes");
+            let type_count: u32 = msg![env; url_types count];
+            for i in 0..type_count {
+                let url_type: id = msg![env; url_types objectAtIndex:i];
+                if url_type == nil {
+                    continue;
+                }
+                let schemes: id = msg![env; url_type objectForKey:schemes_key];
+                if schemes == nil {
+                    continue;
+                }
+                let scheme_count: u32 = msg![env; schemes count];
+                for j in 0..scheme_count {
+                    let registered_scheme: id = msg![env; schemes objectAtIndex:j];
+                    if registered_scheme == nil {
+                        continue;
+                    }
+                    let registered_scheme = ns_string::to_rust_string(env, registered_scheme);
+                    if registered_scheme.to_lowercase() == scheme_lower {
+                        log_dbg!(
+                            "canOpenURL: {:?} is registered by the running app; returning YES",
+                            scheme_lower
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Honour the Info.plist allow-list (`LSApplicationQueriesSchemes`).
+        // Real iOS uses this only to *gate* the query, not to answer it,
+        // but if the app lists a scheme there it almost always genuinely
+        // expects the answer to be NO when the corresponding app is not
+        // installed. We therefore log a debug note and return false so the
+        // app's "app isn't installed" fallback runs.
         let key_str = ns_string::get_static_str(env, "LSApplicationQueriesSchemes");
         let allowed_arr: id = msg![env; main_bundle objectForInfoDictionaryKey:key_str];
         if allowed_arr != nil {
@@ -316,13 +348,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)openURL:(id)url { // NSURL
     let ns_string = msg![env; url absoluteString];
     let url_string = ns_string::to_rust_string(env, ns_string);
+    // Hand the URL to the host (on Android this opens the system browser
+    // via MainActivity.openExternalUrl and the emulator keeps running —
+    // exiting the process here killed the app before the intent could
+    // dispatch, so links never opened).
     if let Err(e) = crate::window::open_url(env, &url_string) {
-        echo!("App opened URL {:?} unsuccessfully ({}), exiting.", url_string, e);
+        echo!("App opened URL {:?} unsuccessfully ({}).", url_string, e);
     } else {
-        echo!("App opened URL {:?}, exiting.", url_string);
+        echo!("App opened URL {:?}.", url_string);
     }
-
-    exit(env);
     true
 }
 
@@ -362,14 +396,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if target != nil {
         let responds: bool = msg![env; target respondsToSelector:action];
         if responds {
-            let sel_str = action.as_str(&env.mem);
-            let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
-            match colon_count {
-                0 => () = crate::objc::msg_send(env, (target, action)),
-                1 => () = crate::objc::msg_send(env, (target, action, sender)),
-                2 => () = crate::objc::msg_send(env, (target, action, sender, _event)),
-                _ => return false,
-            }
+            () = msg![env; target performSelector:action withObject:sender];
             return true;
         }
         return false;
@@ -379,14 +406,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     while responder != nil {
         let responds: bool = msg![env; responder respondsToSelector:action];
         if responds {
-            let sel_str = action.as_str(&env.mem);
-            let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
-            match colon_count {
-                0 => () = crate::objc::msg_send(env, (responder, action)),
-                1 => () = crate::objc::msg_send(env, (responder, action, sender)),
-                2 => () = crate::objc::msg_send(env, (responder, action, sender, _event)),
-                _ => return false,
-            }
+            () = msg![env; responder performSelector:action withObject:sender];
             return true;
         }
         responder = msg![env; responder nextResponder];
@@ -588,10 +608,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())registerForRemoteNotificationTypes:(UIRemoteNotificationType)types {
-    log_once_fmt!(
-        "Remote notification registration requested (types={}); notifications are unavailable in the emulator and the request was ignored",
-        types
-    );
+    // Push notifications cannot work in an emulator; apps register on every
+    // launch, so keep the log quiet (debug level only).
+    log_dbg!("registerForRemoteNotificationTypes:{} ignored", types);
 }
 
 // `- (UIRemoteNotificationType)enabledRemoteNotificationTypes` —
@@ -925,17 +944,15 @@ pub(super) fn UIApplicationMain(
     //   https://developer.apple.com/documentation/uikit/uidevice/1620018-beginGeneratingdeviceorientationn
     {
         let pool: id = msg_class![env; NSAutoreleasePool new];
+        let current_device: id = msg_class![env; UIDevice currentDevice];
         let is_generating: bool =
-            env.framework_state
-                .uikit
-                .ui_device
-                .is_generating_device_orientation_notifications();
+            msg![env; current_device isGeneratingDeviceOrientationNotifications];
         if is_generating {
             log_dbg!(
                 "Posting initial UIDeviceOrientationDidChangeNotification \
                  so apps observing device orientation can finish initializing."
             );
-            generate_device_orientation_notification(env);
+            let _: () = msg![env; current_device _postOrientationChangeNotification];
         }
         let _: () = msg![env; pool drain];
     }

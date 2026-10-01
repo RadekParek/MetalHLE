@@ -14,12 +14,13 @@ use crate::libc::sysctl::SysInfoType::String;
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, PAGE_SIZE};
 use crate::Environment;
 
-static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
+static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 38] = [
     // Generic CPU, I/O
     ((6,1), "hw.machine" , String(b"iPhone2,1")), // overridden dynamically below
     ((6,2), "hw.model" , String(b"N88AP")),
     ((6,3), "hw.ncpu" , SysInfoType::Int32(1)),
     ((6,25), "hw.activecpu" , SysInfoType::Int32(1)), // Активные ядра
+    ((6,26), "hw.activecpu" , SysInfoType::Int32(1)), // HW_ACTIVECPU
     // Physical / logical CPU counters introduced in 10.5 / iOS 4 and
     // documented in `<sys/sysctl.h>`. iPhone 1/2G/3G are single-core, so
     // every counter reads back as 1 — matching what a real iOS 4 device
@@ -31,20 +32,27 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
     ((0,0), "hw.logicalcpu_max" , SysInfoType::Int32(1)),
     ((0,0), "hw.cputype" , SysInfoType::Int32(12)),
     ((0,0), "hw.cpusubtype" , SysInfoType::Int32(6)),
+    ((6,4), "hw.byteorder" , SysInfoType::Int32(1234)), // little-endian
+    ((6,12), "hw.machine_arch" , String(b"armv6")), // overridden dynamically below
+    ((6,13), "hw.vectorunit" , SysInfoType::Int32(1)), // VFP present
     ((6,15), "hw.cpufrequency" , SysInfoType::Int64(412000000)),
     ((6,16), "hw.cpufrequency_max", SysInfoType::Int64(412000000)),
     ((6,14), "hw.busfrequency" , SysInfoType::Int64(103000000)),
 
     // Честные параметры кэша для ARM1176JZF-S (iPhone 2G / 3G)
-    ((0,0), "hw.cachelinesize", SysInfoType::Int32(32)),
-    ((0,0), "hw.l1dcachesize", SysInfoType::Int32(16384)),
-    ((0,0), "hw.l2cachesize", SysInfoType::Int32(0)),
-    ((0,0), "hw.l3cachesize", SysInfoType::Int32(0)),
+    ((6,17), "hw.l1icachesize", SysInfoType::Int32(16384)),
+    ((6,18), "hw.l1dcachesize", SysInfoType::Int32(16384)),
+    ((6,19), "hw.l2icachesize", SysInfoType::Int32(0)),
+    ((6,20), "hw.l2cachesize", SysInfoType::Int32(0)),
+    ((6,21), "hw.l3icachesize", SysInfoType::Int32(0)),
+    ((6,22), "hw.l3cachesize", SysInfoType::Int32(0)),
+    ((6,23), "hw.tbfreq", SysInfoType::Int64(1000000000)),
 
     ((1, 14), "kern.osversion", String(b"10B141")),
     ((6,5), "hw.physmem" , SysInfoType::Int32(536870912)),
     ((6,6), "hw.usermem" , SysInfoType::Int32(402653184)),
-    ((6,24), "hw.memsize" , SysInfoType::Int32(536870912)),
+    ((6,24), "hw.memsize" , SysInfoType::Int64(536870912)),
+    ((7,1), "machdep.cpu.vendor", String(b"Apple")),
     ((6,7), "hw.pagesize" , SysInfoType::Int32(PAGE_SIZE as i32)),
     // High kernel limits
     ((1,1), "kern.ostype" , String(b"Darwin")),
@@ -56,6 +64,11 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
     // kern.proc.pid is a node for process information. Some games probe
     // it with sysctl([CTL_KERN, KERN_PROC, ...]) and only need success.
     ((1,65), "kern.proc.pid", SysInfoType::Bytes(b"")),
+    // CTL_NET with PF_ROUTE (17): routing-table/interface dumps (used by
+    // Mono/.NET NetworkInterface via getifaddrs, hence by Unity games).
+    // Callers only need the call to succeed; an empty table means "no
+    // network interfaces", which is fine for an offline emulator.
+    ((4,17), "net.route", SysInfoType::Bytes(b"")),
 ];
 
 static STRING_MAP: LazyLock<HashMap<&str, SysInfoType>> = LazyLock::new(|| {
@@ -115,6 +128,23 @@ fn sysctl(
 
     let (name0, name1) = (env.mem.read(name), env.mem.read(name + 1));
 
+    // hw.machine_arch (HW_MACHINE_ARCH) depends on the emulated device: the
+    // ARM1176-based models are armv6, the Cortex-A8+ models are armv7.
+    if name0 == 6 && name1 == 12 {
+        let arch: &'static [u8] = match env.window().device_family().machine_name() {
+            "iPhone1,1" | "iPhone1,2" | "iPod1,1" | "iPod2,1" => b"armv6",
+            _ => b"armv7",
+        };
+        return sysctl_generic(
+            env,
+            |_env| Some(("hw.machine_arch", SysInfoType::String(arch))),
+            oldp,
+            oldlenp,
+            newp,
+            newlen,
+        );
+    }
+
     // hw.machine depends on the emulated device family
     // В SYSCTL_VALUES hw.machine соответствует ключу (6, 1)
     if name0 == 6 && name1 == 1 {
@@ -134,21 +164,6 @@ fn sysctl(
         env.mem.memmove(oldp, tmp.cast().cast_const(), len);
         env.mem.free(tmp.cast());
         env.mem.write(oldlenp, len);
-        return 0;
-    }
-
-    // CTL_NET/PF_ROUTE route-table probe: games (e.g. BioShock) and Apple's
-    // Reachability-style code call sysctl({CTL_NET, PF_ROUTE, ...}) as
-    // {4, 17} to size the kernel routing table and infer network presence.
-    // Report an empty table with success instead of an unknown-parameter
-    // error (with the default network-disabled environment there are no
-    // routes to report).
-    if name0 == 4 && name1 == 17 {
-        log_dbg!("sysctl([CTL_NET, PF_ROUTE]): returning empty route table");
-        // Report the needed size as zero in both call shapes: with a NULL
-        // buffer (size probe) and with a real buffer (query). A zero length
-        // means "no routes", which the caller treats as success either way.
-        env.mem.write(oldlenp, 0u32);
         return 0;
     }
 
@@ -183,7 +198,7 @@ fn sysctl(
             let Some((name_str, val)) = INT_MAP.get(&(name0, name1)) else {
                 // Убираем unimplemented!, чтобы избежать паники, просто
                 // логируем и возвращаем ошибку, как в sysctlbyname
-                log_dbg!(
+                log!(
                     "sysctl(): unknown parameter [{}, {}], returning -1",
                     name0,
                     name1
@@ -232,6 +247,17 @@ fn sysctlbyname(
                 let machine: &'static str = env.window().device_family().machine_name();
                 return Some(("hw.machine", String(machine.as_bytes())));
             }
+            if name_str == "hw.machine_arch" {
+                let machine: &'static str = env.window().device_family().machine_name();
+                let arch: &'static [u8] = match machine {
+                    "iPhone1,1" | "iPhone1,2" | "iPod1,1" | "iPod2,1" => b"armv6",
+                    _ => b"armv7",
+                };
+                return Some(("hw.machine_arch", SysInfoType::String(arch)));
+            }
+            if name_str == "machdep.cpu.vendor" {
+                return Some(("machdep.cpu.vendor", String(b"Apple")));
+            }
             // hw.physmem / hw.memsize / hw.usermem must reflect the emulated
             // device's real RAM (see the numeric sysctl() path above for why).
             match name_str {
@@ -250,7 +276,7 @@ fn sysctlbyname(
                 _ => {}
             }
             let Some((name_str, val)) = STRING_MAP.get_key_value(name_str) else {
-                log_dbg!(
+                log!(
                     "sysctlbyname(): unknown parameter {}, returning -1",
                     name_str
                 );
@@ -336,7 +362,11 @@ where
                 return 0;
             }
             _ => {
-                log!("sysctl(byname) for '{name_str}': the buffer of size {oldlen} is too low to fit the value of size {len}, returning -1");
+                // This is the real-sysctl behavior (ENOMEM), apps probe with
+                // a small buffer all the time, so only log it at debug level.
+                log_dbg!(
+                    "sysctl(byname) for '{name_str}': the buffer of size {oldlen} is too low to fit the value of size {len}, returning -1"
+                );
                 return -1;
             }
         }

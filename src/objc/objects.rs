@@ -8,8 +8,76 @@
 use super::{Class, ClassHostObject};
 use crate::mem::{guest_size_of, GuestUSize, Mem, MutPtr, Ptr, SafeRead};
 use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::Mutex;
 
+/// Per-(id, TypeId) cache of phantom host-object buffers used when a
+/// `borrow`/`borrow_mut` call hits an object that has no real host-side
+/// record. Each entry is a zero-initialised, leaked buffer large enough to
+/// hold `T`; callers get a stable reference that isn't aliased with buffers
+/// for other objects/types.
+///
+/// The cache is behind a single process-wide `Mutex` because touchHLE keeps
+/// a single `ObjC` instance but this function is used from both immutable
+/// (`&self`) and mutable (`&mut self`) receivers, and from many framework
+/// modules. Contention here is only hit on the error path, so a plain
+/// `Mutex` is fine.
+static PHANTOM_STORE: Mutex<Option<HashMap<(TypeId, usize), usize>>> = Mutex::new(None);
+
+fn phantom_buffer_for<T: 'static>(object: id, init: impl FnOnce() -> T) -> *mut u8 {
+    let key = (TypeId::of::<T>(), object.to_bits() as usize);
+    let mut guard = PHANTOM_STORE.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(&ptr) = map.get(&key) {
+        return ptr as *mut u8;
+    }
+    // Leak a buffer sized and aligned for T, then write a real `T` value
+    // into it. Using raw `alloc_zeroed` plus `transmute` (the previous
+    // behaviour) was unsound for types whose zero bit-pattern is not a
+    // valid instance — most notably anything containing a `HashMap`, whose
+    // internal `ctrl` pointer must point at hashbrown's static empty
+    // sentinel rather than null. Performing a proper `T::default()`
+    // (passed in by the caller) ensures the buffer holds a usable
+    // instance even on this error path.
+    let layout = std::alloc::Layout::new::<T>();
+    // SAFETY: `layout.size()` is non-zero for any real host object, and
+    // the allocator returns a pointer with `layout.align()` alignment.
+    // Writing `init()` (a `T` value) into freshly allocated, uninitialised
+    // memory of exactly that layout is well-defined.
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    assert!(!ptr.is_null(), "phantom host object allocation failed");
+    unsafe { std::ptr::write(ptr as *mut T, init()) };
+    map.insert(key, ptr as usize);
+    ptr
+}
+
+/// Return a `&T` pointing at a stable backing buffer for the given
+/// missing-object id, initialised on first access via [`Default::default`].
+/// Repeated calls with the same `object` and `T` return the same buffer
+/// (which may have been mutated through [`phantom_host_object_mut`] in the
+/// meantime).
+fn phantom_host_object<T: Default + 'static>(object: id) -> &'static T {
+    let ptr = phantom_buffer_for::<T>(object, T::default) as *const T;
+    // SAFETY: `phantom_buffer_for` returns a stable allocation of
+    // `size_of::<T>()` bytes with the required alignment, initialised on
+    // first call via `T::default()`. Subsequent calls return the same
+    // region, giving a stable `'static` reference to a valid `T`.
+    unsafe { &*ptr }
+}
+
+/// Return a `&mut T` pointing at a stable backing buffer for the given
+/// missing-object id, initialised on first access via [`Default::default`].
+/// Repeated calls with the same `object` and `T` return a reference to the
+/// same buffer.
+fn phantom_host_object_mut<T: Default + 'static>(object: id) -> &'static mut T {
+    let ptr = phantom_buffer_for::<T>(object, T::default) as *mut T;
+    // SAFETY: See `phantom_host_object`. Additionally, because the cache
+    // keys on `(TypeId, object)` each call-site gets an isolated buffer,
+    // so mutations by one fake-borrow won't be visible to another fake-
+    // borrow of a different object or type.
+    unsafe { &mut *ptr }
+}
 
 #[repr(C, packed)]
 pub struct objc_object {
@@ -94,14 +162,6 @@ impl super::ObjC {
     ) -> id {
         let guest_object = objc_object { isa };
         let ptr: MutPtr<objc_object> = mem.alloc(instance_size).cast();
-        if ptr.is_null() {
-            log!(
-                "Warning: could not allocate {:#x} bytes for Objective-C object of class {:?}; returning nil",
-                instance_size,
-                isa
-            );
-            return nil;
-        }
         mem.write(ptr, guest_object);
         self.objects.insert(
             ptr,
@@ -134,6 +194,10 @@ impl super::ObjC {
         )
     }
 
+    /// Like [Self::alloc_object], but with an explicit guest instance size.
+    /// Needed for classes whose guest-memory layout carries the object's
+    /// state (so guest code that bit-copies the object — e.g. Gameloft's
+    /// engines copying a 0x40-byte UITouch — gets a fully functional copy).
     pub fn alloc_object_sized(
         &mut self,
         isa: Class,
@@ -198,46 +262,55 @@ impl super::ObjC {
             }
         }
 
-        let key = (object, TypeId::of::<T>());
-        if let Some(host_object) = self.missing_objects.borrow().get(&key) {
-            let host_object = host_object
-                .as_any()
-                .downcast_ref::<T>()
-                .expect("missing-object compatibility cache type mismatch")
-                as *const T;
-            return unsafe { &*host_object };
-        }
-
+        // Fallback for missing / wrong-type objects.
+        //
+        // Previously we returned a reference to a single shared
+        // `static DUMMY_BUF: [u64; 256] = [0; 256]`. That one buffer was
+        // aliased across EVERY fake borrow of EVERY type, so as soon as a
+        // `borrow_mut` populated e.g. `UIViewHostObject.subviews` with a
+        // non-empty Vec, every subsequent fake borrow saw the same list —
+        // including of itself, causing `hitTest:` to recurse infinitely and
+        // overflow the host stack.
+        //
+        // We now leak a fresh zero-initialized buffer per (id, type) pair
+        // so the returned reference has stable, isolated storage. A proper
+        // fix would register a real `Default::default()` host object, but
+        // that requires a `T: Default` bound which many callers don't yet
+        // provide.
+        // POSIX/Objective-C semantics: a message to `nil` returns the
+        // zero/empty form of the return type — the runtime is expected
+        // to treat such calls as a no-op. Returning a zero-initialized
+        // phantom host object preserves this without flooding the log.
         if object == nil {
             log_dbg!(
-                "borrow on nil receiver of type {} — returning isolated phantom",
+                "borrow on nil receiver of type {} — returning zero-initialized phantom",
                 std::any::type_name::<T>()
             );
         } else if let Some(entry) = self.objects.get(&object) {
-            log_once_fmt!(
-                "Warning: host object {:?} has type {}, not requested {}; using isolated compatibility state",
+            // The object exists but its host object is a different type than
+            // requested. Reporting the actual type makes these mismatches
+            // diagnosable — it's usually either a guest pointer/type confusion
+            // or a host class that forgot to embed its superclass host object
+            // (see `impl_HostObject_with_superclass!`).
+            if self.warn_fake_borrow_once(object, std::any::TypeId::of::<T>()) {
+                log!(
+                    "Warning: SUPER HACK! Faking borrow for wrong-type object {:?}: \
+                     requested {}, actual host type {} (suppressing further warnings \
+                     for this object/type pair)",
+                    object,
+                    std::any::type_name::<T>(),
+                    entry.host_object.type_name(),
+                );
+            }
+        } else if self.warn_fake_borrow_once(object, std::any::TypeId::of::<T>()) {
+            log!(
+                "Warning: SUPER HACK! Faking borrow for missing object {:?} of type {} \
+                 (suppressing further warnings for this object/type pair)",
                 object,
-                entry.host_object.type_name(),
-                std::any::type_name::<T>(),
-            );
-        } else {
-            log_once_fmt!(
-                "Warning: missing host object {:?} of type {}; using isolated compatibility state",
-                object,
-                std::any::type_name::<T>(),
+                std::any::type_name::<T>()
             );
         }
-        let mut missing_objects = self.missing_objects.borrow_mut();
-        let host_object = missing_objects
-            .entry(key)
-            .or_insert_with(|| Box::new(T::default()));
-        let host_object = host_object
-            .as_any()
-            .downcast_ref::<T>()
-            .expect("missing-object compatibility cache type mismatch")
-            as *const T;
-        drop(missing_objects);
-        unsafe { &*host_object }
+        phantom_host_object::<T>(object)
     }
 
     pub fn borrow_mut<T: AnyHostObject + Default + 'static>(&mut self, object: id) -> &mut T {
@@ -259,62 +332,31 @@ impl super::ObjC {
             }
         }
 
+        // See comment in `borrow` above for rationale.
         if object == nil {
             log_dbg!(
-                "borrow_mut on nil receiver of type {} — returning isolated compatibility state",
+                "borrow_mut on nil receiver of type {} — returning zero-initialized phantom",
+                std::any::type_name::<T>()
+            );
+        } else if self.warn_fake_borrow_once(object, std::any::TypeId::of::<T>()) {
+            log!(
+                "Warning: SUPER HACK! Faking borrow_mut for missing object {:?} of type {} \
+                 (suppressing further warnings for this object/type pair)",
+                object,
                 std::any::type_name::<T>()
             );
         }
+        phantom_host_object_mut::<T>(object)
+    }
 
-        if let Some(entry) = self.objects.get(&object) {
-            log_once_fmt!(
-                "Warning: host object {:?} has type {}, not requested {}; using isolated compatibility state",
-                object,
-                entry.host_object.type_name(),
-                std::any::type_name::<T>(),
-            );
-        } else {
-            log_once_fmt!(
-                "Warning: missing host object {:?} of type {}; using isolated compatibility state",
-                object,
-                std::any::type_name::<T>(),
-            );
-        }
-
-        let key = (object, TypeId::of::<T>());
-
-        // Self-heal: an object without any host object (e.g. allocated through
-        // a path that skipped host-object attachment) previously got a
-        // forever-isolated phantom, so mutations never became visible to other
-        // lookups of the same object. Attach a real host object instead so all
-        // subsequent borrows share one coherent state.
-        if !object.is_null() && self.objects.get(&object).is_none() {
-            let host_object = Box::new(T::default());
-            self.objects.insert(
-                object,
-                HostObjectEntry {
-                    host_object,
-                    refcount: Some(NonZeroU32::new(1).unwrap()),
-                },
-            );
-            self.missing_objects.borrow_mut().remove(&key);
-            let entry = self.objects.get_mut(&object).unwrap();
-            let aho: &mut (dyn AnyHostObject + 'static) = &mut *entry.host_object;
-            return aho
-                .as_any_mut()
-                .downcast_mut::<T>()
-                .expect("self-healed host object type mismatch");
-        }
-
-        let host_object = self
-            .missing_objects
-            .get_mut()
-            .entry(key)
-            .or_insert_with(|| Box::new(T::default()));
-        host_object
-            .as_any_mut()
-            .downcast_mut::<T>()
-            .expect("missing-object compatibility cache type mismatch")
+    /// Returns `true` the first time a fake borrow is attempted for the
+    /// (object, host type) pair, `false` afterwards. Keeps the diagnostic
+    /// value of the SUPER HACK warnings while preventing per-frame spam.
+    fn warn_fake_borrow_once(&self, object: id, ty: std::any::TypeId) -> bool {
+        self.fake_borrow_warned
+            .lock()
+            .unwrap()
+            .insert((object, ty))
     }
 
     pub fn get_refcount(&mut self, object: id) -> NonZeroU32 {
@@ -426,9 +468,6 @@ impl super::ObjC {
         // `nil`. This must happen before we drop the host object,
         // because the writeback uses guest memory only.
         self.zero_weak_references_for(object, mem);
-        self.missing_objects
-            .borrow_mut()
-            .retain(|(candidate, _), _| *candidate != object);
 
         if let Some(entry) = self.objects.remove(&object) {
             std::mem::drop(entry.host_object);

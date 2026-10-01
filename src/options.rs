@@ -10,6 +10,7 @@ use crate::window::{DeviceFamily, DeviceOrientation};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 pub const OPTIONS_HELP: &str =
@@ -31,68 +32,87 @@ pub enum Button {
 }
 
 /// Highest iOS version currently exposed by the emulator compatibility layer.
-pub const LATEST_IOS_VERSION: (i32, i32, i32) = (26, 6, 0);
+pub const LATEST_IOS_VERSION: (i32, i32, i32) = (12, 0, 0);
 
-/// The app-picker power switch starts in the same state as the runtime default.
-pub const DEFAULT_HIGH_PERFORMANCE: bool = true;
-/// Request the host's best-effort maximum-performance hint by default.
-pub const DEFAULT_FORCE_MAX_CLOCKS: bool = true;
-/// Use Dynarmic's direct guest-memory path by default.
-pub const DEFAULT_FAST_MEMORY: bool = true;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CorruptionOptions {
+    pub enabled: bool,
+    pub interval_frames: u32,
+    pub bytes_per_burst: u32,
+    pub max_offset: Option<u32>,
+    pub seed: u64,
+}
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Arm64Backend {
+impl Default for CorruptionOptions {
+    fn default() -> Self {
+        Self {
+            // RTCV corruption is opt-in only: enabled via touchHLE_options /
+            // --corrupt-game, never by default.
+            enabled: false,
+            interval_frames: 30,
+            bytes_per_burst: 8,
+            max_offset: None,
+            seed: 0x6a09e667f3bcc909,
+        }
+    }
+}
+
+/// How `-[EAGLContext presentRenderbuffer:]` gets a rendered frame onto the
+/// host window when the app draws into a fullscreen `CAEAGLLayer`
+/// (`--present-mode=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PresentMode {
+    /// Present on the GPU (copy the renderbuffer into a texture and draw a
+    /// quad into the window). If the first frames come out black even though
+    /// the renderbuffer has content, automatically fall back to `Readback`.
     Auto,
-    Jit,
-    Interpreter,
+    /// Always present on the GPU, never fall back.
+    Direct,
+    /// Read the renderbuffer back to system RAM with `glReadPixels()` and
+    /// push it through the Core Animation compositor. Slow (a full GPU
+    /// pipeline stall plus two full-frame copies per frame), but it avoids
+    /// touching the app's GL state and is a useful workaround for broken
+    /// vendor OpenGL ES 1.1 drivers.
+    Readback,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Arm64Fallback {
-    Jit,
-    Interpreter,
-}
-
-impl Arm64Fallback {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "jit" => Ok(Self::Jit),
-            "interpreter" => Ok(Self::Interpreter),
-            _ => Err(format!(
-                "Unknown ARM64 fallback {value:?}; expected jit or interpreter"
-            )),
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Jit => "jit",
-            Self::Interpreter => "interpreter",
-        }
-    }
-}
-
-impl Arm64Backend {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
+impl PresentMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
             "auto" => Ok(Self::Auto),
-            "jit" => Ok(Self::Jit),
-            "interpreter" => Ok(Self::Interpreter),
-            _ => Err(format!(
-                "Unknown ARM64 backend {value:?}; expected auto, jit, or interpreter"
-            )),
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Jit => "jit",
-            Self::Interpreter => "interpreter",
+            "direct" => Ok(Self::Direct),
+            "readback" => Ok(Self::Readback),
+            _ => Err(()),
         }
     }
 }
 
+/// Whether host buffer swaps wait for the display's vertical refresh
+/// (`--vsync=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VsyncMode {
+    /// Android: off (the emulator paces frames itself and the Android
+    /// compositor already synchronises to the display, so a blocking swap only
+    /// adds stalls). Other platforms: leave the driver's default alone.
+    Auto,
+    /// Swap interval 1: every swap waits for the next vertical refresh.
+    On,
+    /// Swap interval 0: swaps never block.
+    Off,
+}
+
+impl VsyncMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "on" | "1" => Ok(Self::On),
+            "off" | "0" => Ok(Self::Off),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Which graphics API (or GL context flavor) to request for rendering.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum GraphicsApi {
     Default,
@@ -108,141 +128,43 @@ pub enum GraphicsApi {
     Metal,
 }
 
-impl Default for GraphicsApi {
-    fn default() -> Self {
-        Self::Default
-    }
-}
-
-impl GraphicsApi {
-    pub fn from_short_name(name: &str) -> Result<Self, ()> {
-        match name {
-            "default" | "auto" => Ok(Self::Default),
-            "translator" | "gles1.1-gles2.0" => Ok(Self::Translator),
-            "translator-gles3" | "gles1.1-gles3.0" => Ok(Self::TranslatorGLES30),
-            "gles1.0" | "gles10" => Ok(Self::GLES10),
-            "gles1.1" | "gles11" => Ok(Self::GLES11),
-            "gles2.0" | "gles20" => Ok(Self::GLES20),
-            "gles3.0" | "gles30" => Ok(Self::GLES30),
-            "wgpu" | "webgpu" => Ok(Self::Wgpu),
-            "vulkan" => Ok(Self::Vulkan),
-            "software" | "software-rendering" | "cpu" => Ok(Self::Software),
-            "metal" => Ok(Self::Metal),
-            _ => Err(()),
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Default => "Default (game)",
-            Self::Translator => "OpenGL ES 1.1 → OpenGL ES 2.0 translator",
-            Self::TranslatorGLES30 => "OpenGL ES 1.1 → OpenGL ES 3.0 translator",
-            Self::GLES10 => "OpenGL ES 1.0",
-            Self::GLES11 => "OpenGL ES 1.1",
-            Self::GLES20 => "OpenGL ES 2.0",
-            Self::GLES30 => "OpenGL ES 3.0",
-            Self::Wgpu => "WGPU",
-            Self::Vulkan => "Vulkan",
-            Self::Software => "Software rendering",
-            Self::Metal => "Metal compatibility",
-        }
-    }
-}
-
+/// Rotation applied to rendered pixels without changing the emulated device orientation.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum TextureFiltering {
+pub enum RenderRotation {
     Default,
-    Bilinear,
-    Trilinear,
-    Anisotropic,
+    Minus90,
+    Minus180,
+    Plus90,
+    Plus180,
 }
 
-impl Default for TextureFiltering {
+impl Default for RenderRotation {
     fn default() -> Self {
         Self::Default
     }
 }
 
-impl TextureFiltering {
+impl RenderRotation {
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().trim_end_matches('\u{00b0}') {
             "default" => Ok(Self::Default),
-            "bilinear" => Ok(Self::Bilinear),
-            "trilinear" => Ok(Self::Trilinear),
-            "anisotropic" | "anistropic" => Ok(Self::Anisotropic),
-            _ => Err(format!("Invalid texture filtering {value:?}")),
+            "-90" => Ok(Self::Minus90),
+            "-180" => Ok(Self::Minus180),
+            "90" => Ok(Self::Plus90),
+            "180" => Ok(Self::Plus180),
+            _ => Err(format!(
+                "Invalid render rotation {value:?}; expected default, -90, -180, 90, or 180"
+            )),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Bilinear => "bilinear",
-            Self::Trilinear => "trilinear",
-            Self::Anisotropic => "anisotropic",
-        }
-    }
-}
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum PvrtcDecoding {
-    Software,
-    Auto,
-    Driver,
-}
-
-impl Default for PvrtcDecoding {
-    fn default() -> Self {
-        Self::Software
-    }
-}
-
-impl PvrtcDecoding {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "software" | "cpu" | "decode" => Ok(Self::Software),
-            "auto" | "automatic" => Ok(Self::Auto),
-            "driver" | "native" => Ok(Self::Driver),
-            _ => Err(format!("Invalid PVRTC decoding mode {value:?}")),
-        }
-    }
-
-    pub fn short_name(self) -> &'static str {
-        match self {
-            Self::Software => "software",
-            Self::Auto => "auto",
-            Self::Driver => "driver",
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum MemoryManagement {
-    Light,
-    Balanced,
-    Aggressive,
-}
-
-impl Default for MemoryManagement {
-    fn default() -> Self {
-        Self::Aggressive
-    }
-}
-
-impl MemoryManagement {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "light" => Ok(Self::Light),
-            "balanced" => Ok(Self::Balanced),
-            "aggressive" | "aggresive" => Ok(Self::Aggressive),
-            _ => Err(format!("Invalid memory management mode {value:?}")),
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Light => "light",
-            Self::Balanced => "balanced",
-            Self::Aggressive => "aggressive",
+            Self::Minus90 => "-90\u{00b0}",
+            Self::Minus180 => "-180\u{00b0}",
+            Self::Plus90 => "90\u{00b0}",
+            Self::Plus180 => "180\u{00b0}",
         }
     }
 }
@@ -257,12 +179,6 @@ pub enum GlesOverrideVersion {
     Gles31,
     Gles32,
     Metal,
-}
-
-impl Default for GlesOverrideVersion {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl GlesOverrideVersion {
@@ -306,17 +222,43 @@ impl GlesOverrideVersion {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PvrtcDecoding {
+    Software,
+    Auto,
+    Driver,
+}
+
+impl Default for PvrtcDecoding {
+    fn default() -> Self {
+        Self::Software
+    }
+}
+
+impl PvrtcDecoding {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "software" | "cpu" | "decode" => Ok(Self::Software),
+            "auto" | "automatic" => Ok(Self::Auto),
+            "driver" | "native" => Ok(Self::Driver),
+            _ => Err(format!("Invalid PVRTC decoding mode {value:?}")),
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::Auto => "auto",
+            Self::Driver => "driver",
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AudioBackend {
     Default,
     CoreAudio,
     OpenSlEs,
     AAudio,
-}
-
-impl Default for AudioBackend {
-    fn default() -> Self {
-        Self::CoreAudio
-    }
 }
 
 impl AudioBackend {
@@ -349,81 +291,165 @@ impl AudioBackend {
     }
 }
 
-/// Rotation applied to rendered pixels without changing the emulated device orientation.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum RenderRotation {
+pub enum TextureFiltering {
     Default,
-    Minus90,
-    Minus180,
-    Plus90,
-    Plus180,
+    Bilinear,
+    Trilinear,
+    Anisotropic,
 }
 
-impl Default for RenderRotation {
-    fn default() -> Self {
-        Self::Default
-    }
-}
-
-impl RenderRotation {
+impl TextureFiltering {
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().trim_end_matches('°') {
+        match value.trim().to_ascii_lowercase().as_str() {
             "default" => Ok(Self::Default),
-            "-90" => Ok(Self::Minus90),
-            "-180" => Ok(Self::Minus180),
-            "90" => Ok(Self::Plus90),
-            "180" => Ok(Self::Plus180),
-            _ => Err(format!(
-                "Invalid render rotation {value:?}; expected default, -90, -180, 90, or 180"
-            )),
+            "bilinear" => Ok(Self::Bilinear),
+            "trilinear" => Ok(Self::Trilinear),
+            "anisotropic" | "anistropic" => Ok(Self::Anisotropic),
+            _ => Err(format!("Invalid texture filtering {value:?}")),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Minus90 => "-90°",
-            Self::Minus180 => "-180°",
-            Self::Plus90 => "90°",
-            Self::Plus180 => "180°",
+            Self::Bilinear => "bilinear",
+            Self::Trilinear => "trilinear",
+            Self::Anisotropic => "anisotropic",
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MemoryManagement {
+    Light,
+    Balanced,
+    Aggressive,
+}
+
+impl MemoryManagement {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "light" => Ok(Self::Light),
+            "balanced" => Ok(Self::Balanced),
+            "aggressive" | "aggresive" => Ok(Self::Aggressive),
+            _ => Err(format!("Invalid memory management mode {value:?}")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Balanced => "balanced",
+            Self::Aggressive => "aggressive",
+        }
+    }
+}
+
+pub const DEFAULT_HIGH_PERFORMANCE: bool = true;
+pub const DEFAULT_FORCE_MAX_CLOCKS: bool = true;
+pub const DEFAULT_FAST_MEMORY: bool = true;
+
+impl Default for GraphicsApi {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl GraphicsApi {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "default" | "auto" => Ok(Self::Default),
+            "translator" | "gles1.1-gles2.0" => Ok(Self::Translator),
+            "translator-gles3" | "gles1.1-gles3.0" => Ok(Self::TranslatorGLES30),
+            "gles1.0" | "gles10" => Ok(Self::GLES10),
+            "gles1.1" | "gles11" => Ok(Self::GLES11),
+            "gles2.0" | "gles20" => Ok(Self::GLES20),
+            "gles3.0" | "gles30" => Ok(Self::GLES30),
+            "wgpu" | "webgpu" => Ok(Self::Wgpu),
+            "vulkan" => Ok(Self::Vulkan),
+            "software" | "software-rendering" | "cpu" => Ok(Self::Software),
+            "metal" => Ok(Self::Metal),
+            _ => Err(()),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default (game)",
+            Self::Translator => "OpenGL ES 1.1 to OpenGL ES 2.0 translator",
+            Self::TranslatorGLES30 => "OpenGL ES 1.1 to OpenGL ES 3.0 translator",
+            Self::GLES10 => "OpenGL ES 1.0",
+            Self::GLES11 => "OpenGL ES 1.1",
+            Self::GLES20 => "OpenGL ES 2.0",
+            Self::GLES30 => "OpenGL ES 3.0",
+            Self::Wgpu => "WGPU",
+            Self::Vulkan => "Vulkan",
+            Self::Software => "Software rendering",
+            Self::Metal => "Metal compatibility",
+        }
+    }
+}
+
+/// Which execution engine to use for ARM64 executables.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Arm64Backend {
+    Auto,
+    Jit,
+    Interpreter,
+}
+
+impl Arm64Backend {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "jit" => Ok(Self::Jit),
+            "interpreter" => Ok(Self::Interpreter),
+            _ => Err(format!(
+                "Unknown ARM64 backend {value:?}; expected auto, jit, or interpreter"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Jit => "jit",
+            Self::Interpreter => "interpreter",
+        }
+    }
+}
+
+/// What to do when the selected ARM64 backend cannot run a given slice.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Arm64Fallback {
+    Jit,
+    Interpreter,
+}
+
+impl Arm64Fallback {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "jit" => Ok(Self::Jit),
+            "interpreter" => Ok(Self::Interpreter),
+            _ => Err(format!(
+                "Unknown ARM64 fallback {value:?}; expected jit or interpreter"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jit => "jit",
+            Self::Interpreter => "interpreter",
         }
     }
 }
 
 /// Struct containing all user-configurable options.
-#[derive(Clone, Debug)]
-pub struct CorruptionOptions {
-    pub enabled: bool,
-    pub interval_frames: u32,
-    pub bytes_per_burst: u32,
-    pub max_offset: Option<u32>,
-    pub seed: u64,
-}
-
-impl Default for CorruptionOptions {
-    fn default() -> Self {
-        Self {
-            // RTCV-style corruption is strictly opt-in: only enabled via
-            // --corrupt-game (or the --corrupt-* options, which imply it).
-            // Never on by default — random guest-memory corruption is a
-            // toy/debug feature, not something you want in normal play.
-            enabled: false,
-            interval_frames: 30,
-            bytes_per_burst: 8,
-            max_offset: None,
-            seed: 0x6a09e667f3bcc909,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Options {
     pub fullscreen: bool,
-    /// Fill the host display without preserving the emulated device aspect ratio.
-    /// This is a presentation-only option; guest orientation and input geometry stay unchanged.
-    pub fullscreen_stretched: bool,
-    /// Geometry Dash music bypass (host-side audio player for FMOD MP3 streams).
-    pub gd_music_bypass: bool,
     pub device_family: Option<DeviceFamily>,
     pub auto_device_family: bool,
     /// When set, the guest sees a screen of exactly this size (in points) and
@@ -431,23 +457,17 @@ pub struct Options {
     /// `--device-family=auto` (from the host display) or via the explicit
     /// `--screen-size=WxH` override below.
     pub host_screen_size: Option<(u32, u32)>,
-    /// Disable the optional in-game Cheat Engine panel.
+    /// Disable the Cheat Engine-style memory trainer overlay. The trainer
+    /// is off by default; opt in with `--trainer`.
     pub trainer_disabled: bool,
-    pub corruption: CorruptionOptions,
-    /// Explicit custom logical screen size selected in the app picker.
-    pub custom_screen_size: Option<(u32, u32)>,
     pub initial_orientation: DeviceOrientation,
-    pub render_rotation: RenderRotation,
-    pub revert_x_axis: bool,
-    pub revert_y_axis: bool,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
-    /// Request the native Core Audio host path where it is available.
-    pub core_audio: bool,
-    pub audio_backend: AudioBackend,
-    /// Reduce decoded audio to a lower sample rate to leave more CPU time for emulation.
-    pub low_audio_quality: bool,
-    pub scale_hack: f32,
+    pub scale_hack: NonZeroU32,
+    /// `--ui-scale=N`: resolution multiplier for UIKit/Core Animation UI
+    /// (app picker, in-game UIKit HUDs). Layer bitmaps and the compositor
+    /// framebuffer are rendered at N times their point size.
+    pub ui_scale: NonZeroU32,
     pub deadzone: f32,
     pub analog_stick_tilt_controls: bool,
     pub x_tilt_range: f32,
@@ -462,42 +482,58 @@ pub struct Options {
     /// Allow selected early OpenGL ES 2.0 apps to use the GLES2 subset exposed
     /// through touchHLE's desktop OpenGL 2.1 compatibility backend.
     pub gles2_compat: bool,
-    pub graphics_api: GraphicsApi,
-    pub gles_override_version: GlesOverrideVersion,
-    pub angle_driver: bool,
-    pub log_file: bool,
-    pub fast_memory: bool,
     pub direct_memory_access: bool,
-    pub force_32_bit: bool,
-    pub force_64_bit: bool,
-    pub arm64_backend: Arm64Backend,
-    pub arm64_fallback: Arm64Fallback,
-    pub llvmpipe_fallback: bool,
-    pub metal_translator: bool,
+    /// CPU affinity policy for the emulator thread on Android
+    /// (`--affinity=`): `None` = default (big cores), or one of
+    /// `all` / `off` / `big` / an explicit CPU list like `4-7`.
+    pub affinity: Option<String>,
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
     pub print_fps: bool,
     pub fps_limit: Option<f64>,
-    pub frame_pacing: bool,
-    pub vsync: bool,
+    pub force_composition: bool,
+    pub graphics_api: GraphicsApi,
+    pub metal_translator: bool,
+    pub render_rotation: RenderRotation,
+    pub audio_backend: AudioBackend,
+    pub gles_override_version: GlesOverrideVersion,
+    pub fast_memory: bool,
+    pub high_performance: bool,
+    pub force_max_clocks: bool,
+    pub texture_filtering: TextureFiltering,
+    pub pvrtc_decoding: PvrtcDecoding,
+    pub memory_management: MemoryManagement,
+    pub angle_driver: bool,
+    pub llvmpipe_fallback: bool,
+    pub custom_driver: Option<std::path::PathBuf>,
+    pub custom_screen_size: Option<(u32, u32)>,
+    pub verbose_logging: bool,
+    /// Run the app's ARM64 slice in the 64-bit loader instead of failing.
+    pub force_64_bit: bool,
+    /// Prefer the app's 32-bit slice when both exist.
+    pub force_32_bit: bool,
+    /// Execution engine for ARM64 executables.
+    pub arm64_backend: Arm64Backend,
+    /// Execution engine fallback when the primary ARM64 backend is unavailable.
+    pub arm64_fallback: Arm64Fallback,
+    /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
+    /// environment variable (the option takes precedence).
+    pub present_mode: PresentMode,
+    /// Issue a `glFinish()` before the presented renderbuffer is copied to
+    /// the window. Only needed for drivers that don't order the copy after
+    /// the app's draws correctly; costs a GPU pipeline stall per frame.
+    /// Can also be enabled with `TOUCHHLE_PRESENT_FINISH=1`.
+    pub present_finish: bool,
+    /// See [VsyncMode]. Can also be set with the `TOUCHHLE_VSYNC` environment
+    /// variable (the option takes precedence).
+    pub vsync: VsyncMode,
     /// Android: give the emulator thread a higher scheduling priority and
     /// report its per-frame CPU time to the OS performance hint manager
     /// (ADPF), so the CPU governor keeps the core clocked for the emulated
     /// workload instead of reacting to the idle time between frames. Can be
     /// disabled with `--no-perf-hints` or `TOUCHHLE_PERF_HINTS=0`.
     pub perf_hints: bool,
-    pub battery_saver: bool,
-    pub ultra_battery_saver: bool,
-    /// Generate presentation frames up to the host display refresh rate. Disabled by default.
-    pub frame_generation: bool,
-    /// Disable emulation throttles and request the highest practical host scheduling priority.
-    pub high_performance: bool,
-    /// Ask the host platform for a best-effort maximum-performance GPU/CPU hint.
-    pub force_max_clocks: bool,
-    /// Apply a safe, visual-only accelerating corruption effect to presented frames.
-    pub rtcs: bool,
-    pub force_composition: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 2.0 context even when
     /// the app requested an OpenGL ES 1.1 context.
     ///
@@ -510,10 +546,18 @@ pub struct Options {
     /// command line. Apps that legitimately rely on the ES 1.1 fixed-function
     /// pipeline should NOT enable this flag.
     pub prefer_gles2_context: bool,
-    /// Force EAGL context creation to use GLES 1.1 when the default backend is selected.
+    /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
+    /// context even when the app requested an OpenGL ES 2.0/3.x context.
+    ///
+    /// The inverse of `--prefer-gles2-context`. Games built on engines that
+    /// support both backends (cocos2d-x 2.x: Geometry Dash, etc.) pick ES 2.0
+    /// whenever context creation succeeds, even though they also ship a fully
+    /// working ES 1.1 fixed-function path. On hosts where the ES 2.0 path
+    /// misrenders, downgrading the context to ES 1.1 makes such engines take
+    /// their ES 1.1 code path instead. Enable with `--force-gles1-context`
+    /// (per-app via the options file) or `TOUCHHLE_FORCE_GLES1_CONTEXT=1`.
+    /// Apps that are ES 2.0-only will fail to create a context with this set.
     pub force_gles1_context: bool,
-    /// Android CPU affinity policy: None uses the default big-core policy.
-    pub affinity: Option<String>,
     pub network_access: bool,
     pub popup_errors: bool,
     pub dumping_options: DumpingOptions,
@@ -539,11 +583,10 @@ pub struct Options {
     /// vendor drivers differ a lot between devices. Enable (`--gles-native`,
     /// quick option ON) to use the vendor driver instead: it behaves closest
     /// to real iPhone-era hardware (lenient GLSL ES linking etc.) and avoids
-    /// ANGLE's stricter validation, which breaks some apps' shaders. Only
-    /// meaningful on Android; ignored elsewhere.
+    /// ANGLE's stricter validation, which breaks some apps' shaders (e.g.
+    /// Gangstar's fragment-only varyings). Only meaningful on Android;
+    /// ignored elsewhere.
     pub gles_native: bool,
-    pub verbose_logging: bool,
-    pub shader_compatibility_fixes: bool,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
     /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
@@ -561,48 +604,28 @@ pub struct Options {
     /// (`level > 0`) do not trigger the fix-up so games that actually use
     /// mipmaps are unaffected.
     pub fix_texture_min_filter: bool,
-    pub software_rendering: bool,
-    pub anisotropic_filtering: u8,
-    pub texture_upscaler: u8,
-    pub texture_filtering: TextureFiltering,
-    pub pvrtc_decoding: PvrtcDecoding,
-    pub no_texture_compression: bool,
-    /// Skip guest intro/cutscene videos as fast as possible instead of
-    /// playing them (`--skip-intros`, inspired by the `-novideo` flag of
-    /// DamnWrapper32_ARMv7). The movie still goes through the full
-    /// notification lifecycle so apps that gate progress on
-    /// `MPMoviePlayerPlaybackDidFinishNotification` advance normally.
-    pub skip_intros: bool,
-    pub memory_management: MemoryManagement,
-    pub anti_aliasing: u8,
-    pub software_presentation: bool,
-    pub custom_driver: Option<PathBuf>,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
+    pub corruption: CorruptionOptions,
+    /// device (FMOD streaming bypass). Opt in with `--fix-music` or
+    /// `TOUCHHLE_GD_MUSIC_BYPASS=1`; off by default so the bypass only
+    /// affects Geometry Dash sessions where the user asked for it.
+    // TODO: flip to opt-out once track-switch/pause/reset handling is
+    // validated against a real run of the game.
+    pub gd_music_bypass: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
-            fullscreen_stretched: false,
+            trainer_disabled: true,
             device_family: None,
             auto_device_family: false,
             host_screen_size: None,
-            trainer_disabled: true,
-            corruption: CorruptionOptions::default(),
-            custom_screen_size: None,
-            gd_music_bypass: std::env::var_os("TOUCHHLE_GD_MUSIC_BYPASS")
-                .map(|value| value != "0")
-                .unwrap_or(false),
             initial_orientation: DeviceOrientation::Portrait,
-            render_rotation: RenderRotation::Default,
-            revert_x_axis: false,
-            revert_y_axis: false,
             ios_version: None,
-            core_audio: false,
-            audio_backend: AudioBackend::Default,
-            low_audio_quality: false,
-            scale_hack: 1.0,
+            scale_hack: NonZeroU32::new(1).unwrap(),
+            ui_scale: NonZeroU32::new(2).unwrap(),
             analog_stick_tilt_controls: true,
             deadzone: 0.1,
             x_tilt_range: 60.0,
@@ -615,47 +638,61 @@ impl Default for Options {
             stabilize_virtual_cursor: None,
             gles1_implementation: None,
             gles2_compat: false,
-            graphics_api: GraphicsApi::Default,
-            gles_override_version: GlesOverrideVersion::Default,
-            angle_driver: false,
-            log_file: true,
-            fast_memory: DEFAULT_FAST_MEMORY,
-            direct_memory_access: DEFAULT_FAST_MEMORY,
-            force_32_bit: false,
-            force_64_bit: false,
-            arm64_backend: Arm64Backend::Interpreter,
-            arm64_fallback: Arm64Fallback::Interpreter,
-            llvmpipe_fallback: false,
-            metal_translator: false,
+            direct_memory_access: true,
+            affinity: None,
             gdb_listen_addrs: None,
             preferred_languages: None,
             headless: false,
             print_fps: false,
-            fps_limit: None, // Follow the host display; legacy apps can still opt into a fixed cap.
-            frame_pacing: true,
-            vsync: false,
-            perf_hints: true,
-            battery_saver: false,
-            ultra_battery_saver: false,
-            frame_generation: false,
+            fps_limit: Some(60.0),
+            force_composition: false,
+            graphics_api: GraphicsApi::Default,
+            metal_translator: false,
+            render_rotation: RenderRotation::default(),
+            audio_backend: AudioBackend::Default,
+            gles_override_version: GlesOverrideVersion::Default,
+            fast_memory: DEFAULT_FAST_MEMORY,
             high_performance: DEFAULT_HIGH_PERFORMANCE,
             force_max_clocks: DEFAULT_FORCE_MAX_CLOCKS,
-            rtcs: false,
-            force_composition: false,
+            texture_filtering: TextureFiltering::Default,
+            pvrtc_decoding: PvrtcDecoding::default(),
+            memory_management: MemoryManagement::Balanced,
+            angle_driver: false,
+            llvmpipe_fallback: false,
+            custom_driver: None,
+            custom_screen_size: None,
+            verbose_logging: false,
+            force_64_bit: false,
+            force_32_bit: false,
+            arm64_backend: Arm64Backend::Interpreter,
+            arm64_fallback: Arm64Fallback::Interpreter,
+            present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
+                .ok()
+                .and_then(|value| PresentMode::from_short_name(value.trim()).ok())
+                .unwrap_or(PresentMode::Auto),
+            present_finish: std::env::var_os("TOUCHHLE_PRESENT_FINISH")
+                .map(|value| value != "0")
+                .unwrap_or(false),
+            vsync: std::env::var("TOUCHHLE_VSYNC")
+                .ok()
+                .and_then(|value| VsyncMode::from_short_name(value.trim()).ok())
+                .unwrap_or(VsyncMode::Auto),
+            perf_hints: std::env::var_os("TOUCHHLE_PERF_HINTS")
+                .map(|value| value != "0")
+                .unwrap_or(true),
             prefer_gles2_context: false,
-            force_gles1_context: false,
-            affinity: None,
+            force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
+                .map(|value| {
+                    let value = value.trim();
+                    value != "0" && !value.is_empty()
+                })
+                .unwrap_or(false),
             network_access: false,
             popup_errors: true,
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
-            // On by default: guest GLES calls that would otherwise silently
-            // swallow a GL error get logged with the host call site instead.
-            // Turn off with --disable-trace-gl-errors.
-            trace_gl_errors: true,
-            verbose_logging: false,
-            shader_compatibility_fixes: true,
+            trace_gl_errors: false,
             verbose_gles: false,
             gles_native: false,
             // On Android the host GLES driver is essentially always
@@ -677,18 +714,11 @@ impl Default for Options {
             // historically lenient) we leave it off so we don't change
             // pixel output for the common case.
             fix_texture_min_filter: cfg!(target_os = "android"),
-            skip_intros: false,
-            software_rendering: false,
-            anisotropic_filtering: 1,
-            texture_upscaler: 1,
-            texture_filtering: TextureFiltering::Default,
-            pvrtc_decoding: PvrtcDecoding::default(),
-            no_texture_compression: false,
-            memory_management: MemoryManagement::Balanced,
-            anti_aliasing: 1,
-            software_presentation: false,
-            custom_driver: None,
             zero_stack_after_guest_to_host_call: None,
+            corruption: CorruptionOptions::default(),
+            gd_music_bypass: std::env::var_os("TOUCHHLE_GD_MUSIC_BYPASS")
+                .map(|value| value != "0")
+                .unwrap_or(false),
         }
     }
 }
@@ -707,70 +737,17 @@ impl Options {
             }
             Ok(arg)
         }
-        fn parse_quality(arg: &str, name: &str, allowed: &[u8]) -> Result<u8, String> {
-            let value = arg.parse::<u8>().unwrap_or(0);
-            if allowed.contains(&value) {
-                Ok(value)
-            } else {
-                Err(format!("Invalid value for {name}"))
-            }
-        }
 
-        if arg == "--trainer" {
-            self.trainer_disabled = false;
-        } else if arg == "--no-trainer" {
-            self.trainer_disabled = true;
-        } else if arg == "--corrupt-game" {
-            self.corruption.enabled = true;
-        } else if arg == "--no-corrupt-game" {
-            self.corruption.enabled = false;
-        } else if let Some(value) = arg.strip_prefix("--corrupt-interval=") {
-            let frames: u32 = value
-                .parse()
-                .ok()
-                .filter(|&v| v > 0)
-                .ok_or_else(|| "Invalid value for --corrupt-interval= (must be > 0)".to_string())?;
-            self.corruption.enabled = true;
-            self.corruption.interval_frames = frames;
-        } else if let Some(value) = arg.strip_prefix("--corrupt-intensity=") {
-            let bytes: u32 = value
-                .parse()
-                .ok()
-                .filter(|&v| v > 0)
-                .ok_or_else(|| {
-                    "Invalid value for --corrupt-intensity= (must be > 0)".to_string()
-                })?;
-            self.corruption.enabled = true;
-            self.corruption.bytes_per_burst = bytes;
-        } else if let Some(value) = arg.strip_prefix("--corrupt-seed=") {
-            let seed: u64 = value
-                .parse()
-                .map_err(|_| "Invalid value for --corrupt-seed=".to_string())?;
-            self.corruption.enabled = true;
-            self.corruption.seed = seed;
-        } else if let Some(value) = arg.strip_prefix("--corrupt-max-offset=") {
-            let off: u32 = value
-                .parse()
-                .map_err(|_| "Invalid value for --corrupt-max-offset=".to_string())?;
-            self.corruption.enabled = true;
-            self.corruption.max_offset = Some(off);
-        } else if arg == "--fullscreen" {
+        if arg == "--fullscreen" {
             self.fullscreen = true;
         } else if arg == "--fix-music" {
             self.gd_music_bypass = true;
-        } else if arg == "--fullscreen-stretched" {
-            self.fullscreen = true;
-            self.fullscreen_stretched = true;
-        } else if arg == "--disable-fullscreen-stretched" {
-            self.fullscreen_stretched = false;
         } else if arg == "--landscape-left" {
             self.initial_orientation = DeviceOrientation::LandscapeLeft;
         } else if arg == "--landscape-right" {
             self.initial_orientation = DeviceOrientation::LandscapeRight;
         } else if arg == "--upside-down" {
             self.initial_orientation = DeviceOrientation::PortraitUpsideDown;
-        } else if let Some(value) = arg.strip_prefix("--render-rotation=") {
-            self.render_rotation = RenderRotation::parse(value)?;
         } else if let Some(value) = arg.strip_prefix("--device-family=") {
             if value == "auto" {
                 self.auto_device_family = true;
@@ -802,22 +779,6 @@ impl Options {
                 return Err("Invalid value for --ios-version=".to_string());
             }
             self.ios_version = Some((major, minor, patch));
-        } else if arg == "--core-audio" {
-            self.core_audio = true;
-            self.audio_backend = AudioBackend::CoreAudio;
-        } else if arg == "--disable-core-audio" {
-            self.core_audio = false;
-            if self.audio_backend == AudioBackend::CoreAudio {
-                self.audio_backend = AudioBackend::Default;
-            }
-        } else if let Some(value) = arg.strip_prefix("--audio-backend=") {
-            let backend = AudioBackend::parse(value)?;
-            self.core_audio = backend == AudioBackend::CoreAudio;
-            self.audio_backend = backend;
-        } else if arg == "--low-audio-quality" || arg == "--low-audio-quality=on" {
-            self.low_audio_quality = true;
-        } else if arg == "--disable-low-audio-quality" || arg == "--low-audio-quality=off" {
-            self.low_audio_quality = false;
         } else if let Some(value) = arg.strip_prefix("--screen-size=") {
             let (w, h) = value
                 .split_once(|c| c == 'x' || c == 'X' || c == ',')
@@ -834,34 +795,14 @@ impl Options {
                 return Err("--screen-size= dimensions must be non-zero".to_string());
             }
             self.host_screen_size = Some((w, h));
-        } else if let Some(value) = arg.strip_prefix("--custom-resolution=") {
-            let (w, h) = value
-                .split_once(|c| c == 'x' || c == 'X' || c == ',')
-                .ok_or_else(|| "--custom-resolution= requires WIDTHxHEIGHT".to_string())?;
-            let w: u32 = w
-                .trim()
-                .parse()
-                .map_err(|_| "Invalid width for --custom-resolution=".to_string())?;
-            let h: u32 = h
-                .trim()
-                .parse()
-                .map_err(|_| "Invalid height for --custom-resolution=".to_string())?;
-            if !(64..=16384).contains(&w) || !(64..=16384).contains(&h) {
-                return Err(
-                    "--custom-resolution= dimensions must be between 64 and 16384".to_string(),
-                );
-            }
-            self.custom_screen_size = Some((w, h));
-            self.host_screen_size = Some((w, h));
-        } else if arg == "--clear-custom-resolution" {
-            self.custom_screen_size = None;
-            self.host_screen_size = None;
         } else if let Some(value) = arg.strip_prefix("--scale-hack=") {
             self.scale_hack = value
-                .parse::<f32>()
-                .ok()
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .ok_or_else(|| "Invalid scale hack factor".to_string())?;
+                .parse()
+                .map_err(|_| "Invalid scale hack factor".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--ui-scale=") {
+            self.ui_scale = value
+                .parse()
+                .map_err(|_| "Invalid UI scale factor".to_string())?;
         } else if arg == "--disable-analog-stick-tilt-controls" {
             self.analog_stick_tilt_controls = false;
         } else if let Some(value) = arg.strip_prefix("--deadzone=") {
@@ -947,79 +888,10 @@ impl Options {
             );
         } else if arg == "--gles2-compat" {
             self.gles2_compat = true;
-        } else if arg == "--software-rendering" {
-            self.software_rendering = true;
-            self.software_presentation = true;
-        } else if arg == "--disable-software-rendering" {
-            self.software_rendering = false;
-            self.software_presentation = false;
-        } else if let Some(value) = arg.strip_prefix("--custom-driver=") {
-            let value = value.trim();
-            if value.is_empty()
-                || value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("none")
-            {
-                self.custom_driver = None;
-            } else {
-                self.custom_driver = Some(PathBuf::from(value));
-            }
-        } else if arg == "--disable-custom-driver" {
-            self.custom_driver = None;
-        } else if let Some(value) = arg.strip_prefix("--anisotropic-filtering=") {
-            self.anisotropic_filtering =
-                parse_quality(value, "--anisotropic-filtering=", &[1, 2, 4, 8, 16])?;
-        } else if let Some(value) = arg.strip_prefix("--texture-upscaler=") {
-            self.texture_upscaler = parse_quality(value, "--texture-upscaler=", &[1, 2, 3, 4])?;
-        } else if let Some(value) = arg.strip_prefix("--texture-filtering=") {
-            self.texture_filtering = TextureFiltering::parse(value)?;
-        } else if let Some(value) = arg.strip_prefix("--pvrtc-decoding=") {
-            self.pvrtc_decoding = PvrtcDecoding::parse(value)?;
-        } else if arg == "--no-texture-compression" {
-            self.no_texture_compression = true;
-        } else if arg == "--allow-texture-compression" {
-            self.no_texture_compression = false;
-        } else if arg == "--skip-intros" || arg == "--novideo" {
-            self.skip_intros = true;
-        } else if arg == "--no-skip-intros" {
-            self.skip_intros = false;
-        } else if let Some(value) = arg.strip_prefix("--memory-management=") {
-            self.memory_management = MemoryManagement::parse(value)?;
-        } else if let Some(value) = arg.strip_prefix("--anti-aliasing=") {
-            self.anti_aliasing = parse_quality(value, "--anti-aliasing=", &[1, 2, 4, 8])?;
-        } else if let Some(value) = arg.strip_prefix("--gles-override=") {
-            let override_version = GlesOverrideVersion::parse(value)?;
-            self.gles_override_version = override_version;
-            if override_version != GlesOverrideVersion::Default {
-                self.graphics_api = override_version.graphics_api();
-            }
-        } else if let Some(value) = arg.strip_prefix("--graphics-api=") {
-            let api = GraphicsApi::from_short_name(value)
-                .map_err(|_| "Unrecognized --graphics-api= value".to_string())?;
-            self.graphics_api = api;
-            if api == GraphicsApi::Software {
-                self.software_rendering = true;
-                self.software_presentation = true;
-            }
-        } else if let Some(value) = arg.strip_prefix("--gles-override-version=") {
-            let override_version = GlesOverrideVersion::parse(value)?;
-            self.gles_override_version = override_version;
-            if override_version != GlesOverrideVersion::Default {
-                self.graphics_api = override_version.graphics_api();
-            }
-        } else if arg == "--angle-driver" {
-            self.angle_driver = true;
-        } else if arg == "--disable-angle-driver" {
-            self.angle_driver = false;
-        } else if arg == "--disable-log-file" {
-            self.log_file = false;
-        } else if arg == "--enable-log-file" {
-            self.log_file = true;
+        } else if let Some(value) = arg.strip_prefix("--affinity=") {
+            self.affinity = Some(value.to_string());
         } else if arg == "--disable-direct-memory-access" {
-            self.fast_memory = false;
             self.direct_memory_access = false;
-        } else if arg == "--enable-direct-memory-access" {
-            self.fast_memory = true;
-            self.direct_memory_access = true;
         } else if let Some(address) = arg.strip_prefix("--gdb=") {
             let addrs = address
                 .to_socket_addrs()
@@ -1034,48 +906,6 @@ impl Options {
             self.popup_errors = false;
         } else if arg == "--print-fps" {
             self.print_fps = true;
-        } else if arg == "--enable-frame-pacing" {
-            self.frame_pacing = true;
-        } else if arg == "--disable-frame-pacing" {
-            self.frame_pacing = false;
-        } else if arg == "--vsync" || arg == "--vsync=on" {
-            self.vsync = true;
-        } else if arg == "--disable-vsync" || arg == "--vsync=off" {
-            self.vsync = false;
-        } else if arg == "--battery-saver" || arg == "--battery-saver=on" {
-            self.battery_saver = true;
-            self.high_performance = false;
-            self.force_max_clocks = false;
-        } else if arg == "--disable-battery-saver" || arg == "--battery-saver=off" {
-            self.battery_saver = false;
-            self.ultra_battery_saver = false;
-        } else if arg == "--ultra-battery-saver" || arg == "--ultra-battery-saver=on" {
-            self.ultra_battery_saver = true;
-            self.battery_saver = true;
-            self.high_performance = false;
-            self.force_max_clocks = false;
-        } else if arg == "--disable-ultra-battery-saver" || arg == "--ultra-battery-saver=off" {
-            self.ultra_battery_saver = false;
-        } else if arg == "--frame-generation" || arg == "--frame-generation=on" {
-            self.frame_generation = true;
-        } else if arg == "--disable-frame-generation" || arg == "--frame-generation=off" {
-            self.frame_generation = false;
-        } else if arg == "--high-performance" || arg == "--high-performance=on" {
-            self.high_performance = true;
-            self.battery_saver = false;
-            self.ultra_battery_saver = false;
-        } else if arg == "--disable-high-performance" || arg == "--high-performance=off" {
-            self.high_performance = false;
-            self.force_max_clocks = false;
-        } else if arg == "--force-max-clocks" || arg == "--force-max-clocks=on" {
-            self.high_performance = true;
-            self.force_max_clocks = true;
-        } else if arg == "--disable-force-max-clocks" || arg == "--force-max-clocks=off" {
-            self.force_max_clocks = false;
-        } else if arg == "--rtcs" || arg == "--rtcs=on" {
-            self.rtcs = true;
-        } else if arg == "--disable-rtcs" || arg == "--rtcs=off" {
-            self.rtcs = false;
         } else if let Some(value) = arg.strip_prefix("--fps-limit=") {
             if value == "off" {
                 self.fps_limit = None;
@@ -1089,8 +919,65 @@ impl Options {
             }
         } else if arg == "--force-composition" {
             self.force_composition = true;
-        } else if arg == "--disable-force-composition" {
-            self.force_composition = false;
+        } else if let Some(value) = arg.strip_prefix("--graphics-api=") {
+            let api = GraphicsApi::from_short_name(value)
+                .map_err(|_| "Unrecognized --graphics-api= value".to_string())?;
+            self.graphics_api = api;
+        } else if let Some(value) = arg.strip_prefix("--render-rotation=") {
+            self.render_rotation = RenderRotation::parse(value)?;
+        } else if arg == "--metal-translator" {
+            self.metal_translator = true;
+        } else if let Some(value) = arg.strip_prefix("--render-rotation=") {
+            self.render_rotation = RenderRotation::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--gles-override=") {
+            self.gles_override_version = GlesOverrideVersion::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--audio-backend=") {
+            self.audio_backend = AudioBackend::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--texture-filtering=") {
+            self.texture_filtering = TextureFiltering::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--pvrtc-decoding=") {
+            self.pvrtc_decoding = PvrtcDecoding::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--memory-management=") {
+            self.memory_management = MemoryManagement::parse(value)?;
+        } else if arg == "--high-performance" {
+            self.high_performance = true;
+        } else if arg == "--no-high-performance" {
+            self.high_performance = false;
+        } else if arg == "--force-max-clocks" {
+            self.force_max_clocks = true;
+        } else if arg == "--no-force-max-clocks" {
+            self.force_max_clocks = false;
+        } else if arg == "--fast-memory" {
+            self.fast_memory = true;
+        } else if arg == "--no-fast-memory" {
+            self.fast_memory = false;
+        } else if arg == "--angle-driver" {
+            self.angle_driver = true;
+        } else if arg == "--llvmpipe-fallback" {
+            self.llvmpipe_fallback = true;
+        } else if let Some(value) = arg.strip_prefix("--custom-driver=") {
+            self.custom_driver = Some(std::path::PathBuf::from(value));
+        } else if arg == "--disable-metal-translator" {
+            self.metal_translator = false;
+        } else if let Some(value) = arg.strip_prefix("--custom-resolution=") {
+            let (w, h) = value
+                .split_once('x')
+                .and_then(|(w, h)| {
+                    Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+                })
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .ok_or_else(|| {
+                    "Invalid value for --custom-resolution= (expected WIDTHxHEIGHT)".to_string()
+                })?;
+            self.custom_screen_size = Some((w, h));
+            self.host_screen_size = Some((w, h));
+        } else if arg == "--clear-custom-resolution" {
+            self.custom_screen_size = None;
+            self.host_screen_size = None;
+        } else if arg == "--verbose-logging" {
+            self.verbose_logging = true;
+        } else if arg == "--no-verbose-logging" {
+            self.verbose_logging = false;
         } else if arg == "--force-32-bit" {
             self.force_32_bit = true;
             self.force_64_bit = false;
@@ -1105,30 +992,34 @@ impl Options {
             self.arm64_backend = Arm64Backend::parse(value)?;
         } else if let Some(value) = arg.strip_prefix("--arm64-fallback=") {
             self.arm64_fallback = Arm64Fallback::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--present-mode=") {
+            self.present_mode = PresentMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --present-mode= (expected auto, direct or readback)".to_string()
+            })?;
+        } else if arg == "--present-finish" {
+            self.present_finish = true;
+        } else if arg == "--no-present-finish" {
+            self.present_finish = false;
+        } else if let Some(value) = arg.strip_prefix("--vsync=") {
+            self.vsync = VsyncMode::from_short_name(value)
+                .map_err(|_| "Invalid value for --vsync= (expected auto, on or off)".to_string())?;
+        } else if arg == "--vsync" {
+            self.vsync = VsyncMode::On;
+        } else if arg == "--no-vsync" {
+            self.vsync = VsyncMode::Off;
         } else if arg == "--perf-hints" {
             self.perf_hints = true;
         } else if arg == "--no-perf-hints" {
             self.perf_hints = false;
-        } else if arg == "--llvmpipe-fallback" {
-            self.llvmpipe_fallback = true;
-        } else if arg == "--disable-llvmpipe-fallback" {
-            self.llvmpipe_fallback = false;
-        } else if arg == "--metal-translator" {
-            self.metal_translator = true;
-        } else if arg == "--disable-metal-translator" {
-            self.metal_translator = false;
+        } else if arg == "--prefer-gles2-context" {
             self.prefer_gles2_context = true;
         } else if arg == "--force-gles1-context" {
             self.force_gles1_context = true;
-        } else if let Some(value) = arg.strip_prefix("--affinity=") {
-            if !matches!(value, "big" | "all" | "off") && parse_cpu_list(value).is_empty() {
-                return Err(format!("Invalid CPU affinity policy {value:?}"));
-            }
-            self.affinity = Some(value.to_string());
+            // GLES-native backend selection and EAGL both read this env var
+            // (the GLES backend layer has no `Options` access).
+            std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
         } else if arg == "--allow-network-access" {
             self.network_access = true;
-        } else if arg == "--disable-network-access" {
-            self.network_access = false;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
         } else if let Some(values) = arg.strip_prefix("--dump=") {
@@ -1139,86 +1030,64 @@ impl Options {
             self.ignore_gl_errors = true;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
-        } else if arg == "--disable-trace-gl-errors" {
-            self.trace_gl_errors = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
         } else if arg == "--gles-native" {
             self.gles_native = true;
         } else if arg == "--no-gles-native" {
             self.gles_native = false;
-        } else if arg == "--verbose-logging" {
-            self.verbose_logging = true;
-        } else if arg == "--disable-verbose-logging" {
-            self.verbose_logging = false;
-        } else if arg == "--shader-compatibility-fixes" {
-            self.shader_compatibility_fixes = true;
-        } else if arg == "--disable-shader-compatibility-fixes" {
-            self.shader_compatibility_fixes = false;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
+            // GLES1Native reads this as its source of truth (it has no
+            // `Options` access from inside the GL call path).
+            std::env::set_var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER", "1");
         } else if arg == "--no-fix-texture-min-filter" {
+            // Off-switch for the Android default. Useful when an iOS
+            // title actually relies on mipmap minification and the
+            // forced `GL_LINEAR` would visibly degrade quality.
             self.fix_texture_min_filter = false;
+            std::env::set_var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER", "0");
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
             self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
             })?);
-        } else if arg == "--revert-x-axis" {
-            self.revert_x_axis = true;
-        } else if arg == "--disable-revert-x-axis" {
-            self.revert_x_axis = false;
-        } else if arg == "--revert-y-axis" {
-            self.revert_y_axis = true;
-        } else if arg == "--disable-revert-y-axis" {
-            self.revert_y_axis = false;
+        } else if arg == "--corrupt-game" {
+            self.corruption.enabled = true;
+        } else if arg == "--no-corrupt-game" {
+            self.corruption.enabled = false;
+        } else if arg == "--no-trainer" {
+            self.trainer_disabled = true;
+        } else if arg == "--trainer" {
+            self.trainer_disabled = false;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-interval=") {
+            let frames: u32 =
+                value.parse().ok().filter(|&v| v > 0).ok_or_else(|| {
+                    "Invalid value for --corrupt-interval= (must be > 0)".to_string()
+                })?;
+            self.corruption.enabled = true;
+            self.corruption.interval_frames = frames;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-intensity=") {
+            let bytes: u32 = value.parse().ok().filter(|&v| v > 0).ok_or_else(|| {
+                "Invalid value for --corrupt-intensity= (must be > 0)".to_string()
+            })?;
+            self.corruption.enabled = true;
+            self.corruption.bytes_per_burst = bytes;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-seed=") {
+            let seed: u64 = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-seed=".to_string())?;
+            self.corruption.enabled = true;
+            self.corruption.seed = seed;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-max-offset=") {
+            let off: u32 = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-max-offset=".to_string())?;
+            self.corruption.enabled = true;
+            self.corruption.max_offset = Some(off);
         } else {
             return Ok(false);
         };
         Ok(true)
-    }
-
-    pub fn effective_fps_limit(&self, display_rate: f64) -> f64 {
-        let configured = self.fps_limit.unwrap_or(display_rate).max(1.0);
-        let configured = if self.vsync {
-            configured.min(display_rate.max(1.0))
-        } else {
-            configured
-        };
-        if self.ultra_battery_saver {
-            configured.min(10.0)
-        } else if self.battery_saver {
-            configured.min(24.0)
-        } else {
-            configured
-        }
-    }
-
-    pub fn frame_pacing_enabled(&self) -> bool {
-        !self.high_performance
-            && (self.frame_pacing || self.vsync || self.battery_saver || self.ultra_battery_saver)
-    }
-
-    pub fn apply_power_profile(&mut self, display_rate: f64) {
-        if self.ultra_battery_saver {
-            self.high_performance = false;
-            self.force_max_clocks = false;
-        } else if self.high_performance {
-            self.battery_saver = false;
-            self.ultra_battery_saver = false;
-            self.vsync = false;
-            self.frame_pacing = false;
-            self.fps_limit = None;
-            return;
-        } else {
-            return;
-        }
-        self.battery_saver = true;
-        self.fps_limit = Some(self.effective_fps_limit(display_rate));
-        self.frame_generation = false;
-        self.anisotropic_filtering = 1;
-        self.texture_upscaler = 1;
-        self.anti_aliasing = 1;
-        self.memory_management = MemoryManagement::Light;
     }
 }
 
@@ -1292,307 +1161,4 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
         }
     }
     Ok(dumping_options)
-}
-
-pub(crate) fn parse_cpu_list(value: &str) -> Vec<usize> {
-    const MAX_CPU_INDEX: usize = 1024;
-    let mut cpus = Vec::new();
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((start, end)) = part.split_once('-') {
-            let (Ok(start), Ok(end)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>())
-            else {
-                continue;
-            };
-            if start <= end && end < MAX_CPU_INDEX {
-                cpus.extend(start..=end);
-            }
-        } else if let Ok(cpu) = part.parse::<usize>() {
-            if cpu < MAX_CPU_INDEX {
-                cpus.push(cpu);
-            }
-        }
-    }
-    cpus.sort_unstable();
-    cpus.dedup();
-    cpus
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn high_performance_disables_frame_throttling() {
-        let mut options = Options::default();
-        options.parse_argument("--high-performance").unwrap();
-        assert!(options.high_performance);
-        options.frame_pacing = true;
-        options.vsync = true;
-        options.fps_limit = Some(30.0);
-        options.apply_power_profile(60.0);
-        assert!(!options.frame_pacing_enabled());
-        assert!(!options.vsync);
-        assert_eq!(options.fps_limit, None);
-    }
-
-    #[test]
-    fn parses_software_graphics_and_pvrtc_modes() {
-        assert_eq!(PvrtcDecoding::default(), PvrtcDecoding::Software);
-        let mut options = Options::default();
-        options.parse_argument("--graphics-api=software").unwrap();
-        assert_eq!(options.graphics_api, GraphicsApi::Software);
-        assert!(options.software_rendering);
-        assert!(options.software_presentation);
-
-        options.parse_argument("--pvrtc-decoding=driver").unwrap();
-        assert_eq!(options.pvrtc_decoding, PvrtcDecoding::Driver);
-        options.parse_argument("--pvrtc-decoding=software").unwrap();
-        assert_eq!(options.pvrtc_decoding, PvrtcDecoding::Software);
-    }
-
-    #[test]
-    fn force_max_clocks_implies_high_performance() {
-        let mut options = Options::default();
-        options.parse_argument("--force-max-clocks").unwrap();
-        assert!(options.high_performance);
-        assert!(options.force_max_clocks);
-    }
-
-    #[test]
-    fn interpreter_is_the_arm64_default() {
-        assert_eq!(Options::default().arm64_backend, Arm64Backend::Interpreter);
-    }
-
-    #[test]
-    fn parses_render_rotation_values_without_changing_orientation() {
-        let values = [
-            ("default", RenderRotation::Default),
-            ("-90", RenderRotation::Minus90),
-            ("-180°", RenderRotation::Minus180),
-            ("90", RenderRotation::Plus90),
-            ("180°", RenderRotation::Plus180),
-        ];
-        for (value, expected) in values {
-            let mut options = Options::default();
-            assert!(options
-                .parse_argument(&format!("--render-rotation={value}"))
-                .unwrap());
-            assert_eq!(options.render_rotation, expected);
-            assert_eq!(options.initial_orientation, DeviceOrientation::Portrait);
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_render_rotation_values() {
-        let mut options = Options::default();
-        let error = options.parse_argument("--render-rotation=45").unwrap_err();
-        assert!(error.contains("render rotation"));
-    }
-
-    #[test]
-    fn parses_shader_compatibility_switch() {
-        let mut options = Options::default();
-        assert!(options.shader_compatibility_fixes);
-        options
-            .parse_argument("--disable-shader-compatibility-fixes")
-            .unwrap();
-        assert!(!options.shader_compatibility_fixes);
-        options
-            .parse_argument("--shader-compatibility-fixes")
-            .unwrap();
-        assert!(options.shader_compatibility_fixes);
-    }
-
-    #[test]
-    fn parses_texture_quality_settings() {
-        let mut options = Options::default();
-        options
-            .parse_argument("--texture-filtering=trilinear")
-            .unwrap();
-        options.parse_argument("--memory-management=light").unwrap();
-        assert_eq!(options.texture_filtering, TextureFiltering::Trilinear);
-        assert_eq!(options.memory_management, MemoryManagement::Light);
-    }
-
-    #[test]
-    fn parses_low_audio_quality_switch() {
-        let mut options = Options::default();
-        assert!(!options.low_audio_quality);
-        options.parse_argument("--low-audio-quality").unwrap();
-        assert!(options.low_audio_quality);
-        options
-            .parse_argument("--disable-low-audio-quality")
-            .unwrap();
-        assert!(!options.low_audio_quality);
-    }
-
-    #[test]
-    fn fullscreen_stretched_is_presentation_only() {
-        let mut options = Options::default();
-        assert!(!options.fullscreen_stretched);
-        options.parse_argument("--fullscreen-stretched").unwrap();
-        assert!(options.fullscreen);
-        assert!(options.fullscreen_stretched);
-        options
-            .parse_argument("--disable-fullscreen-stretched")
-            .unwrap();
-        assert!(!options.fullscreen_stretched);
-    }
-
-    #[test]
-    fn metal_translator_defaults_to_off() {
-        assert!(!Options::default().metal_translator);
-    }
-
-    #[test]
-    fn ultra_battery_saver_caps_fps_and_enables_pacing() {
-        let mut options = Options::default();
-        assert!(!options.ultra_battery_saver);
-        options.parse_argument("--ultra-battery-saver").unwrap();
-        assert!(options.ultra_battery_saver);
-        assert!(options.battery_saver);
-        assert!(options.frame_pacing_enabled());
-        assert_eq!(options.effective_fps_limit(120.0), 10.0);
-        options
-            .parse_argument("--disable-ultra-battery-saver")
-            .unwrap();
-        assert!(!options.ultra_battery_saver);
-        assert_eq!(options.effective_fps_limit(120.0), 24.0);
-    }
-
-    #[test]
-    fn vsync_caps_fps_to_display_rate() {
-        let mut options = Options::default();
-        options.vsync = true;
-        options.fps_limit = Some(120.0);
-        assert_eq!(options.effective_fps_limit(60.0), 60.0);
-    }
-
-    #[test]
-    fn ultra_battery_saver_enforces_low_power_profile() {
-        let mut options = Options::default();
-        options.frame_generation = true;
-        options.anisotropic_filtering = 16;
-        options.texture_upscaler = 4;
-        options.anti_aliasing = 8;
-        options.memory_management = MemoryManagement::Aggressive;
-        options.ultra_battery_saver = true;
-        options.apply_power_profile(120.0);
-        assert_eq!(options.fps_limit, Some(10.0));
-        assert!(options.battery_saver);
-        assert!(!options.frame_generation);
-        assert_eq!(options.anisotropic_filtering, 1);
-        assert_eq!(options.texture_upscaler, 1);
-        assert_eq!(options.anti_aliasing, 1);
-        assert_eq!(options.memory_management, MemoryManagement::Light);
-    }
-
-    #[test]
-    fn defaults_enable_requested_native_compatibility_modes() {
-        let options = Options::default();
-        assert_eq!(options.graphics_api, GraphicsApi::Default);
-        assert!(options.high_performance);
-        assert!(options.force_max_clocks);
-        assert!(options.fast_memory);
-        assert!(options.direct_memory_access);
-        assert!(!options.force_composition);
-        assert!(!options.network_access);
-        assert_eq!(options.metal_translator, cfg!(target_arch = "aarch64"));
-    }
-
-    #[test]
-    fn high_performance_keeps_frame_generation_opt_in() {
-        let mut options = Options::default();
-        options.frame_generation = true;
-        options.apply_power_profile(60.0);
-        assert!(options.frame_generation);
-        assert!(!options.frame_pacing);
-        assert_eq!(options.fps_limit, None);
-    }
-
-    #[test]
-    fn software_graphics_api_selects_cpu_rendering() {
-        let mut options = Options::default();
-        options.parse_argument("--graphics-api=software").unwrap();
-        assert_eq!(options.graphics_api, GraphicsApi::Software);
-        assert!(!options.force_composition);
-    }
-
-    #[test]
-    fn force_gles1_context_is_opt_in() {
-        let mut options = Options::default();
-        assert!(!options.force_gles1_context);
-        options.parse_argument("--force-gles1-context").unwrap();
-        assert!(options.force_gles1_context);
-    }
-
-    #[test]
-    fn affinity_policy_accepts_named_modes_and_cpu_lists() {
-        let mut options = Options::default();
-        assert_eq!(options.affinity, None);
-        options.parse_argument("--affinity=4-7,6").unwrap();
-        assert_eq!(options.affinity.as_deref(), Some("4-7,6"));
-        assert_eq!(parse_cpu_list("4-7,6"), vec![4, 5, 6, 7]);
-        assert!(options.parse_argument("--affinity=7-4").is_err());
-    }
-
-    #[test]
-    fn gles_override_selects_a_real_graphics_path() {
-        let mut options = Options::default();
-        options.parse_argument("--gles-override=gles2").unwrap();
-        assert_eq!(options.gles_override_version, GlesOverrideVersion::Gles20);
-        assert_eq!(options.graphics_api, GraphicsApi::GLES20);
-        options.parse_argument("--graphics-api=vulkan").unwrap();
-        assert_eq!(options.graphics_api, GraphicsApi::Vulkan);
-    }
-
-    #[test]
-    fn ultra_battery_saver_caps_fps_and_disables_optional_work() {
-        let mut options = Options::default();
-        options.frame_generation = true;
-        options.anisotropic_filtering = 16;
-        options.texture_upscaler = 4;
-        options.anti_aliasing = 8;
-        options.memory_management = MemoryManagement::Aggressive;
-        options.parse_argument("--ultra-battery-saver").unwrap();
-        options.apply_power_profile(120.0);
-
-        assert!(options.ultra_battery_saver);
-        assert!(options.battery_saver);
-        assert_eq!(options.effective_fps_limit(120.0), 10.0);
-        assert!(!options.frame_generation);
-        assert_eq!(options.anisotropic_filtering, 1);
-        assert_eq!(options.texture_upscaler, 1);
-        assert_eq!(options.anti_aliasing, 1);
-        assert_eq!(options.memory_management, MemoryManagement::Light);
-    }
-
-    #[test]
-    fn device_family_defaults_to_no_command_line_override() {
-        assert!(Options::default().device_family.is_none());
-        assert!(!Options::default().auto_device_family);
-    }
-
-    #[test]
-    fn accepts_legacy_compact_device_family_names() {
-        let mut options = Options::default();
-        options.parse_argument("--device-family=iphone5").unwrap();
-        assert_eq!(options.device_family, Some(DeviceFamily::iPhone5));
-        options.parse_argument("--device-family=ipad2").unwrap();
-        assert_eq!(options.device_family, Some(DeviceFamily::iPad2));
-    }
-
-    #[test]
-    fn cheat_engine_is_disabled_by_default_and_has_explicit_flags() {
-        let mut options = Options::default();
-        assert!(options.trainer_disabled);
-        options.parse_argument("--trainer").unwrap();
-        assert!(!options.trainer_disabled);
-        options.parse_argument("--no-trainer").unwrap();
-        assert!(options.trainer_disabled);
-    }
 }

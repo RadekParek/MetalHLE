@@ -29,12 +29,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Number of touch-down diagnostics to print at `log!` level (always visible)
 /// before going quiet. Helps diagnose "game ignores taps" reports without
 /// requiring the user to enable debug logging.
-static TOUCH_DIAGS_LEFT: AtomicUsize = AtomicUsize::new(12);
 
 /// Number of touch-end summaries to print at `log!` level. Shows how many
 /// Moved events reached the view and the total displacement, which
 /// distinguishes "host lost the moves" from "game ignored a complete gesture".
-static TOUCH_END_DIAGS_LEFT: AtomicUsize = AtomicUsize::new(12);
 
 /// Number of warnings for Move/Up events naming an untracked finger (its Down
 /// never arrived). Proof of lost Downs in "swipes randomly dead" reports.
@@ -223,8 +221,7 @@ fn touchhle_should_use_landscape_touch_remap_for_bundle(
     match bundle_id {
         "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => true,
         "at.source.tomzom" => false,
-        // UIKit already returns the landscape coordinates used by the game's
-        // 480x320 view (HyperHLE 44a1a109).
+        // UIKit already returns the landscape coordinates used by the game's 480x320 view.
         "com.saban.powerrangersbash" => manual_override,
         _ => manual_override,
     }
@@ -235,6 +232,14 @@ fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
         env.bundle.bundle_identifier(),
         touchhle_manual_landscape_touch_remap_enabled(),
     )
+}
+
+fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool {
+    if view == nil || !touchhle_should_use_landscape_touch_remap(env) {
+        return false;
+    }
+    let class_name = touchhle_cocos_view_class_name(env, view);
+    touchhle_cocos_is_gl_or_game_view_name(&class_name)
 }
 
 #[cfg(test)]
@@ -260,18 +265,6 @@ mod landscape_touch_remap_tests {
             true
         ));
     }
-}
-
-fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool {
-    if !touchhle_should_use_landscape_touch_remap(env) {
-        return false;
-    }
-
-    if view == nil {
-        return false;
-    }
-    let class_name = touchhle_cocos_view_class_name(env, view);
-    touchhle_cocos_is_gl_or_game_view_name(&class_name)
 }
 
 fn touchhle_cocos_target_size() -> (f32, f32) {
@@ -300,17 +293,19 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
     let mode = crate::env_var_cached!("TOUCHHLE_TOUCH_MODE")
         .map(str::to_owned)
         .unwrap_or_else(|| {
-        match env.bundle.bundle_identifier() {
-            "at.source.veggie1"
-            | "at.source.potato3D"
-            | "at.source.potpan" => "scale".to_string(),
-            _ => crate::env_var_cached!("TOUCHHLE_COCOS_TOUCH_MODE")
+            let bundle_id = env.bundle.bundle_identifier();
+            let custom_mode = crate::env_var_cached!("TOUCHHLE_COCOS_TOUCH_MODE")
                 .or(crate::env_var_cached!("TOUCHHLE_UNITY_TOUCH_MODE"))
-                .or(crate::env_var_cached!("TOUCHHLE_ENGINE_TOUCH_MODE"))
-                .map(str::to_owned)
-                .unwrap_or_else(|| "scale".to_string()),
-        }
-    });
+                .or(crate::env_var_cached!("TOUCHHLE_ENGINE_TOUCH_MODE"));
+            match bundle_id {
+                "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => {
+                    "scale".to_string()
+                }
+                _ => custom_mode
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "scale".to_string()),
+            }
+        });
 
     let source_bounds: CGRect = if view != nil {
         msg![env; view bounds]
@@ -383,7 +378,6 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
         "UITouch Cocos remap mode={} source=({:.1}x{:.1}) target=({:.1}x{:.1}): ({:.1}, {:.1}) -> ({:.1}, {:.1})",
         mode, source_w, source_h, target_w, target_h, old_x, old_y, new_x, new_y
     );
-
     CGPoint { x: new_x, y: new_y }
 }
 
@@ -451,7 +445,46 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     let remap_view = if that_view != nil { that_view } else { view };
-    if touchhle_should_use_landscape_touch_remap(env) || should_remap_touch_location_for_view(env, remap_view) {
+    let should_remap =
+        touchhle_should_use_landscape_touch_remap(env) || should_remap_touch_location_for_view(env, remap_view);
+
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCH_REMAP") {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        if COUNTER.fetch_add(1, Ordering::Relaxed) < 24 {
+            let location_x = location.x;
+            let location_y = location.y;
+            let location_in_window_x = location_in_window.x;
+            let location_in_window_y = location_in_window.y;
+            let result_x = result.x;
+            let result_y = result.y;
+            let vclass = if remap_view != nil {
+                let c: crate::objc::Class = msg![env; remap_view class];
+                env.objc.get_class_name(c).to_owned()
+            } else {
+                "(nil)".to_string()
+            };
+            let vbounds: CGRect = if remap_view != nil {
+                msg![env; remap_view bounds]
+            } else {
+                CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: crate::frameworks::core_graphics::CGSize { width: 0.0, height: 0.0 },
+                }
+            };
+            // Copy packed CGRect fields into aligned locals before formatting
+            // (taking a reference to a packed field is a hard error).
+            let vb_w = vbounds.size.width;
+            let vb_h = vbounds.size.height;
+            log!(
+                "TOUCHHLE_TRACE_TOUCH_REMAP: view={} bounds=({:.0}x{:.0}) location=({:.1},{:.1}) location_in_window=({:.1},{:.1}) result=({:.1},{:.1}) should_remap={}",
+                vclass, vb_w, vb_h,
+                location_x, location_y, location_in_window_x, location_in_window_y, result_x, result_y,
+                should_remap
+            );
+        }
+    }
+
+    if should_remap {
         // Important: this happens AFTER UIKit hit-testing. The touch can still
         // hit a portrait-sized EAGL/CCGL view, but the game can receive the
         // Cocos/OpenGL coordinate system it expects.
@@ -852,39 +885,6 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             );
         }
 
-        // Compact always-visible diagnostic for the first few touch-downs:
-        // shows which window/view received the tap so "game ignores taps"
-        // reports can be diagnosed from a normal log.
-        if TOUCH_DIAGS_LEFT.load(Ordering::Relaxed) > 0 {
-            TOUCH_DIAGS_LEFT.fetch_sub(1, Ordering::Relaxed);
-            let diag_x = location.x;
-            let diag_y = location.y;
-            let windows_count = env.framework_state.uikit.ui_view.ui_window.windows.len();
-            let win_class: crate::objc::Class = msg![env; window class];
-            let win_name = env.objc.get_class_name(win_class).to_owned();
-            let hit_name = if view != nil {
-                let c: crate::objc::Class = msg![env; view class];
-                env.objc.get_class_name(c).to_owned()
-            } else {
-                "(nil)".to_string()
-            };
-            let enabled: bool = if view != nil {
-                msg![env; view isUserInteractionEnabled]
-            } else {
-                false
-            };
-            log!(
-                "TOUCH-DIAG #{}: tap ({:.0},{:.0}) windows={} window={} -> view={} interactionEnabled={}",
-                12 - TOUCH_DIAGS_LEFT.load(Ordering::Relaxed),
-                diag_x,
-                diag_y,
-                windows_count,
-                win_name,
-                hit_name,
-                enabled,
-            );
-        }
-
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled
             && !touchhle_cocos_should_allow_multitouch(env, view)
@@ -1194,41 +1194,6 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             v.timestamp = timestamp;
             v.phase = UITouchPhaseEnded;
         });
-
-        // Compact always-visible end-of-gesture summary for the first few
-        // touches: how many Moved updates reached the view and the total
-        // displacement. A swipe with moves=0 means the host lost the moves;
-        // a large delta that the game still ignores points at game-side
-        // interpretation instead.
-        if TOUCH_END_DIAGS_LEFT.load(Ordering::Relaxed) > 0 {
-            TOUCH_END_DIAGS_LEFT.fetch_sub(1, Ordering::Relaxed);
-            let gesture_cancelled = env
-                .framework_state
-                .uikit
-                .ui_touch
-                .cancelled_by_gesture
-                .contains(&touch);
-            let (start, moves) = {
-                let host = env.objc.borrow::<UITouchHostObject>(touch);
-                (host.start_location, host.move_count)
-            };
-            let (dx, dy) = (location.x - start.x, location.y - start.y);
-            let view_name = if view != nil {
-                let view_class: crate::objc::Class = msg![env; view class];
-                env.objc.get_class_name(view_class).to_owned()
-            } else {
-                "(nil view)".to_owned()
-            };
-            log!(
-                "TOUCH-END #{}: view={} moves={} delta=({:+.0},{:+.0}) gesture_cancelled={}",
-                12 - TOUCH_END_DIAGS_LEFT.load(Ordering::Relaxed),
-                view_name,
-                moves,
-                dx,
-                dy,
-                gesture_cancelled
-            );
-        }
 
         let _: () = msg![env;
             touches addObject:touch];

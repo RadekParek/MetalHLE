@@ -76,6 +76,21 @@ fn alloc_path(env: &mut Environment, mutable: bool) -> CGPathRef {
     )
 }
 
+
+/// Builds a fresh (immutable) CGPath from UI-side path commands. Used by
+/// `UIBezierPath` to hand out a `CGPath` for its element list.
+pub(crate) fn path_from_elements(env: &mut Environment, elements: Vec<PathElement>) -> CGPathRef {
+    let class = env.objc.get_known_class("_touchHLE_CGPath", &mut env.mem);
+    env.objc.alloc_object(
+        class,
+        Box::new(CGPathHostObject {
+            elements,
+            mutable: false,
+        }),
+        &mut env.mem,
+    )
+}
+
 // MARK: - Lifecycle
 
 pub fn CGPathRetain(env: &mut Environment, path: CGPathRef) -> CGPathRef {

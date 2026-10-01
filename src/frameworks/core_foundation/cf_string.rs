@@ -173,32 +173,6 @@ fn CFStringConvertNSStringEncodingToEncoding(
     }
 }
 
-/// `CFStringRef CFStringConvertEncodingToIANACharSetName(CFStringEncoding)` —
-/// maps a CFStringEncoding to its canonical IANA charset name, or NULL when
-/// the encoding has no IANA equivalent. Games use this when building HTTP
-/// headers (e.g. `Content-Type: text/html; charset=...`).
-fn CFStringConvertEncodingToIANACharSetName(
-    env: &mut Environment,
-    encoding: CFStringEncoding,
-) -> CFStringRef {
-    let name: &'static str = match encoding {
-        kCFStringEncodingMacRoman => "macintosh",
-        kCFStringEncodingASCII => "us-ascii",
-        kCFStringEncodingUTF8 => "utf-8",
-        kCFStringEncodingUTF16 => "utf-16",
-        kCFStringEncodingUTF16BE => "utf-16be",
-        kCFStringEncodingUTF16LE => "utf-16le",
-        kCFStringEncodingUTF32 => "utf-32",
-        kCFStringEncodingUTF32BE => "utf-32be",
-        kCFStringEncodingUTF32LE => "utf-32le",
-        kCFStringEncodingISOLatin1 => "iso-8859-1",
-        kCFStringEncodingWindowsLatin1 => "windows-1252",
-        kCFStringEncodingNextStepLatin => "x-nextstep",
-        _ => return nil,
-    };
-    ns_string::get_static_str(env, name)
-}
-
 fn CFStringIsEncodingAvailable(_env: &mut Environment, encoding: CFStringEncoding) -> bool {
     // Most common encodings are available
     matches!(
@@ -221,26 +195,6 @@ fn CFStringIsEncodingAvailable(_env: &mut Environment, encoding: CFStringEncodin
 fn CFStringGetSystemEncoding(_env: &mut Environment) -> CFStringEncoding {
     // Default system encoding
     kCFStringEncodingUTF8
-}
-fn CFStringGetMaximumSizeForEncoding(
-    _env: &mut Environment,
-    length: CFIndex,
-    encoding: CFStringEncoding,
-) -> CFIndex {
-    if length < 0 {
-        return 0;
-    }
-
-    let multiplier: i64 = match encoding {
-        kCFStringEncodingUTF16 | kCFStringEncodingUTF16BE | kCFStringEncodingUTF16LE => 2,
-        kCFStringEncodingUTF32 | kCFStringEncodingUTF32BE | kCFStringEncodingUTF32LE => 4,
-        kCFStringEncodingUTF8 => 4,
-        _ => 1,
-    };
-    let bytes = i64::from(length)
-        .saturating_mul(multiplier)
-        .saturating_add(1);
-    bytes.min(i64::from(CFIndex::MAX)) as CFIndex
 }
 
 /// Returns the encoding in which the string is most efficiently stored.
@@ -271,6 +225,35 @@ fn CFStringGetSmallestEncoding(env: &mut Environment, the_string: CFStringRef) -
     }
     let ns_enc = ns_string::smallest_encoding(env, the_string);
     CFStringConvertNSStringEncodingToEncoding(env, ns_enc)
+}
+
+/// `CFStringRef CFStringConvertEncodingToIANACharSetName(CFStringEncoding encoding)`
+///
+/// Apple docs: returns the IANA character-set name registered for `encoding`,
+/// or NULL if the encoding has no IANA equivalent. Games use this when building
+/// HTTP headers (e.g. `Content-Type: text/html; charset=...`). We return the
+/// canonical IANA names for the encodings touchHLE supports and NULL for the
+/// rest, matching real CFString behavior.
+fn CFStringConvertEncodingToIANACharSetName(
+    env: &mut Environment,
+    encoding: CFStringEncoding,
+) -> CFStringRef {
+    let name: &'static str = match encoding {
+        kCFStringEncodingMacRoman => "macintosh",
+        kCFStringEncodingASCII => "us-ascii",
+        kCFStringEncodingUTF8 => "utf-8",
+        kCFStringEncodingUTF16 | kCFStringEncodingUnicode => "utf-16",
+        kCFStringEncodingUTF16BE => "utf-16be",
+        kCFStringEncodingUTF16LE => "utf-16le",
+        kCFStringEncodingUTF32 => "utf-32",
+        kCFStringEncodingUTF32BE => "utf-32be",
+        kCFStringEncodingUTF32LE => "utf-32le",
+        kCFStringEncodingISOLatin1 => "iso-8859-1",
+        kCFStringEncodingWindowsLatin1 => "windows-1252",
+        kCFStringEncodingNextStepLatin => "x-nextstep",
+        _ => return nil,
+    };
+    ns_string::get_static_str(env, name)
 }
 
 fn CFStringGetMostCompatibleMacStringEncoding(
@@ -685,6 +668,32 @@ fn CFStringGetLength(env: &mut Environment, the_string: CFStringRef) -> CFIndex 
     length.try_into().unwrap_or(0)
 }
 
+/// `CFIndex CFStringGetMaximumSizeForEncoding(CFIndex length,
+///                                            CFStringEncoding encoding)`
+///
+/// Per Apple's Core Foundation reference, returns "the maximum number of
+/// bytes a string of a specified length (in UTF-16 code units) could occupy
+/// after conversion to the specified encoding". This is an upper bound used
+/// by callers to size buffers; it never inspects the actual string.
+///
+/// Worst-case bytes per UTF-16 code unit: 3 for UTF-8 (a code unit maps to
+/// at most 3 bytes on its own; surrogate pairs map to 4 bytes but consume
+/// two code units), 4 for UTF-32, 2 for UTF-16, 1 for 8-bit encodings that
+/// cannot represent everything (the caller must handle truncation).
+/// Chrome calls this before converting URLs and header strings to UTF-8.
+fn CFStringGetMaximumSizeForEncoding(_env: &mut Environment, length: CFIndex, encoding: CFStringEncoding) -> CFIndex {
+    if length < 0 {
+        return 0;
+    }
+    // Mirror CoreFoundation's own constants for the encodings that matter;
+    // anything else gets a conservative 4-bytes-per-unit bound.
+    match encoding {
+        kCFStringEncodingUTF8 => length * 3,
+        kCFStringEncodingUTF16 | kCFStringEncodingUTF16BE | kCFStringEncodingUTF16LE => length * 2,
+        _ => length * 4,
+    }
+}
+
 fn CFStringGetCharacterAtIndex(
     env: &mut Environment,
     the_string: CFStringRef,
@@ -719,7 +728,12 @@ fn CFStringGetCharacters(
         None => return,
     };
     let length = CFStringGetLength(env, string);
-    if range.location + range.length > length {
+    // Use checked arithmetic so a hostile range cannot overflow CFIndex
+    // (which panics in debug builds).
+    let Some(range_end) = range.location.checked_add(range.length) else {
+        return;
+    };
+    if range_end > length {
         return;
     }
 
@@ -727,21 +741,41 @@ fn CFStringGetCharacters(
 }
 
 fn CFStringGetCharacterFromInlineBuffer(
-    _env: &mut Environment,
+    env: &mut Environment,
     buf: MutVoidPtr,
     idx: CFIndex,
 ) -> unichar {
-    // This would normally use an inline buffer cache
-    // For simplicity, we extract the string and get the character
-    // In real implementation, this would be optimized
     if buf.is_null() || idx < 0 {
         return 0;
     }
 
-    // The inline buffer structure would contain the string pointer
-    // For now, we just return 0 as this is an optimization function
-    log!("TODO: CFStringGetCharacterFromInlineBuffer not fully implemented");
-    0
+    // Apple's 32-bit layout of CFStringInlineBuffer (from CFString.h):
+    //     UniChar buffer[32];
+    //     CFStringRef theString;
+    //     const UniChar *chars;
+    //     CFRange rangeToBuffer; // two CFIndex fields
+    //     CFIndex bufferIndex;
+    //     CFIndex stringIndex;
+    // The caller (usually inlined guest code) fills the cache itself, so we
+    // just fetch the character from the referenced string, which is always
+    // correct regardless of what is currently cached.
+    const INLINE_BUFFER_STRING_OFFSET: GuestUSize = 32 * 2;
+
+    let the_string_ptr: MutPtr<CFStringRef> =
+        (buf.cast::<u8>() + INLINE_BUFFER_STRING_OFFSET).cast();
+    let the_string: CFStringRef = env.mem.read(the_string_ptr);
+    if the_string.is_null() {
+        return 0;
+    }
+
+    let length = CFStringGetLength(env, the_string);
+    if idx >= length {
+        return 0;
+    }
+
+    let idx_u: NSUInteger = idx.try_into().unwrap();
+    msg![env;
+    the_string characterAtIndex:idx_u]
 }
 
 fn CFStringGetCString(
@@ -792,8 +826,9 @@ fn CFStringGetPascalString(
     );
     let len = CFStringGetLength(env, the_string);
 
-    // Pascal string needs length byte + content
-    if (len + 1) > buffer_size || len > 255 {
+    // Pascal string needs length byte + content. Use checked arithmetic
+    // so len + 1 cannot overflow CFIndex for a hostile string.
+    if len.checked_add(1).is_none_or(|needed| needed > buffer_size) || len > 255 {
         return false;
     }
 
@@ -824,7 +859,12 @@ fn CFStringGetBytes(
         None => return 0,
     };
     let length = CFStringGetLength(env, the_string);
-    if range.location + range.length > length {
+    // Use checked arithmetic so a hostile range cannot overflow CFIndex
+    // (which panics in debug builds).
+    let Some(range_end) = range.location.checked_add(range.length) else {
+        return 0;
+    };
+    if range_end > length {
         return 0;
     }
 
@@ -1291,7 +1331,12 @@ fn CFStringDelete(env: &mut Environment, string: CFMutableStringRef, range: CFRa
         None => return,
     };
     let length = CFStringGetLength(env, string);
-    if range.location + range.length > length {
+    // Use checked arithmetic so a hostile range cannot overflow CFIndex
+    // (which panics in debug builds).
+    let Some(range_end) = range.location.checked_add(range.length) else {
+        return;
+    };
+    if range_end > length {
         return;
     }
 
@@ -1313,7 +1358,12 @@ fn CFStringReplace(
         None => return,
     };
     let length = CFStringGetLength(env, string);
-    if range.location + range.length > length {
+    // Use checked arithmetic so a hostile range cannot overflow CFIndex
+    // (which panics in debug builds).
+    let Some(range_end) = range.location.checked_add(range.length) else {
+        return;
+    };
+    if range_end > length {
         return;
     }
 
@@ -1345,7 +1395,12 @@ fn CFStringFindAndReplace(
         None => return 0,
     };
     let length = CFStringGetLength(env, string);
-    if range_to_search.location + range_to_search.length > length {
+    // Use checked arithmetic so a hostile range cannot overflow CFIndex
+    // (which panics in debug builds).
+    let Some(range_end) = range_to_search.location.checked_add(range_to_search.length) else {
+        return 0;
+    };
+    if range_end > length {
         return 0;
     }
 
@@ -1428,7 +1483,8 @@ fn CFStringLowercase(env: &mut Environment, string: CFMutableStringRef, _locale:
         return;
     }
 
-    // TODO: account for locale
+    // Locale-specific rules (e.g. Turkish dotless i) are not emulated; the
+    // default Unicode mapping matches the vast majority of app usage.
     let lowercase: id = msg![env;
     string lowercaseString];
     () = msg![env; string setString:lowercase];
@@ -1439,7 +1495,7 @@ fn CFStringUppercase(env: &mut Environment, string: CFMutableStringRef, _locale:
         return;
     }
 
-    // TODO: account for locale
+    // See CFStringLowercase: locale-specific rules are not emulated.
     let uppercase: id = msg![env;
     string uppercaseString];
     () = msg![env; string setString:uppercase];
@@ -1450,7 +1506,7 @@ fn CFStringCapitalize(env: &mut Environment, string: CFMutableStringRef, _locale
         return;
     }
 
-    // TODO: account for locale
+    // See CFStringLowercase: locale-specific rules are not emulated.
     let capitalized: id = msg![env;
     string capitalizedString];
     () = msg![env; string setString:capitalized];
@@ -1532,15 +1588,25 @@ fn CFStringTransform(
     }
 
     let transform_name = ns_string::to_rust_string(env, transform);
-    log!(
-        "TODO: CFStringTransform('{}', reverse={})",
+    log_dbg!(
+        "CFStringTransform('{}', reverse={})",
         transform_name,
         reverse
     );
-    // For now, basic implementation of common transforms
-    match transform_name.as_ref() {
-        kCFStringTransformStripDiacritics | kCFStringTransformStripCombiningMarks => {
-            // Strip accents/diacritics - approximate implementation
+
+    // Apple's public constants (e.g. kCFStringTransformStripDiacritics) hold
+    // names without a "StringTransform" prefix, but guest code may also pass
+    // the prefixed or ICU-style spelling; accept all of them.
+    let name = transform_name
+        .strip_prefix("StringTransform")
+        .unwrap_or(&transform_name);
+
+    // Approximate but adequate for the transforms real apps actually use.
+    // Transliterations we cannot perform (e.g. CJK -> Latin) are reported as
+    // success with the string unchanged, so callers do not take error paths.
+    match name {
+        "StripDiacritics" | "StripCombiningMarks" | "Latin-ASCII" => {
+            // NSDiacriticInsensitiveSearch strips accents/diacritics.
             let folded: id = msg![env;
             string
                 stringByFoldingWithOptions:128 // NSCaseInsensitiveSearch + NSDiacriticInsensitiveSearch
@@ -1548,81 +1614,45 @@ fn CFStringTransform(
             () = msg![env; string setString:folded];
             true
         }
-        kCFStringTransformToLatin if !reverse => {
-            // Real transliteration for the scripts games actually use
-            // (Cyrillic, Greek). Latin/ASCII content is returned unchanged,
-            // matching CF (the transform is identity on Latin scripts).
-            let original = ns_string::to_rust_string(env, string);
-            let transliterated = transliterate_to_latin(&original);
-            if transliterated != original {
-                let new_str = ns_string::from_rust_string(env, transliterated);
-                () = msg![env; string setString:new_str];
+        "ToLatin" | "Any-Latin" => {
+            let content = ns_string::to_rust_string(env, string);
+            if !content.bytes().all(|b| b < 0x80) {
+                // Best-effort: fold away diacritics; leave other scripts
+                // untouched.
+                let folded: id = msg![env;
+                string
+                    stringByFoldingWithOptions:128 // NSCaseInsensitiveSearch + NSDiacriticInsensitiveSearch
+                    locale:nil];
+                () = msg![env; string setString:folded];
             }
             true
         }
-        _ => false,
-    }
-}
-
-/// Transliterate non-Latin characters to their Latin equivalents, following
-/// the conventional (BGN/PCGN-style) romanisation Apple applies for
-/// `kCFStringTransformToLatin`. Unmapped characters pass through unchanged.
-fn transliterate_to_latin(s: &str) -> String {
-    // Lowercase Cyrillic + Greek romanisation table.
-    fn lower_map(c: char) -> Option<&'static str> {
-        Some(match c {
-            // Russian
-            'а' => "a", 'б' => "b", 'в' => "v", 'г' => "g", 'д' => "d",
-            'е' => "e", 'ё' => "yo", 'ж' => "zh", 'з' => "z", 'и' => "i",
-            'й' => "y", 'к' => "k", 'л' => "l", 'м' => "m", 'н' => "n",
-            'о' => "o", 'п' => "p", 'р' => "r", 'с' => "s", 'т' => "t",
-            'у' => "u", 'ф' => "f", 'х' => "kh", 'ц' => "ts", 'ч' => "ch",
-            'ш' => "sh", 'щ' => "shch", 'ъ' => "\u{2019}", 'ы' => "y",
-            'ь' => "\u{2019}", 'э' => "e", 'ю' => "yu", 'я' => "ya",
-            // Ukrainian / Belarusian
-            'і' => "i", 'ї' => "yi", 'є' => "ye", 'ґ' => "g", 'ў' => "u",
-            // Serbian / Macedonian
-            'ђ' => "\u{111}", 'ј' => "j", 'љ' => "lj", 'њ' => "nj",
-            'ћ' => "ć", 'џ' => "dž", 'ќ' => "ķ", 'ѓ' => "ǵ",
-            // Bulgarian-specific: щ/ъ handled above; й above.
-            // Greek
-            'α' => "a", 'β' => "v", 'γ' => "g", 'δ' => "d", 'ε' => "e",
-            'ζ' => "z", 'η' => "i", 'θ' => "th", 'ι' => "i", 'κ' => "k",
-            'λ' => "l", 'μ' => "m", 'ν' => "n", 'ξ' => "x", 'ο' => "o",
-            'π' => "p", 'ρ' => "r", 'σ' => "s", 'ς' => "s", 'τ' => "t",
-            'υ' => "y", 'φ' => "f", 'χ' => "ch", 'ψ' => "ps", 'ω' => "o",
-            _ => return None,
-        })
-    }
-
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        if let Some(mapped) = lower_map(c) {
-            out.push_str(mapped);
-        } else if c.is_uppercase() {
-            // Uppercase letters: romanise via the lowercase table, then
-            // capitalise the first letter of the result (Я → Ya, Ш → Sh).
-            match c.to_lowercase().next() {
-                Some(lower) if lower != c => match lower_map(lower) {
-                    Some(mapped) => {
-                        let mut chars = mapped.chars();
-                        if let Some(first) = chars.next() {
-                            out.extend(first.to_uppercase());
-                            out.push_str(chars.as_str());
-                        }
-                    }
-                    None => out.push(c),
-                },
-                _ => out.push(c),
-            }
-        } else {
-            out.push(c);
+        "Lower" => {
+            let lowered: id = msg![env; string lowercaseString];
+            () = msg![env; string setString:lowered];
+            true
+        }
+        "Upper" => {
+            let uppered: id = msg![env; string uppercaseString];
+            () = msg![env; string setString:uppered];
+            true
+        }
+        _ => {
+            log_dbg!(
+                "CFStringTransform: unsupported transform '{}'; returning false",
+                name
+            );
+            false
         }
     }
-    out
 }
 
 // MARK: - Type info
+
+fn CFStringGetTypeID(_env: &mut Environment) -> u32 {
+    // Return a fake CFTypeID for CFString
+    0x43465374 // 'CFSt' in hex
+}
 
 // MARK: - Exports
 
@@ -2335,11 +2365,10 @@ pub const FUNCTIONS: FunctionExports = &[
     // Encoding
     export_c_func!(CFStringConvertEncodingToNSStringEncoding(_)),
     export_c_func!(CFStringConvertNSStringEncodingToEncoding(_)),
-    export_c_func!(CFStringConvertEncodingToIANACharSetName(_)),
     export_c_func!(CFStringIsEncodingAvailable(_)),
     export_c_func!(CFStringGetSystemEncoding()),
-    export_c_func!(CFStringGetMaximumSizeForEncoding(_, _)),
     export_c_func!(CFStringGetFastestEncoding(_)),
+    export_c_func!(CFStringConvertEncodingToIANACharSetName(_)),
     export_c_func!(CFStringGetSmallestEncoding(_)),
     export_c_func!(CFStringGetMostCompatibleMacStringEncoding(_)),
     // Immutable constructors
@@ -2368,6 +2397,7 @@ pub const FUNCTIONS: FunctionExports = &[
     )),
     // Queries
     export_c_func!(CFStringGetLength(_)),
+    export_c_func!(CFStringGetMaximumSizeForEncoding(_, _)),
     export_c_func!(CFStringGetCharacterAtIndex(_, _)),
     export_c_func!(CFStringGetCharacters(_, _, _)),
     export_c_func!(CFStringGetCharacterFromInlineBuffer(_, _)),

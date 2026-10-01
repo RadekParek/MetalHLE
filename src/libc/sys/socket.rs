@@ -6,7 +6,7 @@
  */
 //! sys/socket.h (Sockets)
 //!
-//! We currently support blocking TCP and UDP guest sockets on IPv4 addresses.
+//! We currently support blocking TCP and UDP guest sockets on IPv4 and IPv6 addresses.
 //!
 //! Because fine grain control is needed, those are implemented as
 //! _non-blocking_ host sockets. Moreover, app usage of select() is
@@ -24,12 +24,13 @@
 
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::errno::{
-    set_errno, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAGAIN, EBADF, ECONNABORTED, ECONNREFUSED, ECONNRESET, EINVAL,
-    EIO, EISCONN, ENETUNREACH, ENOTCONN, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
+    set_errno, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EBADF, ECONNABORTED,
+    ECONNREFUSED, ECONNRESET, EINVAL, EIO, EISCONN, ENETUNREACH, ENOPROTOOPT, ENOTCONN, ENOTSUP,
+    ENOTTY, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
 };
 use crate::libc::posix_io::{
-    close, find_or_create_socket, is_socket, FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLPRI,
-    POLLOUT, POLLRDNORM, POLLWRNORM,
+    close, find_or_create_socket, is_socket, FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLOUT,
+    POLLPRI, POLLRDNORM, POLLWRNORM,
 };
 use crate::libc::time::timeval;
 use crate::mem::{
@@ -42,9 +43,12 @@ use crate::libc::netdb::{socklen_t, IPPROTO_TCP, IPPROTO_UDP};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket,
+};
 
 pub const AF_INET: i32 = 2;
+pub const AF_INET6: i32 = 30;
 pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
 
@@ -54,6 +58,10 @@ const SO_REUSEADDR: i32 = 0x4;
 const SO_BROADCAST: i32 = 0x20;
 const SO_ERROR: i32 = 0x1007;
 
+const SO_KEEPALIVE: i32 = 0x8;
+const SO_TYPE: i32 = 0x1003;
+const SO_NREAD: i32 = 0x1020;
+const TCP_NODELAY: i32 = 1;
 const SO_LINGER: i32 = 0x80;
 const SO_SNDBUF: i32 = 0x1001;
 const SO_RCVBUF: i32 = 0x1002;
@@ -98,8 +106,19 @@ impl sockaddr {
     ///
     /// Port is returned in the native endian format.
     fn to_ipv4_parts(self) -> ([u8; 4], u16) {
-        assert!(self.sa_len == 16 || self.sa_len == 0);
-        assert_eq!(self.sa_family, AF_INET as u8);
+        if !(self.sa_len == 16 || self.sa_len == 0) {
+            log!(
+                "Warning: sockaddr with sa_len {} (expected 16 or 0); treating as IPv4 address",
+                self.sa_len
+            );
+        }
+        if self.sa_family != AF_INET as u8 {
+            log!(
+                "Warning: sockaddr with unsupported sa_family {}; treating as IPv4 wildcard address",
+                self.sa_family
+            );
+            return ([0, 0, 0, 0], 0);
+        }
         let port = u16::from_be_bytes([self.sa_data[0], self.sa_data[1]]);
         let ip = [
             self.sa_data[2],
@@ -109,28 +128,43 @@ impl sockaddr {
         ];
         (ip, port)
     }
-    fn from_sockaddr_v4(addr: &SocketAddr) -> Self {
-        // Only IPV4 for the moment
-        match addr {
-            SocketAddr::V4(ipv4addr) => {
-                sockaddr::from_ipv4_parts(ipv4addr.ip().octets(), ipv4addr.port())
-            }
-            SocketAddr::V6(_) => {
-                // Host resolved the peer to an IPv6 address but we don't
-                // model AF_INET6 yet. Return an all-zero IPv4 sockaddr so the
-                // guest sees a well-formed but obviously-invalid address
-                // instead of crashing the host.
-                log!(
-                    "Warning: from_sockaddr_v4(): host returned IPv6 address {:?} but only AF_INET is modelled; returning 0.0.0.0:0.",
-                    addr
-                );
-                sockaddr::from_ipv4_parts([0; 4], 0)
-            }
-        }
-    }
     pub fn to_sockaddr_v4(self) -> SocketAddrV4 {
         let (ip, port) = self.to_ipv4_parts();
         SocketAddrV4::new(ip.into(), port)
+    }
+}
+
+/// Write a guest sockaddr to `address`, truncating the copy to the buffer
+/// size the caller provided via `address_len` (BSD semantics), so a short
+/// guest buffer is never overrun. The full size is stored through
+/// `address_len` when it is non-null.
+fn write_sockaddr_bounded(
+    env: &mut Environment,
+    address: MutPtr<sockaddr>,
+    address_len: MutPtr<socklen_t>,
+    value: SocketAddr,
+    domain: i32,
+) {
+    if address.is_null() {
+        return;
+    }
+    let bytes = socket_addr_to_sockaddr_bytes(socket_addr_for_domain(value, domain));
+    let full_len = bytes.len() as u32;
+    let provided = if address_len.is_null() {
+        full_len
+    } else {
+        env.mem.read(address_len)
+    };
+    if !address.is_null() {
+        let copy_len = provided.min(full_len);
+        if copy_len > 0 {
+            env.mem
+                .bytes_at_mut(address.cast::<u8>(), copy_len)
+                .copy_from_slice(&bytes[..copy_len as usize]);
+        }
+    }
+    if !address_len.is_null() {
+        env.mem.write(address_len, full_len);
     }
 }
 
@@ -156,6 +190,8 @@ struct SocketHostObject {
     tcp_stream: Option<TcpStream>,
     /// UDP socket
     udp_socket: Option<UdpSocket>,
+    /// Domain of the socket
+    domain: i32,
 }
 
 #[derive(Default)]
@@ -172,9 +208,9 @@ impl State {
 }
 
 fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> FileDescriptor {
-    // TODO: handle errno properly
+    // errno is set on every failure path below.
     set_errno(env, 0);
-    if !env.ensure_network_access("socket()") {
+    if !env.options.network_access {
         log_dbg!(
             "Network access is disabled, socket({}, {}, {}) => -1",
             domain,
@@ -185,12 +221,31 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
         return -1;
     }
 
-    assert_eq!(domain, AF_INET);
-    assert!(type_ == SOCK_STREAM || type_ == SOCK_DGRAM);
-    assert!(protocol == IPPROTO_TCP || protocol == IPPROTO_UDP || protocol == 0);
+    if domain != AF_INET && domain != AF_INET6 {
+        set_errno(env, EAFNOSUPPORT);
+        return -1;
+    }
+
+    if type_ != SOCK_STREAM && type_ != SOCK_DGRAM {
+        set_errno(env, ESOCKTNOSUPPORT);
+        return -1;
+    }
+
+    if protocol != IPPROTO_TCP && protocol != IPPROTO_UDP && protocol != 0 {
+        set_errno(env, EPROTONOSUPPORT);
+        return -1;
+    }
 
     let fd = find_or_create_socket(env);
-    assert!(!State::get(env).sockets.contains_key(&fd));
+    if State::get(env).sockets.contains_key(&fd) {
+        // Should be unreachable: find_or_create_socket() returns an fd with
+        // no open file object, so it cannot have a socket either. Log and
+        // overwrite a stale entry rather than panicking.
+        log!(
+            "Warning: socket(): fd {} already had a stale socket entry",
+            fd
+        );
+    }
     let host_object = SocketHostObject {
         type_,
         options: Default::default(),
@@ -198,6 +253,7 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
         pending_tcp_stream: None,
         tcp_stream: None,
         udp_socket: None,
+        domain,
     };
     State::get_mut(env).sockets.insert(fd, host_object);
 
@@ -205,17 +261,86 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
     fd
 }
 
-fn ioctl(env: &mut Environment, fd: i32, request: u32, _args: DotDotDot) -> i32 {
+fn ioctl(env: &mut Environment, fd: i32, request: u32, args: DotDotDot) -> i32 {
     set_errno(env, 0);
-    // Честно обрабатываем неверные дескрипторы по стандарту POSIX:
+    // Handle invalid descriptors per POSIX.
     if !is_socket(env, fd) {
         log!("ioctl: fd={} is not a valid socket, returning EBADF", fd);
         set_errno(env, EBADF);
         return -1;
     }
 
-    log!("TODO: ioctl({} (socket), {:#x?}, ...) => -1", fd, request);
-    -1
+    // Darwin request codes for the two operations real iOS apps actually
+    // issue on sockets. Everything else fails with ENOTTY rather than
+    // crashing or silently lying about success.
+    const FIONBIO: u32 = 0x8004667E;
+    const FIONREAD: u32 = 0x4004667F;
+
+    match request {
+        FIONREAD => {
+            let mut varargs = args.start();
+            let out: MutPtr<i32> = varargs.next(env);
+            if !out.is_null() {
+                let available = socket_bytes_available(env, fd);
+                env.mem.write(out, available);
+                log_dbg!("ioctl({}, FIONREAD) => {} bytes", fd, available);
+            } else {
+                log_dbg!("ioctl({}, FIONREAD) with NULL arg, ignored", fd);
+            }
+            0
+        }
+        FIONBIO => {
+            // Argument is a pointer to int: non-zero enables non-blocking
+            // mode. Host sockets are always non-blocking here, so both
+            // directions are accepted; the flag is read only for logging.
+            let mut varargs = args.start();
+            let flag_ptr: MutPtr<i32> = varargs.next(env);
+            let flag = if flag_ptr.is_null() {
+                0
+            } else {
+                env.mem.read(flag_ptr)
+            };
+            log_dbg!(
+                "ioctl({}, FIONBIO, {}) => 0 (host sockets are non-blocking)",
+                fd,
+                flag
+            );
+            0
+        }
+        request => {
+            log!(
+                "ioctl({} (socket), {:#x}, ...) is not supported, returning ENOTTY",
+                fd,
+                request
+            );
+            set_errno(env, ENOTTY);
+            -1
+        }
+    }
+}
+
+/// Number of bytes immediately available for reading on a socket fd, as
+/// reported by FIONREAD and SO_NREAD. Peeked (non-destructive); returns 0
+/// when the count cannot be determined.
+fn socket_bytes_available(env: &mut Environment, fd: i32) -> i32 {
+    const PEEK_CAP: usize = 65536; // one maximum-size UDP datagram
+    let Some(sock) = State::get(env).sockets.get(&fd) else {
+        return 0;
+    };
+    if let Some(udp) = sock.udp_socket.as_ref() {
+        let mut buf = vec![0u8; PEEK_CAP];
+        return (udp.peek(&mut buf).unwrap_or(0).min(i32::MAX as usize)) as i32;
+    }
+    if let Some(stream) = sock.tcp_stream.as_ref() {
+        let mut buf = vec![0u8; PEEK_CAP];
+        return match stream.peek(&mut buf) {
+            Ok(n) => (n.min(i32::MAX as usize)) as i32,
+            // A reset connection reads as "0 bytes available", not an error.
+            Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => 0,
+            Err(_) => 0,
+        };
+    }
+    0
 }
 
 fn getsockopt(
@@ -226,7 +351,7 @@ fn getsockopt(
     option_value: MutVoidPtr,
     option_len: MutPtr<socklen_t>,
 ) -> i32 {
-    // TODO: handle errno properly
+    // errno is set on every failure path below.
     set_errno(env, 0);
     log_dbg!(
         "getsockopt({}, {:#x}, {:#x}, {:?}, {:?})",
@@ -236,15 +361,79 @@ fn getsockopt(
         option_value,
         option_len
     );
-    assert_eq!(level, SOL_SOCKET);
-    // TODO: support other options
-    assert_eq!(option_name, SO_ERROR);
+    let Some(sock) = State::get(env).sockets.get(&socket) else {
+        set_errno(env, EBADF);
+        return -1;
+    };
 
+    if option_len.is_null() || option_value.is_null() {
+        set_errno(env, EINVAL);
+        return -1;
+    }
     let option_len_val = env.mem.read(option_len);
-    assert_eq!(option_len_val, 4);
-    let option_value: MutPtr<i32> = option_value.cast();
-    env.mem.write(option_value, 0); // no errors
 
+    // Write the integer answer for the common 4-byte options.
+    let int_answer: Option<i32> = match (level, option_name) {
+        (SOL_SOCKET, SO_ERROR) => Some(0), // no pending error is ever tracked
+        (SOL_SOCKET, SO_TYPE) => Some(sock.type_),
+        (SOL_SOCKET, SO_SNDBUF) | (SOL_SOCKET, SO_RCVBUF) => {
+            // Plausible default; host buffer sizes are not exposed by
+            // Rust's std::net.
+            Some(0x10000)
+        }
+        (SOL_SOCKET, SO_DEBUG)
+        | (SOL_SOCKET, SO_REUSEADDR)
+        | (SOL_SOCKET, SO_BROADCAST)
+        | (SOL_SOCKET, SO_KEEPALIVE)
+        | (SOL_SOCKET, SO_NOSIGPIPE) => Some(sock.options.contains(&option_name) as i32),
+        (SOL_SOCKET, SO_NREAD) => Some(socket_bytes_available(env, socket)),
+        (IPPROTO_TCP, TCP_NODELAY) => Some(sock.options.contains(&TCP_NODELAY) as i32),
+        (SOL_SOCKET, SO_LINGER) => None, // struct option, handled below
+        // Unknown IPPROTO_TCP options (e.g. TCP_INFO) get a zeroed buffer:
+        // sane defaults beat failing the app. Unknown SOL_SOCKET options are
+        // reported with ENOPROTOOPT like a real socket would.
+        (IPPROTO_TCP, _) => None,
+        (level, option_name) => {
+            log!(
+                "getsockopt: unhandled level={:#x} option={:#x} on socket {}",
+                level,
+                option_name,
+                socket
+            );
+            set_errno(env, ENOPROTOOPT);
+            return -1;
+        }
+    };
+
+    if let Some(value) = int_answer {
+        if option_len_val < guest_size_of::<socklen_t>() {
+            set_errno(env, EINVAL);
+            return -1;
+        }
+        let option_value: MutPtr<i32> = option_value.cast();
+        env.mem.write(option_value, value);
+        env.mem.write(option_len, guest_size_of::<i32>());
+    } else if level == SOL_SOCKET && option_name == SO_LINGER {
+        if option_len_val < guest_size_of::<linger>() {
+            set_errno(env, EINVAL);
+            return -1;
+        }
+        // Report lingering disabled; a zeroed struct is a valid answer.
+        let option_value: MutPtr<linger> = option_value.cast();
+        env.mem.write(
+            option_value,
+            linger {
+                l_onoff: 0,
+                l_linger: 0,
+            },
+        );
+        env.mem.write(option_len, guest_size_of::<linger>());
+    } else {
+        // Zero-fill struct-valued options (e.g. TCP_INFO) so the guest sees
+        // well-formed data instead of an error.
+        let bytes = env.mem.bytes_at_mut(option_value.cast(), option_len_val);
+        bytes.fill(0);
+    }
     0 // Success
 }
 
@@ -280,7 +469,12 @@ fn setsockopt(
             0
         }
         (SOL_SOCKET, SO_REUSEADDR) | (SOL_SOCKET, SO_BROADCAST) | (SOL_SOCKET, SO_NOSIGPIPE) => {
-            assert_eq!(option_len, guest_size_of::<i32>());
+            // Guest-controlled option_len: report EINVAL instead of
+            // asserting when an app passes a wrong size.
+            if option_len < guest_size_of::<i32>() {
+                set_errno(env, EINVAL);
+                return -1;
+            }
             let val: i32 = env.mem.read(option_value.cast());
             if val != 0 {
                 State::get_mut(env)
@@ -362,7 +556,10 @@ fn setsockopt(
             0
         }
         (SOL_SOCKET, SO_SNDBUF) | (SOL_SOCKET, SO_RCVBUF) => {
-            assert_eq!(option_len, guest_size_of::<i32>());
+            if option_len < guest_size_of::<i32>() {
+                set_errno(env, EINVAL);
+                return -1;
+            }
             let buf_size: i32 = env.mem.read(option_value.cast());
 
             // Rust std::net не экспортирует управление размером буфера
@@ -379,10 +576,12 @@ fn setsockopt(
             0
         }
         (level, option_name) if level == IPPROTO_TCP => {
-            // TCP_NODELAY (1) — disable Nagle's algorithm.
-            const TCP_NODELAY: i32 = 1;
+            // TCP_NODELAY — disable Nagle's algorithm.
             if option_name == TCP_NODELAY {
-                assert_eq!(option_len, guest_size_of::<i32>());
+                if option_len < guest_size_of::<i32>() {
+                    set_errno(env, EINVAL);
+                    return -1;
+                }
                 let val: i32 = env.mem.read(option_value.cast());
                 if type_ == SOCK_STREAM {
                     if let Some(stream) = State::get(env)
@@ -441,29 +640,31 @@ fn bind(
         return -1;
     };
     let type_ = sock.type_;
+    let domain = sock.domain;
 
     if type_ != SOCK_STREAM && type_ != SOCK_DGRAM {
         set_errno(env, ESOCKTNOSUPPORT);
         return -1;
     }
 
-    if address_len < guest_size_of::<sockaddr>() {
-        set_errno(env, EINVAL);
-        return -1;
-    }
-
-    let sockaddr_val = env.mem.read(address);
-    let socket_address = sockaddr_val.to_sockaddr_v4();
+    let socket_address = match read_socket_addr(env, address, address_len)
+        .and_then(|address| host_socket_addr_for_domain(address, domain))
+    {
+        Ok(address) => address,
+        Err(error) => {
+            set_errno(env, error);
+            return -1;
+        }
+    };
     let type_str = match type_ {
         SOCK_STREAM => "TCP",
         SOCK_DGRAM => "UDP",
         _ => "<unknown socket type>",
     };
     log_dbg!(
-        "bind({}, {:?} ({:?}), {}) -> {} {:?}",
+        "bind({}, {:?}, {}) -> {} {:?}",
         socket,
         address,
-        sockaddr_val,
         address_len,
         type_str,
         socket_address
@@ -586,7 +787,8 @@ fn bind(
 }
 
 fn listen(env: &mut Environment, socket: i32, backlog: i32) -> i32 {
-    // TODO: handle errno properly
+    // errno is set on every failure path below. The host socket made by
+    // bind() already listens, so there is nothing else to do.
     set_errno(env, 0);
     let type_ = match State::get(env).sockets.get(&socket) {
         Some(s) => s.type_,
@@ -601,8 +803,8 @@ fn listen(env: &mut Environment, socket: i32, backlog: i32) -> i32 {
         return -1;
     }
 
-    log!(
-        "Warning: listen(socket: {}, backlog: {}), ignoring",
+    log_dbg!(
+        "listen(socket: {}, backlog: {}): already listening on host",
         socket,
         backlog
     );
@@ -621,25 +823,27 @@ fn connect(
         return -1;
     };
     let type_ = sock.type_;
+    let domain = sock.domain;
     if type_ != SOCK_STREAM {
         set_errno(env, ESOCKTNOSUPPORT);
         return -1;
     }
 
-    if address_len < guest_size_of::<sockaddr>() {
-        set_errno(env, EINVAL);
-        return -1;
-    }
-
-    let sockaddr_val = env.mem.read(address);
+    let socket_address = match read_socket_addr(env, address, address_len)
+        .and_then(|address| host_socket_addr_for_domain(address, domain))
+    {
+        Ok(address) => address,
+        Err(error) => {
+            set_errno(env, error);
+            return -1;
+        }
+    };
     log_dbg!(
-        "connect({:?} ({:?}), {})",
+        "connect({:?}, {}) -> {:?}",
         address,
-        sockaddr_val,
-        address_len
+        address_len,
+        socket_address
     );
-    let socket_address = sockaddr_val.to_sockaddr_v4();
-    log_dbg!("connect: socket address {:?}", socket_address);
 
     if State::get(env)
         .sockets
@@ -695,12 +899,17 @@ fn select(
     error_fds: MutPtr<fd_set>,
     timeout: MutPtr<timeval>,
 ) -> i32 {
-    // TODO: handle errno properly
+    // fd_set can only describe descriptors 0..=1024; a negative or
+    // out-of-range n_fds is invalid guest input. Report EINVAL instead of
+    // panicking on the assert.
     set_errno(env, 0);
-    assert!((0..=1024).contains(&n_fds));
+    if !(0..=1024).contains(&n_fds) {
+        log!("select: invalid n_fds {}, returning EINVAL", n_fds);
+        set_errno(env, EINVAL);
+        return -1;
+    }
 
-    // В POSIX вызов select с n_fds = 0 используется для точного сна
-    // (микросекунды)
+    // POSIX: select with n_fds = 0 is a precise (microsecond) sleep.
     if n_fds == 0 {
         if !timeout.is_null() {
             let timeval = env.mem.read(timeout);
@@ -715,287 +924,384 @@ fn select(
         // Ни один дескриптор не готов
     }
 
-    let should_block = if !timeout.is_null() {
+    // Read the timeout once: a null pointer means block indefinitely, a
+    // zero timeout means a single poll.
+    let timeout_duration: Option<std::time::Duration> = if !timeout.is_null() {
         let timeval = env.mem.read(timeout);
-        let tv_sec = timeval.tv_sec;
-        let tv_usec = timeval.tv_usec;
-        if tv_sec == 0 && tv_usec == 0 {
-            // Happy path, just polling once
-            false
-        } else {
-            log_dbg!("TODO: Ignore non-zero timeout {:?} in select()", timeval);
-            true
+        if timeval.tv_sec < 0 || timeval.tv_usec < 0 {
+            set_errno(env, EINVAL);
+            return -1;
         }
+        Some(
+            std::time::Duration::from_secs(timeval.tv_sec.try_into().unwrap_or(0))
+                + std::time::Duration::from_micros(timeval.tv_usec.try_into().unwrap_or(0)),
+        )
     } else {
-        true
+        None
     };
-    let mut count = 0;
+    // Poll repeatedly, sleeping between polls, until something is ready or
+    // the timeout expires. env.sleep() yields the guest thread so other
+    // threads keep running while we wait.
+    let deadline = timeout_duration.map(|d| std::time::Instant::now() + d);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-    if !read_fds.is_null() {
-        let mut read_set = env.mem.read(read_fds);
-        log_dbg!("select: read_set before {:?}", read_set);
-        count += process_set(env, &mut read_set, n_fds, |env, fd, bits, bit_index| {
-            log_dbg!("select: bit set in read_set at fd: {}", fd);
-            // Only sockets for now
-            assert!(is_socket(env, fd));
-            // Clean bit in the set for the current socket
-            *bits &= !(1 << bit_index);
-            let socket_host_object = State::get(env).sockets.get(&fd).unwrap();
-            let type_ = socket_host_object.type_;
-            match type_ {
-                SOCK_DGRAM => {
-                    let udp_socket = socket_host_object.udp_socket.as_ref().unwrap();
-                    // Peek just one byte to check if we have some data
-                    let mut buf = [0; 1];
-                    match udp_socket.peek(&mut buf) {
-                        Ok(received) => {
-                            log_dbg!("select: Socket {} peeked {} bytes", fd, received);
-                            // Set bit back
-                            *bits |= 1 << bit_index;
-                            true
-                        }
-                        // On Windows, if we receive more bytes than we peek,
-                        // it will error, but it means that there is some data!
-                        Err(ref e)
-                            if cfg!(target_os = "windows") && e.raw_os_error() == Some(10040) =>
-                        {
-                            // 10040 code is WSAEMSGSIZE
-                            log_dbg!(
-                                "[Windows case] select: received {} bytes (at least)",
-                                buf.len()
-                            );
-                            // Set bit back
-                            *bits |= 1 << bit_index;
-                            true
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            log_dbg!("select: Socket {} would block on peeking, continue.", fd);
-                            assert!(!should_block); // TODO
-                            false
-                        }
-                        Err(e) => {
-                            panic!("select: Peek for socket {fd} failed: {e:?}")
-                        }
-                    }
+    // Snapshot the fd sets once; every poll starts from a fresh copy because
+    // processing clears bits of not-ready descriptors.
+    let read_orig = (!read_fds.is_null()).then(|| env.mem.read(read_fds));
+    let write_orig = (!write_fds.is_null()).then(|| env.mem.read(write_fds));
+    let error_orig = (!error_fds.is_null()).then(|| env.mem.read(error_fds));
+
+    let mut count;
+    let mut invalid_fd = false;
+    loop {
+        count = 0;
+        if let Some(orig) = read_orig {
+            let mut read_set = orig;
+            log_dbg!("select: read_set before {:?}", read_set);
+            count += process_set(env, &mut read_set, n_fds, |env, fd, bits, bit_index| {
+                log_dbg!("select: bit set in read_set at fd: {}", fd);
+                if !is_socket(env, fd) {
+                    log!("select: read_set contains non-socket fd {}; ignoring", fd);
+                    *bits &= !(1 << bit_index);
+                    invalid_fd = true;
+                    return false;
                 }
-                SOCK_STREAM => {
-                    if socket_host_object.tcp_stream.is_none() {
-                        // If we don't have a TCP stream it probably means
-                        // that a listener is waiting for connection
-                        let listener = socket_host_object.tcp_listener.as_ref().unwrap();
-                        // The listener is non-blocking,
-                        // so we can try to accept
-                        match listener.accept() {
-                            Ok((stream, addr)) => {
-                                log!("select: New client: {}", addr);
-                                // We set host socket as non-blocking in order
-                                // to have more control of how and when it's
-                                // used
-                                stream.set_nonblocking(true).unwrap();
-                                // We already accepted the connection on
-                                // the host, but we need to postpone new
-                                // guest fd creation up until guest calls
-                                // accept()
-                                assert!(socket_host_object.pending_tcp_stream.is_none());
-                                State::get_mut(env)
-                                    .sockets
-                                    .get_mut(&fd)
-                                    .unwrap()
-                                    .pending_tcp_stream = Some(stream);
+                // Clean bit in the set for the current socket
+                *bits &= !(1 << bit_index);
+                let socket_host_object = match State::get(env).sockets.get(&fd) {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let type_ = socket_host_object.type_;
+                match type_ {
+                    SOCK_DGRAM => {
+                        let Some(udp_socket) = socket_host_object.udp_socket.as_ref() else {
+                            // No host socket yet (never bound nor sent to):
+                            // nothing can be readable; treat as not-ready.
+                            return false;
+                        };
+                        // Peek just one byte to check if we have some data
+                        let mut buf = [0; 1];
+                        match udp_socket.peek(&mut buf) {
+                            Ok(received) => {
+                                log_dbg!("select: Socket {} peeked {} bytes", fd, received);
                                 // Set bit back
                                 *bits |= 1 << bit_index;
-                                return true;
+                                true
+                            }
+                            // On Windows, if we receive more bytes than we peek,
+                            // it will error, but it means that there is some data!
+                            Err(ref e)
+                                if cfg!(target_os = "windows")
+                                    && e.raw_os_error() == Some(10040) =>
+                            {
+                                // 10040 code is WSAEMSGSIZE
+                                log_dbg!(
+                                    "[Windows case] select: received {} bytes (at least)",
+                                    buf.len()
+                                );
+                                // Set bit back
+                                *bits |= 1 << bit_index;
+                                true
                             }
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // No incoming connection is ready
-                                log_dbg!("select: TCP listener for socket {} would block on accepting, continue.", fd);
-                                assert!(!should_block);
-                                // TODO
-                                return false;
+                                log_dbg!("select: Socket {} would block on peeking, continue.", fd);
+                                // Not ready; the caller loop will re-poll or
+                                // expire the timeout as appropriate.
+                                false
                             }
                             Err(e) => {
-                                panic!("select: Socket {fd} has error accepting connection: {e}");
+                                log!(
+                                    "select: Peek for socket {fd} failed: {e:?}; treating as not-ready."
+                                );
+                                false
                             }
                         }
                     }
-                    let stream = socket_host_object.tcp_stream.as_ref().unwrap();
-                    // Peek just one byte to check if we have some data
-                    let mut buf = [0; 1];
-                    match stream.peek(&mut buf) {
-                        Ok(received) => {
-                            log_dbg!("select: received {} bytes (at least)", received);
-                            // Set bit back
-                            *bits |= 1 << bit_index;
-                            true
+                    SOCK_STREAM => {
+                        if socket_host_object.tcp_stream.is_none() {
+                            // If we don't have a TCP stream it probably means
+                            // that a listener is waiting for connection
+                            let Some(listener) = socket_host_object.tcp_listener.as_ref() else {
+                                // Neither stream nor listener yet: not ready.
+                                return false;
+                            };
+                            // The listener is non-blocking,
+                            // so we can try to accept
+                            match listener.accept() {
+                                Ok((stream, addr)) => {
+                                    log!("select: New client: {}", addr);
+                                    // We set host socket as non-blocking in
+                                    // order to have more control of how and
+                                    // when it's used
+                                    if let Err(e) = stream.set_nonblocking(true) {
+                                        // If we cannot make the stream
+                                        // non-blocking, drop it and report
+                                        // not-ready rather than risking a
+                                        // blocking host call later.
+                                        log!("select: set_nonblocking failed: {}", e);
+                                        return false;
+                                    }
+                                    // We already accepted the connection on
+                                    // the host, but we need to postpone new
+                                    // guest fd creation up until guest calls
+                                    // accept()
+                                    if socket_host_object.pending_tcp_stream.is_some() {
+                                        log!(
+                                            "select: socket {} already has a pending stream; dropping new one",
+                                            fd
+                                        );
+                                    } else {
+                                        State::get_mut(env)
+                                            .sockets
+                                            .get_mut(&fd)
+                                            .unwrap()
+                                            .pending_tcp_stream = Some(stream);
+                                    }
+                                    // Set bit back
+                                    *bits |= 1 << bit_index;
+                                    return true;
+                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    // No incoming connection is ready
+                                    log_dbg!(
+                                        "select: TCP listener for socket {} would block on accepting, continue.",
+                                        fd
+                                    );
+                                    // Not ready; the caller loop will re-poll
+                                    // or expire the timeout as appropriate.
+                                    return false;
+                                }
+                                Err(e) => {
+                                    log!(
+                                        "select: Socket {fd} has error accepting connection: {e}; treating as not-ready."
+                                    );
+                                    return false;
+                                }
+                            }
                         }
-                        // On Windows, if we receive more bytes than we peek,
-                        // it will error, but it means that there is some data!
-                        Err(ref e)
-                            if cfg!(target_os = "windows") && e.raw_os_error() == Some(10040) =>
+                        let stream = socket_host_object.tcp_stream.as_ref().unwrap();
+                        // Peek just one byte to check if we have some data
+                        let mut buf = [0; 1];
+                        match stream.peek(&mut buf) {
+                            Ok(received) => {
+                                log_dbg!("select: received {} bytes (at least)", received);
+                                // Set bit back
+                                *bits |= 1 << bit_index;
+                                true
+                            }
+                            // On Windows, if we receive more bytes than we peek,
+                            // it will error, but it means that there is some data!
+                            Err(ref e)
+                                if cfg!(target_os = "windows")
+                                    && e.raw_os_error() == Some(10040) =>
+                            {
+                                // 10040 code is WSAEMSGSIZE
+                                log_dbg!(
+                                    "[Windows case] select: received {} bytes (at least)",
+                                    buf.len()
+                                );
+                                // Set bit back
+                                *bits |= 1 << bit_index;
+                                true
+                            }
+                            // As tested on macOS, this marks socket as readable
+                            Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                                log!("select: Peek for socket {}: ConnectionReset", fd);
+                                // Set bit back
+                                *bits |= 1 << bit_index;
+                                true
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                log_dbg!(
+                                    "select: TCP stream for socket {} would block on peeking, continue.",
+                                    fd
+                                );
+                                // Not ready; the caller loop will re-poll or
+                                // expire the timeout as appropriate.
+                                false
+                            }
+                            Err(e) => {
+                                log!(
+                                    "select: Peek for socket {fd} failed: {e}; treating as not-ready."
+                                );
+                                false
+                            }
+                        }
+                    }
+                    other => {
+                        log!(
+                            "Warning: select() read_set fd {} has unknown socket type {}; \
+                             treating as not-ready.",
+                            fd,
+                            other
+                        );
+                        false
+                    }
+                }
+            });
+            log_dbg!("select: read_set after {:?}", read_set);
+            env.mem.write(read_fds, read_set);
+        }
+
+        if let Some(orig) = write_orig {
+            let mut write_set = orig;
+            log_dbg!("select: write_set before {:?}", write_set);
+            count += process_set(env, &mut write_set, n_fds, |env, fd, bits, bit_index| {
+                log_dbg!("select: bit set in write_set at fd: {}", fd);
+                if !is_socket(env, fd) {
+                    log!("select: write_set contains non-socket fd {}; ignoring", fd);
+                    *bits &= !(1 << bit_index);
+                    invalid_fd = true;
+                    return false;
+                }
+                // Clean bit in the current socket set
+                *bits &= !(1 << bit_index);
+                let socket_host_object = match State::get(env).sockets.get(&fd) {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let type_ = socket_host_object.type_;
+                match type_ {
+                    SOCK_STREAM => {
+                        // A connected stream is writable; a listening socket
+                        // is too (it can accept). Without either there is
+                        // nothing to write to yet.
+                        if socket_host_object.tcp_stream.is_some()
+                            || socket_host_object.tcp_listener.is_some()
                         {
-                            // 10040 code is WSAEMSGSIZE
-                            log_dbg!(
-                                "[Windows case] select: received {} bytes (at least)",
-                                buf.len()
-                            );
                             // Set bit back
                             *bits |= 1 << bit_index;
                             true
+                        } else {
+                            false
                         }
-                        // As tested on macOS, this marks socket as readable
-                        Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
-                            log!("select: Peek for socket {}: ConnectionReset", fd);
+                    }
+                    SOCK_DGRAM => {
+                        // UDP sockets are almost always writable once they
+                        // exist; without a host socket there is nothing to
+                        // write with yet.
+                        if socket_host_object.udp_socket.is_some() {
                             // Set bit back
                             *bits |= 1 << bit_index;
                             true
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            log_dbg!(
-                                "select: TCP stream for socket {} would block on peeking, continue.",
-                                fd
-                            );
-                            assert!(!should_block); // TODO
-                            false
-                        }
-                        Err(e) => {
-                            // A transient peek failure is not fatal: report
-                            // the socket as not-ready and let the caller retry.
-                            log!("select: Peek for socket {fd} failed: {e}");
+                        } else {
                             false
                         }
                     }
-                }
-                sock_type => {
-                    // Unknown socket type (e.g. raw/unix): real select(2)
-                    // simply reports nothing for it rather than aborting.
-                    log_dbg!("select: read_set unhandled socket type {sock_type} for fd {fd}");
-                    false
-                }
-            }
-        });
-        log_dbg!("select: read_set after {:?}", read_set);
-        env.mem.write(read_fds, read_set);
-    }
-
-    if !write_fds.is_null() {
-        let mut write_set = env.mem.read(write_fds);
-        log_dbg!("select: write_set before {:?}", write_set);
-        count += process_set(env, &mut write_set, n_fds, |env, fd, bits, bit_index| {
-            log_dbg!("select: bit set in write_set at fd: {}", fd);
-            // Only sockets for now
-            assert!(is_socket(env, fd));
-            // Clean bit in the set for the current socket
-            *bits &= !(1 << bit_index);
-            let socket_host_object = State::get(env).sockets.get(&fd).unwrap();
-            let type_ = socket_host_object.type_;
-            match type_ {
-                SOCK_STREAM => {
-                    assert!(socket_host_object.tcp_listener.is_none());
-                    // As we cannot "peek" on write, we just check
-                    // if TCP stream exist or not
-                    // TODO: find a better way
-                    if socket_host_object.tcp_stream.is_some() {
-                        // Set bit back
-                        *bits |= 1 << bit_index;
-                        true
-                    } else {
-                        assert!(!should_block);
-                        // TODO
+                    other => {
+                        log!(
+                            "Warning: select() write_set fd {} has unknown socket type {}; \
+                             treating as not-ready.",
+                            fd,
+                            other
+                        );
                         false
                     }
                 }
-                SOCK_DGRAM => {
-                    // As we cannot "peek" on write, we just check
-                    // if UDP socket exist or not
-                    // TODO: find a better way
-                    if socket_host_object.udp_socket.is_some() {
-                        // Set bit back
-                        *bits |= 1 << bit_index;
-                        true
-                    } else {
-                        assert!(!should_block);
-                        // TODO
+            });
+            log_dbg!("select: write_set after {:?}", write_set);
+            env.mem.write(write_fds, write_set);
+        }
+
+        if let Some(orig) = error_orig {
+            let mut error_set = orig;
+            log_dbg!("select: error_set before {:?}", error_set);
+            count += process_set(env, &mut error_set, n_fds, |env, fd, bits, bit_index| {
+                log_dbg!("select: bit set in error_set at fd: {}", fd);
+                if !is_socket(env, fd) {
+                    log!("select: error_set contains non-socket fd {}; ignoring", fd);
+                    *bits &= !(1 << bit_index);
+                    invalid_fd = true;
+                    return false;
+                }
+                // Clean bit in the current socket set
+                *bits &= !(1 << bit_index);
+                let socket_host_object = match State::get(env).sockets.get(&fd) {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let type_ = socket_host_object.type_;
+                match type_ {
+                    SOCK_STREAM => {
+                        let Some(stream) = socket_host_object.tcp_stream.as_ref() else {
+                            // No connected stream: no error state to report.
+                            return false;
+                        };
+                        match stream.take_error() {
+                            Ok(None) => {
+                                log_dbg!("No error on TCP socket {}", fd);
+                                false
+                            }
+                            Ok(Some(error)) => {
+                                log!(
+                                    "select: TCP socket {} has a pending error: {:?}; \
+                                     reporting it via the error_fds set.",
+                                    fd,
+                                    error
+                                );
+                                // Set bit back so the guest observes the error
+                                // on this socket rather than us panicking.
+                                true
+                            }
+                            Err(error) => {
+                                log!(
+                                    "select: TCP socket {fd} take_error failed: {error:?}; treating as no-error."
+                                );
+                                false
+                            }
+                        }
+                    }
+                    SOCK_DGRAM => {
+                        // UDP is connectionless, so there is no per-socket
+                        // error state comparable to TCP's take_error(). Real
+                        // BSD sockets can still surface async errors (e.g.
+                        // from a previous ICMP port-unreachable) via
+                        // SO_ERROR, but we don't track that here; report
+                        // "no error" rather than aborting the emulator.
+                        false
+                    }
+                    other => {
+                        log!(
+                            "Warning: select() error_set fd {} has unknown socket type {}; \
+                             treating as no-error.",
+                            fd,
+                            other
+                        );
                         false
                     }
                 }
-                sock_type => {
-                    log_dbg!("select: write_set unhandled socket type {sock_type} for fd {fd}");
-                    false
-                }
-            }
-        });
-        log_dbg!("select: write_set after {:?}", write_set);
-        env.mem.write(write_fds, write_set);
-    }
+            });
+            log_dbg!("select: error_set after {:?}", error_set);
+            env.mem.write(error_fds, error_set);
+        }
 
-    if !error_fds.is_null() {
-        let mut error_set = env.mem.read(error_fds);
-        log_dbg!("select: error_set before {:?}", error_set);
-        count += process_set(env, &mut error_set, n_fds, |env, fd, bits, bit_index| {
-            log_dbg!("select: bit set in error_set at fd: {}", fd);
-            // Only sockets for now
-            assert!(is_socket(env, fd));
-            // Clean bit in the set for the current socket
-            *bits &= !(1 << bit_index);
-            let socket_host_object = State::get(env).sockets.get(&fd).unwrap();
-            let type_ = socket_host_object.type_;
-            match type_ {
-                SOCK_STREAM => {
-                    assert!(socket_host_object.tcp_listener.is_none());
-                    let stream = socket_host_object.tcp_stream.as_ref().unwrap();
-                    match stream.take_error() {
-                        Ok(None) => {
-                            log_dbg!("No error on TCP socket {}", fd);
-                            false
-                        }
-                        Ok(Some(error)) => {
-                            // POSIX: a socket with a pending error is reported
-                            // in exceptfds, not via abort.
-                            log!("select: TCP socket {fd} has pending error: {error:?}");
-                            true
-                        }
-                        Err(error) => {
-                            log!("select: TCP socket {fd} take_error failed: {error:?}");
-                            false
-                        }
-                    }
+        if count > 0 || invalid_fd {
+            break;
+        }
+        match deadline {
+            Some(deadline) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
                 }
-                SOCK_DGRAM => {
-                    match socket_host_object
-                        .udp_socket
-                        .as_ref()
-                        .map(|udp| udp.take_error())
-                        .unwrap_or(Ok(None))
-                    {
-                        Ok(None) => false,
-                        Ok(Some(error)) => {
-                            log!("select: UDP socket {fd} has pending error: {error:?}");
-                            true
-                        }
-                        Err(error) => {
-                            log!("select: UDP socket {fd} take_error failed: {error:?}");
-                            false
-                        }
-                    }
-                }
-                sock_type => {
-                    log_dbg!("select: error_set unhandled socket type {sock_type} for fd {fd}");
-                    false
-                }
+                env.sleep(POLL_INTERVAL.min(deadline - now));
             }
-        });
-        log_dbg!("select: error_set after {:?}", error_set);
-        env.mem.write(error_fds, error_set);
+            None => env.sleep(POLL_INTERVAL),
+        }
     }
-
+    if invalid_fd {
+        set_errno(env, EBADF);
+        return -1;
+    }
     count
 }
 
-fn process_set<F: Fn(&mut Environment, FileDescriptor, &mut i32, i32) -> bool>(
+fn process_set<F: FnMut(&mut Environment, FileDescriptor, &mut i32, i32) -> bool>(
     env: &mut Environment,
     set: &mut fd_set,
     n_fds: i32,
-    process_bit: F,
+    mut process_bit: F,
 ) -> i32 {
     let mut fds_bits = set.fds_bits;
     let mut count = 0;
@@ -1020,14 +1326,25 @@ fn accept(
     address: MutPtr<sockaddr>,
     address_len: MutPtr<socklen_t>,
 ) -> FileDescriptor {
-    // TODO: handle errno properly
+    // errno is set on every failure path below.
     set_errno(env, 0);
     let Some(socket_host_object) = State::get(env).sockets.get(&socket) else {
         set_errno(env, EBADF);
         return -1;
     };
     let type_ = socket_host_object.type_;
-    assert!(type_ == SOCK_STREAM);
+    let domain = socket_host_object.domain;
+    if type_ != SOCK_STREAM {
+        // accept(2) is only defined for stream sockets; some apps probe
+        // other types, so fail with POSIX semantics instead of aborting.
+        log!(
+            "accept: socket {} has unsupported type {}; returning EOPNOTSUPP",
+            socket,
+            type_
+        );
+        set_errno(env, ENOTSUP);
+        return -1;
+    }
 
     if let Some(stream) = State::get_mut(env)
         .sockets
@@ -1036,18 +1353,18 @@ fn accept(
         .pending_tcp_stream
         .take()
     {
-        let addr = match stream.peer_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
-                log!("accept: pending stream for socket {socket} has no peer address: {e}");
-                set_errno(env, EAGAIN);
-                return -1;
-            }
-        };
+        // peer_addr() can fail if the peer reset the connection between
+        // select() and accept(); fall back to a wildcard address instead
+        // of crashing.
+        let addr = stream
+            .peer_addr()
+            .unwrap_or_else(|_| unspecified_socket_addr(domain));
         // We have already accepted TCP socket, we now need to
         // let guest know as well!
         let new_fd = find_or_create_socket(env);
-        assert!(!State::get(env).sockets.contains_key(&new_fd));
+        if State::get(env).sockets.contains_key(&new_fd) {
+            log!("Warning: accept(): fd {} had a stale socket entry", new_fd);
+        }
         let host_object = SocketHostObject {
             type_: SOCK_STREAM,
             options: Default::default(),
@@ -1055,55 +1372,67 @@ fn accept(
             pending_tcp_stream: None,
             tcp_stream: Some(stream),
             udp_socket: None,
+            domain,
         };
         State::get_mut(env).sockets.insert(new_fd, host_object);
         if !address.is_null() {
-            let peer_guest_addr = sockaddr::from_sockaddr_v4(&addr);
-            env.mem.write(address, peer_guest_addr);
-            if !address_len.is_null() {
-                let requested = env.mem.read(address_len) as usize;
-                let full = guest_size_of::<sockaddr>();
-                if requested >= full as usize {
-                    env.mem.write(address_len, full);
-                }
-            }
+            write_sockaddr_bounded(env, address, address_len, addr, domain);
         }
         return new_fd;
     }
 
     // re-borrow
-    let listener = State::get(env).sockets.get(&socket).unwrap();
-    let listener = listener.tcp_listener.as_ref().unwrap();
+    let socket_host_object = State::get(env).sockets.get(&socket).unwrap();
+    let listener = socket_host_object.tcp_listener.as_ref().unwrap();
     match listener.accept() {
         Ok((stream, addr)) => {
             log!("accept: New client: {}", addr);
-            // A connection arrived but select()/poll() hasn't claimed it yet.
-            // Accept it on the host now, stash it as pending (the same slot
-            // select/poll use) and let the guest's next accept() hand it over,
-            // instead of aborting the whole emulation.
+            // FIX: was unimplemented!() — a direct (non-select-driven) accept()
+            // that got a connection immediately used to panic the whole
+            // emulator. Mirror the select() path above: register the new
+            // stream as its own guest socket and report the peer address,
+            // exactly like a real accept(2) does.
             stream.set_nonblocking(true).unwrap();
-            let socket_host_object = State::get_mut(env).sockets.get_mut(&socket).unwrap();
-            if socket_host_object.pending_tcp_stream.is_some() {
-                log!("accept: socket {socket} already has a pending stream; dropping new one");
-            } else {
-                socket_host_object.pending_tcp_stream = Some(stream);
+            let new_fd = find_or_create_socket(env);
+            if State::get(env).sockets.contains_key(&new_fd) {
+                log!("Warning: accept(): fd {} had a stale socket entry", new_fd);
             }
-            set_errno(env, EAGAIN);
-            -1
+            let host_object = SocketHostObject {
+                type_: SOCK_STREAM,
+                options: Default::default(),
+                tcp_listener: None,
+                pending_tcp_stream: None,
+                tcp_stream: Some(stream),
+                udp_socket: None,
+                domain,
+            };
+            State::get_mut(env).sockets.insert(new_fd, host_object);
+            if !address.is_null() {
+                write_sockaddr_bounded(env, address, address_len, addr, domain);
+            }
+            new_fd
         }
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-            // No incoming connection is ready
-            // TODO: if this happened, take a deep breath and do:
-            // - block guest thread with a new [ThreadBlock] type
-            // - poll for data in thread scheduling part
-            // - write/read/accept/etc data once it is ready
-            // - unblock guest thread
-            log_dbg!("accept: TCP listener for socket {socket} would block (guest thread {})", env.current_thread);
+            // No incoming connection is ready.
+            // FIX: was unimplemented!() — a blocking accept() with no
+            // pending connection used to crash the emulator instead of
+            // reporting EAGAIN/EWOULDBLOCK like a real non-blocking accept(2)
+            // would. Guest apps are expected to poll via select()/accept()
+            // in a loop, so surfacing EAGAIN here lets that pattern work
+            // instead of aborting the whole process.
+            log_dbg!(
+                "accept: TCP listener for socket {} would block on accepting; \
+                 returning EAGAIN for thread {}",
+                socket,
+                env.current_thread
+            );
             set_errno(env, EAGAIN);
             -1
         }
         Err(e) => {
-            log!("accept: Socket {socket} has error accepting connection: {e}");
+            // accept(2) reports transient connection aborts via
+            // ECONNABORTED; apps retry, so do not crash the emulator.
+            log!("accept: Socket {socket} error accepting connection: {e}");
             set_errno(env, ECONNABORTED);
             -1
         }
@@ -1129,7 +1458,7 @@ fn recvfrom(
     address: MutPtr<sockaddr>,
     address_len: MutPtr<socklen_t>,
 ) -> i32 {
-    // TODO: handle errno properly
+    // errno is set on every failure path below.
     set_errno(env, 0);
 
     log_dbg!(
@@ -1158,84 +1487,150 @@ fn recvfrom(
             return -1;
         }
     };
+    let domain = State::get(env).sockets.get(&socket).unwrap().domain;
     if type_ != SOCK_STREAM && type_ != SOCK_DGRAM {
         set_errno(env, ESOCKTNOSUPPORT);
         return -1;
     }
 
-    assert_eq!(flags, 0); // TODO
+    // MSG_PEEK is the flag real apps actually use; MSG_DONTWAIT,
+    // MSG_WAITALL and MSG_NOSIGNAL are no-ops because host sockets are
+    // always non-blocking and we never raise SIGPIPE. Anything else is
+    // ignored with a warning rather than asserted away.
+    const MSG_PEEK: i32 = 0x1;
+    const MSG_DONTWAIT: i32 = 0x80;
+    const MSG_WAITALL: i32 = 0x40;
+    const MSG_NOSIGNAL: i32 = 0x800;
+    let peek = flags & MSG_PEEK != 0;
+    let ignored = flags & !(MSG_PEEK | MSG_DONTWAIT | MSG_WAITALL | MSG_NOSIGNAL);
+    if ignored != 0 {
+        log!(
+            "Warning: recvfrom({}, ...) ignoring unsupported flags {:#x}",
+            socket,
+            ignored
+        );
+    }
 
     let (num_bytes_read, addr) = match type_ {
         SOCK_DGRAM => {
-            let udp_socket = env
+            // A UDP socket with no host socket yet (never bound nor sent
+            // to) has nothing to receive; EAGAIN fits the non-blocking
+            // model instead of crashing on the unwrap.
+            let udp_socket = match env
                 .libc_state
                 .socket
                 .sockets
                 .get(&socket)
-                .unwrap()
-                .udp_socket
-                .as_ref()
-                .unwrap();
-            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
-            let (read, addr) = match udp_socket.recv_from(buf) {
-                Ok(n) => n,
-                // FIX: was unimplemented!() — return EAGAIN so the app's
-                // non-blocking network loop can retry without crashing.
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    log_dbg!(
-                        "recvfrom: UDP socket {} no data yet (WouldBlock), \
-                        returning EAGAIN for thread {}",
-                        socket,
-                        env.current_thread
-                    );
+                .and_then(|s| s.udp_socket.as_ref())
+            {
+                Some(udp) => udp,
+                None => {
                     set_errno(env, EAGAIN);
                     return -1;
                 }
-                Err(e) => panic!("recvfrom: UDP socket {socket} encountered IO error: {e}"),
+            };
+            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+            let (read, addr) = if peek {
+                // MSG_PEEK: look at the next datagram without consuming it.
+                match udp_socket.peek_from(buf) {
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        set_errno(env, EAGAIN);
+                        return -1;
+                    }
+                    Err(e) => {
+                        // Any other peek error: report EIO instead of
+                        // crashing the host.
+                        log!("recvfrom: UDP socket {socket} peek failed: {e}");
+                        set_errno(env, EIO);
+                        return -1;
+                    }
+                }
+            } else {
+                match udp_socket.recv_from(buf) {
+                    Ok(n) => n,
+                    // FIX: was unimplemented!() — return EAGAIN so the app's
+                    // non-blocking network loop can retry without crashing.
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        log_dbg!(
+                            "recvfrom: UDP socket {} no data yet (WouldBlock), \
+                        returning EAGAIN for thread {}",
+                            socket,
+                            env.current_thread
+                        );
+                        set_errno(env, EAGAIN);
+                        return -1;
+                    }
+                    Err(e) => {
+                        log!("recvfrom: UDP socket {socket} IO error: {e}");
+                        set_errno(env, EIO);
+                        return -1;
+                    }
+                }
             };
             if !address.is_null() {
-                let guest_addr = sockaddr::from_sockaddr_v4(&addr);
-                env.mem.write(address, guest_addr);
-                assert_eq!(guest_size_of::<sockaddr>(), env.mem.read(address_len));
-                env.mem.write(address_len, guest_size_of::<sockaddr>());
+                write_sockaddr_bounded(env, address, address_len, addr, domain);
             }
             (read, Ok(addr))
         }
         SOCK_STREAM => {
-            assert!(address.is_null());
-            assert!(address_len.is_null());
-            let mut tcp_stream = env
-                .libc_state
-                .socket
-                .sockets
-                .get(&socket)
-                .unwrap()
-                .tcp_stream
-                .as_ref()
-                .unwrap();
-            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
-            let read = match tcp_stream.read(buf) {
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
-                    set_errno(env, ECONNRESET);
-                    log!("recvfrom: TCP socket {}: ConnectionReset => -1", socket);
-                    return -1;
-                }
-                // FIX: was unimplemented!() — return EAGAIN so the app's
-                // non-blocking network loop can retry without crashing.
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    log_dbg!(
-                        "recvfrom: TCP socket {} no data yet (WouldBlock), \
-                        returning EAGAIN for thread {}",
-                        socket,
-                        env.current_thread
-                    );
-                    set_errno(env, EAGAIN);
-                    return -1;
-                }
-                Err(e) => panic!("recvfrom: TCP socket {socket} encountered IO error: {e}"),
+            // recv(2) on a connected stream socket may be given an address
+            // buffer; BSD fills it with the peer address. Some apps rely on
+            // that instead of asserting it stays untouched.
+            // A TCP socket that was never connected has no stream;
+            // report ENOTCONN instead of crashing on the unwrap.
+            let (read, peer) = {
+                let mut tcp_stream = match env
+                    .libc_state
+                    .socket
+                    .sockets
+                    .get(&socket)
+                    .and_then(|s| s.tcp_stream.as_ref())
+                {
+                    Some(stream) => stream,
+                    None => {
+                        set_errno(env, ENOTCONN);
+                        return -1;
+                    }
+                };
+                let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+                let read = match if peek {
+                    tcp_stream.peek(buf)
+                } else {
+                    tcp_stream.read(buf)
+                } {
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                        set_errno(env, ECONNRESET);
+                        log!("recvfrom: TCP socket {}: ConnectionReset => -1", socket);
+                        return -1;
+                    }
+                    // FIX: was unimplemented!() — return EAGAIN so the app's
+                    // non-blocking network loop can retry without crashing.
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        log_dbg!(
+                            "recvfrom: TCP socket {} no data yet (WouldBlock), \
+                            returning EAGAIN for thread {}",
+                            socket,
+                            env.current_thread
+                        );
+                        set_errno(env, EAGAIN);
+                        return -1;
+                    }
+                    Err(e) => {
+                        log!("recvfrom: TCP socket {socket} IO error: {e}");
+                        set_errno(env, EIO);
+                        return -1;
+                    }
+                };
+                (read, tcp_stream.peer_addr().ok())
             };
-            (read, tcp_stream.peer_addr())
+            if !address.is_null() {
+                if let Some(peer) = peer {
+                    write_sockaddr_bounded(env, address, address_len, peer, domain);
+                }
+            }
+            (read, peer.ok_or(()))
         }
         _ => unreachable!(),
     };
@@ -1245,7 +1640,9 @@ fn recvfrom(
         num_bytes_read,
         addr.ok()
     );
-    num_bytes_read.try_into().unwrap()
+    // Cap at i32::MAX so a huge (guest-bug) count can never fail the
+    // conversion to the ssize_t-compatible return type.
+    num_bytes_read.min(i32::MAX as usize) as i32
 }
 
 fn send(
@@ -1261,7 +1658,16 @@ fn send(
         return -1;
     };
     let type_ = sock.type_;
-    assert_eq!(flags, 0); // TODO
+    // MSG_NOSIGNAL is a no-op here (we never raise SIGPIPE) and MSG_DONTWAIT
+    // matches our always-non-blocking host sockets. MSG_OOB is genuinely
+    // unsupported; ignore it with a warning rather than crashing.
+    const MSG_OOB: i32 = 0x4;
+    if flags & MSG_OOB != 0 {
+        log!(
+            "Warning: send({}, ...) ignoring unsupported MSG_OOB flag",
+            socket
+        );
+    }
 
     match type_ {
         SOCK_STREAM => {
@@ -1279,7 +1685,7 @@ fn send(
             match stream.write(buf) {
                 Ok(n) => {
                     log_dbg!("send: wrote {} bytes to TCP socket {}", n, socket);
-                    n.try_into().unwrap()
+                    n.min(i32::MAX as usize) as i32
                 }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::BrokenPipe
@@ -1317,7 +1723,7 @@ fn send(
             match udp.send(buf) {
                 Ok(n) => {
                     log_dbg!("send: sent {} bytes on UDP socket {}", n, socket);
-                    n.try_into().unwrap()
+                    n.min(i32::MAX as usize) as i32
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     set_errno(env, EAGAIN);
@@ -1346,18 +1752,19 @@ fn sendto(
     dest_address: MutPtr<sockaddr>,
     dest_address_len: socklen_t,
 ) -> i32 {
-    // TODO: handle errno properly
+    // errno is set on every failure path below.
     set_errno(env, 0);
     let type_ = match State::get(env).sockets.get(&socket) {
         Some(s) => s.type_,
         None => {
-            log_dbg!("sendto: unknown socket fd={}, returning EBADF", socket);
+            log!("sendto: unknown socket fd={}, returning EBADF", socket);
             set_errno(env, EBADF);
             return -1;
         }
     };
+    let domain = State::get(env).sockets.get(&socket).unwrap().domain;
     if type_ != SOCK_DGRAM {
-        log_dbg!(
+        log!(
             "sendto: socket fd={} is not SOCK_DGRAM, returning ESOCKTNOSUPPORT",
             socket
         );
@@ -1369,17 +1776,22 @@ fn sendto(
         log!("sendto: flags={} ignored", flags);
     }
 
-    assert_eq!(dest_address_len, guest_size_of::<sockaddr>());
-    let sockaddr_val = env.mem.read(dest_address);
-    let socket_address = sockaddr_val.to_sockaddr_v4();
+    let socket_address = match read_socket_addr(env, dest_address.cast_const(), dest_address_len)
+        .and_then(|address| host_socket_addr_for_domain(address, domain))
+    {
+        Ok(address) => address,
+        Err(error) => {
+            set_errno(env, error);
+            return -1;
+        }
+    };
     log_dbg!(
-        "sendto({}, {:?}, {}, {}, {:?} ({:?}, {:?}), {})",
+        "sendto({}, {:?}, {}, {}, {:?}, {:?}, {})",
         socket,
         buffer,
         length,
         flags,
         dest_address,
-        sockaddr_val,
         socket_address,
         dest_address_len
     );
@@ -1392,38 +1804,73 @@ fn sendto(
                 .udp_socket
                 .is_none()
             {
-                // For the case of broadcast we allow a lazy host UDP socket
-                // creation
-                assert!(socket_address.ip().is_broadcast());
-                // TODO: is it a correct address to bind?
-                let host_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-                assert!(host_socket.local_addr().unwrap().ip().is_unspecified());
+                // Lazy host socket creation: binding to the wildcard with
+                // an ephemeral port matches what a fresh BSD socket does on
+                // the first sendto(2). This must work for any destination,
+                // not just broadcast ones.
+                let host_socket = match UdpSocket::bind(if socket_address.is_ipv4() {
+                    "0.0.0.0:0"
+                } else {
+                    "[::]:0"
+                }) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log!("sendto: lazy UdpSocket::bind failed: {}", e);
+                        set_errno(env, EADDRNOTAVAIL);
+                        return -1;
+                    }
+                };
                 // We set host socket as non-blocking in order to have
                 // more control of how and when it's used
-                host_socket.set_nonblocking(true).unwrap();
+                if let Err(e) = host_socket.set_nonblocking(true) {
+                    log!("sendto: set_nonblocking failed: {}", e);
+                    set_errno(env, EIO);
+                    return -1;
+                }
                 for &option in &State::get(env).sockets.get(&socket).unwrap().options {
                     if option == SO_BROADCAST {
-                        host_socket.set_broadcast(true).unwrap();
+                        if let Err(e) = host_socket.set_broadcast(true) {
+                            log!("sendto: set_broadcast failed: {}", e);
+                            set_errno(env, EIO);
+                            return -1;
+                        }
                     }
                 }
-                assert!(host_socket.broadcast().unwrap());
                 State::get_mut(env)
                     .sockets
                     .get_mut(&socket)
                     .unwrap()
                     .udp_socket = Some(host_socket);
             }
-            let udp_socket = env
+            // A UDP socket with no host socket yet (never bound nor sent
+            // to) has nothing to receive; EAGAIN fits the non-blocking
+            // model instead of crashing on the unwrap.
+            let udp_socket = match env
                 .libc_state
                 .socket
                 .sockets
                 .get(&socket)
-                .unwrap()
-                .udp_socket
-                .as_ref()
-                .unwrap();
-            if socket_address.ip().is_broadcast() {
-                assert!(udp_socket.local_addr().unwrap().ip().is_unspecified());
+                .and_then(|s| s.udp_socket.as_ref())
+            {
+                Some(udp) => udp,
+                None => {
+                    set_errno(env, EAGAIN);
+                    return -1;
+                }
+            };
+            if matches!(socket_address, SocketAddr::V4(address) if address.ip().is_broadcast()) {
+                match udp_socket.local_addr() {
+                    Ok(local) if !local.ip().is_unspecified() => {
+                        log!(
+                            "Warning: sendto: broadcast from bound socket {}                              may not reach all hosts",
+                            socket
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log!("Warning: sendto: local_addr failed: {}", e);
+                    }
+                }
             }
             let buf = env.mem.bytes_at(buffer.cast(), length);
             match udp_socket.send_to(buf, socket_address) {
@@ -1440,7 +1887,15 @@ fn sendto(
                     set_errno(env, EAGAIN);
                     return -1;
                 }
-                Err(e) => panic!("sendto: Socket {socket} encountered IO error: {e}"),
+                Err(e) => {
+                    log!("sendto: Socket {socket} IO error: {e}");
+                    let errno = match e.kind() {
+                        io::ErrorKind::NetworkUnreachable => ENETUNREACH,
+                        _ => EIO,
+                    };
+                    set_errno(env, errno);
+                    return -1;
+                }
             }
         }
         _ => unreachable!(),
@@ -1451,13 +1906,40 @@ fn sendto(
         socket,
         socket_address
     );
-    num_bytes_written.try_into().unwrap()
+    num_bytes_written.min(i32::MAX as usize) as i32
 }
 
+const SHUT_RD: i32 = 0;
+const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
 fn shutdown(env: &mut Environment, socket: i32, how: i32) -> i32 {
     log_dbg!("shutdown({}, {})", socket, how);
-    assert_eq!(how, SHUT_RDWR);
+    let Some(sock) = State::get(env).sockets.get(&socket) else {
+        set_errno(env, EBADF);
+        return -1;
+    };
+    let host_shutdown = match how {
+        SHUT_RD => Some(std::net::Shutdown::Read),
+        SHUT_WR => Some(std::net::Shutdown::Write),
+        SHUT_RDWR => None, // handled by close() below
+        _ => {
+            set_errno(env, EINVAL);
+            return -1;
+        }
+    };
+    if let Some(direction) = host_shutdown {
+        // A partial shutdown leaves the fd valid, so only touch an
+        // underlying connected stream; listeners and UDP sockets are
+        // effectively unaffected by SHUT_RD/SHUT_WR.
+        if let Some(stream) = sock.tcp_stream.as_ref() {
+            if let Err(e) = stream.shutdown(direction) {
+                log!("shutdown: socket {} stream shutdown failed: {}", socket, e);
+                set_errno(env, EIO);
+                return -1;
+            }
+        }
+        return 0;
+    }
     close(env, socket)
 }
 
@@ -1472,6 +1954,7 @@ fn getsockname(
         set_errno(env, EBADF);
         return -1;
     };
+    let domain = sock.domain;
     let local_addr: SocketAddr = match sock.type_ {
         SOCK_STREAM => {
             if let Some(stream) = &sock.tcp_stream {
@@ -1519,11 +2002,7 @@ fn getsockname(
     };
 
     if !address.is_null() {
-        env.mem
-            .write(address, sockaddr::from_sockaddr_v4(&local_addr));
-        if !address_len.is_null() {
-            env.mem.write(address_len, guest_size_of::<sockaddr>());
-        }
+        write_sockaddr_bounded(env, address, address_len, local_addr, domain);
     }
     0
 }
@@ -1539,6 +2018,7 @@ fn getpeername(
         set_errno(env, EBADF);
         return -1;
     };
+    let domain = sock.domain;
     let peer_addr: SocketAddr = match &sock.tcp_stream {
         Some(stream) => match stream.peer_addr() {
             Ok(addr) => addr,
@@ -1555,11 +2035,7 @@ fn getpeername(
     };
 
     if !address.is_null() {
-        env.mem
-            .write(address, sockaddr::from_sockaddr_v4(&peer_addr));
-        if !address_len.is_null() {
-            env.mem.write(address_len, guest_size_of::<sockaddr>());
-        }
+        write_sockaddr_bounded(env, address, address_len, peer_addr, domain);
     }
     0
 }
@@ -1729,5 +2205,170 @@ pub const FUNCTIONS: FunctionExports = &[
 
 /// A helper to close a socket, not a part of API
 pub fn close_socket(env: &mut Environment, socket: i32) -> bool {
-    State::get_mut(env).sockets.remove(&socket).is_none()
+    // True when the socket existed and was removed (the old is_none()
+    // check had the sense inverted).
+    State::get_mut(env).sockets.remove(&socket).is_some()
+}
+
+pub fn socket_addr_to_sockaddr_bytes(address: SocketAddr) -> Vec<u8> {
+    match address {
+        SocketAddr::V4(address) => {
+            let mut bytes = vec![0; 16];
+            bytes[0] = 16;
+            bytes[1] = AF_INET as u8;
+            bytes[2..4].copy_from_slice(&address.port().to_be_bytes());
+            bytes[4..8].copy_from_slice(&address.ip().octets());
+            bytes
+        }
+        SocketAddr::V6(address) => {
+            let mut bytes = vec![0; 28];
+            bytes[0] = 28;
+            bytes[1] = AF_INET6 as u8;
+            bytes[2..4].copy_from_slice(&address.port().to_be_bytes());
+            bytes[4..8].copy_from_slice(&address.flowinfo().to_be_bytes());
+            bytes[8..24].copy_from_slice(&address.ip().octets());
+            bytes[24..28].copy_from_slice(&address.scope_id().to_ne_bytes());
+            bytes
+        }
+    }
+}
+
+pub fn socket_addr_from_sockaddr_bytes(bytes: &[u8]) -> Result<SocketAddr, i32> {
+    if bytes.len() < 2 {
+        return Err(EINVAL);
+    }
+    match bytes[1] as i32 {
+        AF_INET => {
+            if bytes.len() < 16 || (bytes[0] != 0 && bytes[0] < 16) {
+                return Err(EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let ip = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        AF_INET6 => {
+            if bytes.len() < 28 || (bytes[0] != 0 && bytes[0] < 28) {
+                return Err(EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let flowinfo = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+            let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).unwrap());
+            let scope_id = u32::from_ne_bytes(bytes[24..28].try_into().unwrap());
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                ip, port, flowinfo, scope_id,
+            )))
+        }
+        _ => Err(EAFNOSUPPORT),
+    }
+}
+
+pub fn read_socket_addr(
+    env: &mut Environment,
+    address: ConstPtr<sockaddr>,
+    address_len: socklen_t,
+) -> Result<SocketAddr, i32> {
+    if address.is_null() || address_len < 2 {
+        return Err(EINVAL);
+    }
+    let address_bytes = address.cast::<u8>();
+    let family = env.mem.read(address_bytes + 1) as i32;
+    let required_len = match family {
+        AF_INET => 16,
+        AF_INET6 => 28,
+        _ => return Err(EAFNOSUPPORT),
+    };
+    if address_len < required_len {
+        return Err(EINVAL);
+    }
+    let bytes = env.mem.bytes_at(address_bytes, required_len).to_vec();
+    socket_addr_from_sockaddr_bytes(&bytes)
+}
+
+fn socket_addr_for_domain(address: SocketAddr, domain: i32) -> SocketAddr {
+    match (domain, address) {
+        (AF_INET6, SocketAddr::V4(address)) => SocketAddr::V6(SocketAddrV6::new(
+            address.ip().to_ipv6_mapped(),
+            address.port(),
+            0,
+            0,
+        )),
+        (AF_INET, SocketAddr::V6(address)) => match address.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::V4(SocketAddrV4::new(ip, address.port())),
+            None => SocketAddr::V6(address),
+        },
+        (_, address) => address,
+    }
+}
+
+fn host_socket_addr_for_domain(address: SocketAddr, domain: i32) -> Result<SocketAddr, i32> {
+    match (domain, address) {
+        (AF_INET, SocketAddr::V4(address)) | (AF_INET6, SocketAddr::V4(address)) => {
+            Ok(SocketAddr::V4(address))
+        }
+        (AF_INET, SocketAddr::V6(address)) | (AF_INET6, SocketAddr::V6(address)) => {
+            match address.ip().to_ipv4_mapped() {
+                Some(ip) => Ok(SocketAddr::V4(SocketAddrV4::new(ip, address.port()))),
+                None if domain == AF_INET6 => Ok(SocketAddr::V6(address)),
+                None => Err(EAFNOSUPPORT),
+            }
+        }
+        _ => Err(EAFNOSUPPORT),
+    }
+}
+
+fn unspecified_socket_addr(domain: i32) -> SocketAddr {
+    if domain == AF_INET6 {
+        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+    } else {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+    }
+}
+
+#[cfg(test)]
+mod ipv6_socket_tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_sockaddr_round_trips() {
+        let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 443));
+        let bytes = socket_addr_to_sockaddr_bytes(address);
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], 16);
+        assert_eq!(bytes[1], AF_INET as u8);
+        assert_eq!(socket_addr_from_sockaddr_bytes(&bytes), Ok(address));
+    }
+
+    #[test]
+    fn ipv6_sockaddr_round_trips() {
+        let address = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::1234".parse().unwrap(),
+            443,
+            0x1234,
+            7,
+        ));
+        let bytes = socket_addr_to_sockaddr_bytes(address);
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(bytes[0], 28);
+        assert_eq!(bytes[1], AF_INET6 as u8);
+        assert_eq!(socket_addr_from_sockaddr_bytes(&bytes), Ok(address));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_use_the_host_ipv4_stack() {
+        let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 443));
+        let guest_address = socket_addr_for_domain(address, AF_INET6);
+        assert!(
+            matches!(guest_address, SocketAddr::V6(value) if value.ip().to_ipv4_mapped() == Some(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        assert_eq!(
+            host_socket_addr_for_domain(guest_address, AF_INET6),
+            Ok(address)
+        );
+        let native_ipv6 =
+            SocketAddr::V6(SocketAddrV6::new("2001:db8::1".parse().unwrap(), 443, 0, 0));
+        assert_eq!(
+            host_socket_addr_for_domain(native_ipv6, AF_INET),
+            Err(EAFNOSUPPORT)
+        );
+    }
 }

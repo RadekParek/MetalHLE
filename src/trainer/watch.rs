@@ -5,8 +5,8 @@
  */
 
 //! Bounded activity feed and explicit before/after experiment snapshots.
-use super::bulk::containing_allocation;
 use super::{classify::number, Mem, SearchResult, VType};
+use super::bulk::containing_allocation;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
@@ -30,11 +30,7 @@ pub(super) struct Activity {
 impl Activity {
     pub fn record(&mut self, change: Change) {
         self.changed_last_sample += 1;
-        if let Some(i) = self
-            .entries
-            .iter()
-            .position(|c| c.addr == change.addr && c.vtype == change.vtype)
-        {
+        if let Some(i) = self.entries.iter().position(|c| c.addr == change.addr && c.vtype == change.vtype) {
             self.entries.remove(i);
         }
         self.entries.push_front(change);
@@ -43,12 +39,7 @@ impl Activity {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum WatchFilter {
-    Changed,
-    Same,
-    Increased,
-    Decreased,
-}
+pub enum WatchFilter { Changed, Same, Increased, Decreased }
 
 impl WatchFilter {
     fn matches(self, t: VType, before: u64, after: u64) -> bool {
@@ -72,16 +63,10 @@ impl Snapshot {
     pub fn capture(mem: &Mem, results: &[SearchResult]) -> Self {
         let mut allocations = mem.live_allocations();
         allocations.sort_unstable_by_key(|a| a.0);
-        let values = results
-            .iter()
-            .filter_map(|r| {
-                let allocation = containing_allocation(&allocations, r.addr, r.vtype.size())?;
-                Some((
-                    (r.addr, r.vtype),
-                    (r.vtype.read_at(mem, r.addr)?, allocation),
-                ))
-            })
-            .collect();
+        let values = results.iter().filter_map(|r| {
+            let allocation = containing_allocation(&allocations, r.addr, r.vtype.size())?;
+            Some(((r.addr, r.vtype), (r.vtype.read_at(mem, r.addr)?, allocation)))
+        }).collect();
         Self { values }
     }
 
@@ -109,10 +94,8 @@ mod tests {
     #[test]
     fn explicit_snapshot_survives_live_value_refreshes() {
         let (mut mem, base) = memory(64);
-        let mut hits = vec![
-            result(&mut mem, base, VType::I32, "30"),
-            result(&mut mem, base + 8, VType::I32, "30"),
-        ];
+        let mut hits = vec![result(&mut mem, base, VType::I32, "30"),
+            result(&mut mem, base + 8, VType::I32, "30")];
         let snapshot = Snapshot::capture(&mem, &hits);
         VType::I32.write_at(&mut mem, base, 29);
         hits[0].bits = 29; // ordinary live refresh must not move the baseline
@@ -124,11 +107,8 @@ mod tests {
     #[test]
     fn comparisons_use_signed_and_float_values_not_unsigned_bits() {
         assert!(WatchFilter::Increased.matches(VType::I8, 255, 0));
-        assert!(WatchFilter::Decreased.matches(
-            VType::F32,
-            2.5f32.to_bits() as u64,
-            1.5f32.to_bits() as u64
-        ));
+        assert!(WatchFilter::Decreased.matches(VType::F32,
+            2.5f32.to_bits() as u64, 1.5f32.to_bits() as u64));
         assert!(!WatchFilter::Increased.matches(VType::F32, 0, f32::NAN.to_bits() as u64));
         assert!(WatchFilter::Same.matches(VType::I32, 2, 2));
         assert!(!WatchFilter::Changed.matches(VType::I32, 2, 2));
@@ -149,23 +129,11 @@ mod tests {
         let mut feed = Activity::default();
         let at = Instant::now();
         for addr in 0..200 {
-            feed.record(Change {
-                addr,
-                vtype: VType::I32,
-                before: 5,
-                after: 4,
-                at,
-            });
+            feed.record(Change { addr, vtype: VType::I32, before: 5, after: 4, at });
         }
         assert_eq!(feed.entries.len(), ACTIVITY_LIMIT);
         assert_eq!(feed.changed_last_sample, 200);
-        feed.record(Change {
-            addr: 199,
-            vtype: VType::I32,
-            before: 4,
-            after: 3,
-            at,
-        });
+        feed.record(Change { addr: 199, vtype: VType::I32, before: 4, after: 3, at });
         assert_eq!(feed.entries.len(), ACTIVITY_LIMIT);
         assert_eq!(feed.entries[0].after, 3);
     }

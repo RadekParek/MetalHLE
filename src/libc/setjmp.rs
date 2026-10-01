@@ -65,10 +65,6 @@ fn setjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>) -> i32 {
     0 // no longjmp() was performed
 }
 
-fn siglongjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>, status: u32) {
-    longjmp(env, jmp_buf, status)
-}
-
 fn sigsetjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>, _save_mask: i32) -> i32 {
     // Signal masks are not currently emulated, but the register/stack state is
     // identical to setjmp for the apps supported here.
@@ -143,6 +139,4 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(__longjmp(_, _)),
     export_c_func!(_setjmp(_)),
     export_c_func!(_longjmp(_, _)),
-    export_c_func!(sigsetjmp(_, _)),
-    export_c_func!(siglongjmp(_, _)),
 ];

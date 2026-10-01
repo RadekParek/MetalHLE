@@ -164,7 +164,7 @@ fn AudioServicesCreateSystemSoundID(
                 .copy_from_slice(data.as_slice());
 
             let (al_format, al_frequency, decoded_data) =
-                decode_buffer(&env.mem, &format, tmp.cast(), size as GuestUSize);
+                decode_buffer(&env.mem, &format, tmp.cast(), size as GuestUSize, &[]);
             env.mem.free(tmp.cast());
             log!(
                 "AudioServicesCreateSystemSoundID: {:?} -> al_format=0x{:x}, al_freq={}, pcm_bytes={}",
@@ -257,10 +257,13 @@ fn AudioServicesDisposeSystemSoundID(
 fn AudioServicesPlaySystemSound(env: &mut Environment, in_system_sound_id: SystemSoundID) {
     log!("AudioServicesPlaySystemSound({})", in_system_sound_id);
     if in_system_sound_id == kSystemSoundID_Vibrate {
-        log!("TODO: vibration (AudioServicesPlaySystemSound)");
+        // Vibration has no host equivalent in touchHLE; acknowledge quietly.
+        log_dbg!("AudioServicesPlaySystemSound(vibrate) (no host haptics)");
         return;
     } else if in_system_sound_id == kSystemSoundID_UserPreferredAlert {
-        log!("TODO: alert sound (AudioServicesPlaySystemSound)");
+        // The user-preferred alert is vibrate-only on a silent iPhone, which
+        // matches our (no-op) capability.
+        log_dbg!("AudioServicesPlaySystemSound(userPreferredAlert) (no host audio)");
         return;
     }
 

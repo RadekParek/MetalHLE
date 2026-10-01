@@ -318,7 +318,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSUInteger)indexOfObject:(id)object inRange:(NSRange)range {
-    for i in range.location..(range.location + range.length) {
+    // Use checked arithmetic so a hostile range (location + length
+    // overflowing NSUInteger) cannot panic the host.
+    let Some(end) = range.location.checked_add(range.length) else {
+        return NSNotFound as NSUInteger;
+    };
+    for i in range.location..end {
         let curr: id = msg![env; this objectAtIndex:i];
         let equal: bool = msg![env; object isEqual:curr];
         if equal {
@@ -340,7 +345,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSUInteger)indexOfObjectIdenticalTo:(id)object inRange:(NSRange)range {
-    for i in range.location..(range.location + range.length) {
+    // Use checked arithmetic so a hostile range cannot overflow.
+    let Some(end) = range.location.checked_add(range.length) else {
+        return NSNotFound as NSUInteger;
+    };
+    for i in range.location..end {
         let curr: id = msg![env; this objectAtIndex:i];
         if curr == object {
             return i;
@@ -382,8 +391,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)subarrayWithRange:(NSRange)range {
+    // Apple raises NSRangeException for an out-of-bounds range; we log and
+    // return an empty array so buggy/malicious guests don't crash the host.
+    // Copy range fields to locals first: NSRange is repr(packed), so log!
+    // would otherwise take misaligned references to its fields.
+    let (loc, len) = (range.location, range.length);
+    let count: NSUInteger = msg![env; this count];
+    let Some(end) = loc.checked_add(len) else {
+        log!("Warning: subarrayWithRange: range overflow (location {}, length {})", loc, len);
+        let res = from_vec(env, Vec::new());
+        return autorelease(env, res);
+    };
+    if loc > count || end > count {
+        log!("Warning: subarrayWithRange: range out of bounds (location {}, length {}, count {})", loc, len, count);
+        let res = from_vec(env, Vec::new());
+        return autorelease(env, res);
+    }
     let mut objects = Vec::with_capacity(range.length as usize);
-    for i in range.location..(range.location + range.length) {
+    for i in range.location..end {
         let obj: id = msg![env; this objectAtIndex:i];
         retain(env, obj);
         objects.push(obj);
@@ -642,10 +667,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())removeObjectsInRange:(NSRange)range {
-    // Remove in reverse order to preserve indices.
-    let end = range.location + range.length;
+    // Remove in reverse order to preserve indices. Clamp to the current
+    // count and guard against range overflow instead of panicking.
+    // Copy range fields to locals: NSRange is repr(packed).
+    let (loc, len) = (range.location, range.length);
+    let count: NSUInteger = msg![env; this count];
+    let Some(end) = loc.checked_add(len) else {
+        log!("Warning: removeObjectsInRange: range overflow (location {}, length {})", loc, len);
+        return;
+    };
+    let end = end.min(count);
     let mut i = end;
-    while i > range.location {
+    while i > loc {
         i -= 1;
         () = msg![env; this removeObjectAtIndex:i];
     }
@@ -666,6 +699,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())exchangeObjectAtIndex:(NSUInteger)idx1 withObjectAtIndex:(NSUInteger)idx2 {
+    // Apple raises NSRangeException for out-of-bounds indices; we log and
+    // ignore so a buggy guest doesn't panic the host.
+    let len = env.objc.borrow::<ArrayHostObject>(this).array.len();
+    if idx1 as usize >= len || idx2 as usize >= len {
+        log!("Warning: exchangeObjectAtIndex:withObjectAtIndex: index out of bounds ({}, {}, len {})", idx1, idx2, len);
+        return;
+    }
     env.objc
         .borrow_mut::<ArrayHostObject>(this)
         .array
@@ -853,7 +893,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     }, state, stackbuf, len)
 }
 
-// TODO: more init methods, etc
+// Apple: "Initializes a newly allocated array by placing in it the objects
+// contained in a given array." When `flag` is true, each object is sent
+// -copyWithZone:nil and the copy is added instead of the original.
+- (id)initWithArray:(id)array copyItems:(bool)copy_items { // NSArray*
+    let new = msg![env; this initWithArray:array];
+    if copy_items {
+        () = msg![env; this _touchHLE_copyAllElements];
+    }
+    new
+}
 
 - (NSUInteger)count {
     env.objc.borrow::<ArrayHostObject>(this).array.len().try_into().unwrap()
@@ -886,11 +935,40 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<ArrayHostObject>(this).array.push(object);
 }
 
+// Private helper: replaces every element with its -copyWithZone:nil result.
+// Only called on the immutable subclass from initWithArray:copyItems:.
+- (())_touchHLE_copyAllElements {
+    let host_object: &mut ArrayHostObject = env.objc.borrow_mut(this);
+    let mut array = std::mem::take(&mut host_object.array);
+    for object in &mut array {
+        let original: id = *object;
+        let copy: id = msg![env; original copy];
+        release(env, original);
+        *object = copy;
+    }
+    env.objc.borrow_mut::<ArrayHostObject>(this).array = array;
+}
+
 - (id)subarrayWithRange:(NSRange)range {
+    // Apple raises NSRangeException for an out-of-bounds range; log and
+    // return an empty array instead of panicking on the slice index.
+    // Copy range fields to locals first: NSRange is repr(packed), so log!
+    // would otherwise take misaligned references to its fields.
+    let (loc, range_len) = (range.location, range.length);
+    let array = env.objc.borrow::<ArrayHostObject>(this).array.clone();
+    let len = array.len();
+    let Some(end) = loc.checked_add(range_len) else {
+        log!("Warning: subarrayWithRange: range overflow (location {}, length {})", loc, range_len);
+        let res = from_vec(env, Vec::new());
+        return autorelease(env, res);
+    };
+    if loc as usize > len || end as usize > len {
+        log!("Warning: subarrayWithRange: range out of bounds (location {}, length {}, len {})", loc, range_len, len);
+        let res = from_vec(env, Vec::new());
+        return autorelease(env, res);
+    }
     let mut tmp = Vec::new();
-    tmp.extend_from_slice(
-        &env.objc.borrow::<ArrayHostObject>(this).array[range.location as usize..(range.location + range.length) as usize]
-    );
+    tmp.extend_from_slice(&array[loc as usize..end as usize]);
     for &obj in &tmp {
         retain(env, obj);
     }
@@ -1162,7 +1240,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state
                                   objects:(MutPtr<id>)stackbuf
                                     count:(NSUInteger)len {
-    // TODO: check that array wasn't mutated!
+    // Apple raises NSGenericException when the array is mutated between
+    // batches. We deliberately tolerate it instead: indexing past the new
+    // count already returns nil below, and an exception would crash games
+    // whose (buggy) enumeration loops we would otherwise survive.
     let count: NSUInteger = msg![env; this count];
     fast_enumeration_helper(env, this, |env, idx| {
         if idx < count {
@@ -1190,7 +1271,57 @@ pub const CLASSES: ClassExports = objc_classes! {
     build_description(env, this)
 }
 
-// TODO: more mutation methods
+// Apple: "Replaces the objects in the receiving array at specified locations
+// by the objects in another given array."
+- (())replaceObjectsInRange:(NSRange)range
+      withObjectsFromArray:(id)other { // NSArray*
+    let len = env.objc.borrow::<ArrayHostObject>(this).array.len();
+    let location = range.location as usize;
+    let mut length = range.length as usize;
+    if location > len {
+        log!("Warning: replaceObjectsInRange:withObjectsFromArray: location {} out of bounds (len {})", location, len);
+        return;
+    }
+    if location + length > len {
+        length = len - location;
+    }
+
+    let removed: Vec<id> = {
+        let host_object: &mut ArrayHostObject = env.objc.borrow_mut(this);
+        host_object.array.drain(location..location + length).collect()
+    };
+    for object in removed {
+        release(env, object);
+    }
+
+    // Collect the replacement objects before borrowing the Vec again.
+    let count: NSUInteger = msg![env; other count];
+    let mut objects = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let obj: id = msg![env; other objectAtIndex:i];
+        retain(env, obj);
+        objects.push(obj);
+    }
+    let host_object: &mut ArrayHostObject = env.objc.borrow_mut(this);
+    for (offset, object) in objects.into_iter().enumerate() {
+        host_object.array.insert(location + offset, object);
+    }
+}
+
+// Apple: "Removes the objects at the indexes specified by a given index set."
+// Indices are removed in descending order so earlier removals don't shift
+// the remaining ones.
+- (())removeObjectsAtIndexes:(id)indexes { // NSIndexSet*
+    let count: NSUInteger = msg![env; this count];
+    let mut i = count;
+    while i > 0 {
+        i -= 1;
+        let contains: bool = msg![env; indexes containsIndex:i];
+        if contains {
+            () = msg![env; this removeObjectAtIndex:i];
+        }
+    }
+}
 
 - (())insertObject:(id)object
            atIndex:(NSUInteger)index {
@@ -1209,19 +1340,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())removeObject:(id)object {
-    let mut to_remove = Vec::new();
-    let count: NSUInteger = msg![env; this count];
-    for i in 0..count {
-        let curr_object: id = msg![env; this objectAtIndex:i];
+    // Single pass: partition out every element that -isEqual:s the argument.
+    // Note this is O(n) — sending -isEqual: while rebuilding the Vec, not
+    // removing indices one by one (which was O(n^2)).
+    let mut host_object: ArrayHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let mut old_array = std::mem::take(&mut host_object.array);
+    let mut new_array = Vec::with_capacity(old_array.len());
+    for curr_object in old_array.drain(..) {
         let equal: bool = msg![env; object isEqual:curr_object];
         if equal {
-            to_remove.push(i);
+            release(env, curr_object);
+        } else {
+            new_array.push(curr_object);
         }
     }
-    // TODO: runtime here is O(n^2), it could be O(n) instead
-    for i in to_remove {
-        () = msg![env; this removeObjectAtIndex:i];
-    }
+    host_object.array = new_array;
+    *env.objc.borrow_mut(this) = host_object;
 }
 
 - (())removeObjectAtIndex:(NSUInteger)index {
@@ -1390,10 +1524,17 @@ fn build_description(env: &mut Environment, arr: id) -> id {
     () = msg![env; desc appendString:prefix];
     release(env, prefix);
     let values: Vec<id> = env.objc.borrow_mut::<ArrayHostObject>(arr).array.clone();
-    for value in values {
+    let count = values.len();
+    for (i, value) in values.into_iter().enumerate() {
         let value_desc: id = msg![env; value description];
-        // TODO: respect nesting and padding
-        let format = format!("\t{},\n", ns_string::to_rust_string(env, value_desc));
+        let mut text = ns_string::to_rust_string(env, value_desc).into_owned();
+        // Indent nested multi-line descriptions so each level adds one
+        // 4-space step, matching Apple's plist-style output.
+        if text.contains('\n') {
+            text = text.replace('\n', "\n    ");
+        }
+        let comma = if i + 1 == count { "" } else { "," };
+        let format = format!("    {}{}\n", text, comma);
         let format = ns_string::from_rust_string(env, format);
         () = msg![env; desc appendString:format];
         release(env, format);

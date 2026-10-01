@@ -126,33 +126,13 @@ impl MutexState {
             }
         })
     }
-
-    /// Deadlock recovery: force-release every mutex that still has waiters
-    /// and a recorded owner. This is a last-resort escape hatch for guests
-    /// whose owner thread died or wedged (for example a crash-handler worker
-    /// blocked on a mutex held by a thread stuck in a loop). Waiters wake
-    /// naturally on the next scheduler pass because they poll
-    /// `mutex_is_locked`. Returns the (mutex, former owner) pairs that were
-    /// released, for logging.
-    pub fn force_release_deadlocked_mutexes(&mut self) -> Vec<(MutexId, ThreadId)> {
-        let mut released = Vec::new();
-        for (&mutex_id, mutex) in self.mutexes.iter_mut() {
-            if mutex.waiting_count > 0 {
-                if let Some((owner, _lock_count)) = mutex.locked.take() {
-                    released.push((mutex_id, owner));
-                }
-            }
-        }
-        released
-    }
 }
 
 impl Environment {
     /// Relock mutex that was just unblocked. This should probably only be used
     /// by the thread scheduler.
     pub fn relock_unblocked_mutex_for_thread(&mut self, thread_id: ThreadId, mutex_id: MutexId) {
-        log_sampled!(
-            1024,
+        log_dbg!(
             "Relocking unblocked mutex {} for thread {}, waiting count {}",
             mutex_id,
             self.current_thread,
@@ -188,12 +168,7 @@ impl Environment {
         let mutex: &mut _ = self.mutex_state.mutexes.get_mut(&mutex_id).unwrap();
 
         let Some((locking_thread, lock_count)) = mutex.locked else {
-            log_sampled!(
-                1024,
-                "Locked mutex #{} for thread {}.",
-                mutex_id,
-                current_thread
-            );
+            log_dbg!("Locked mutex #{} for thread {}.", mutex_id, current_thread);
             mutex.locked = Some((current_thread, NonZeroU32::new(1).unwrap()));
             return Ok(1);
         };
@@ -224,10 +199,10 @@ impl Environment {
                             "Warning: pthread_mutex_lock: non-error-checking mutex #{mutex_id} would deadlock on thread {current_thread}; granting phantom lock instead (real iOS would deadlock here).",
                         );
                     }
-                    let _ = mutex
+                    *mutex
                         .phantom_locks
                         .entry(current_thread)
-                        .and_modify(|count| *count += 1)
+                        .and_modify(|c| *c += 1)
                         .or_insert(1);
                     return Ok(1);
                 }
@@ -330,8 +305,7 @@ impl Environment {
         }
 
         if lock_count.get() == 1 {
-            log_sampled!(
-                1024,
+            log_dbg!(
                 "Unlocked mutex #{} for thread {}.",
                 mutex_id,
                 current_thread

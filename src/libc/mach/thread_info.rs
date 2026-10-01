@@ -22,7 +22,7 @@ pub const KERN_SUCCESS: kern_return_t = 0;
 /// Specified address is not currently valid.
 pub const KERN_INVALID_ADDRESS: kern_return_t = 1;
 pub const KERN_INVALID_ARGUMENT: kern_return_t = 4;
-pub const KERN_INVALID_TASK: kern_return_t = 21;
+pub const KERN_INVALID_TASK: kern_return_t = 5;
 
 pub type thread_inspect_t = mach_port_t;
 type thread_flavor_t = natural_t;
@@ -259,8 +259,10 @@ fn thread_policy_set(
             let _policy: thread_background_policy = env.mem.read(policy_info.cast());
         }
         _ => {
-            log!(
-                "TODO: thread_policy_set({}, {}, {:?}, {}) (ignored)",
+            // Scheduling/affinity hints have no guest-visible effect; accept
+            // them silently (KERN_SUCCESS) at debug level.
+            log_dbg!(
+                "thread_policy_set({}, {}, {:?}, {}) (hint ignored)",
                 thread,
                 flavor,
                 policy_info,

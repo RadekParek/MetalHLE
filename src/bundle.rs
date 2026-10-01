@@ -13,7 +13,7 @@
 
 use crate::fs::{BundleData, Fs, GuestPath, GuestPathBuf};
 use crate::image::Image;
-use crate::window::DeviceFamily;
+use crate::window::{DeviceFamily, DeviceOrientation};
 use plist::dictionary::Dictionary;
 use plist::Value;
 use std::io::Cursor;
@@ -355,46 +355,21 @@ impl Bundle {
     pub fn load_icon(&self, fs: &Fs) -> Result<Image, String> {
         let candidates = self.icon_path_candidates();
         let mut last_err: Option<String> = None;
-        // Read and decode every candidate and keep the highest-resolution
-        // one. Apps commonly ship both a 1x (e.g. 57x57) and a 2x (114x114)
-        // icon variant; taking the first readable file used to make the app
-        // picker render the 1x variant at 1x sharpness. The picker scales
-        // the image down to the button's frame, so the largest variant is
-        // strictly better.
-        let mut best: Option<Image> = None;
-        for path in &candidates {
-            let bytes = match fs.read(path) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    last_err = Some(format!("missing: {}", path.as_str()));
-                    continue;
-                }
-            };
-            let image = match Image::from_bytes(&bytes) {
-                Ok(image) => image,
-                Err(e) => {
-                    last_err = Some(format!("unparseable: {} ({e})", path.as_str()));
-                    continue;
-                }
-            };
-            let replace = match &best {
-                None => true,
-                Some(current) => {
-                    let (w, h) = image.dimensions();
-                    let (cw, ch) = current.dimensions();
-                    w.saturating_mul(h) > cw.saturating_mul(ch)
-                }
-            };
-            if replace {
-                best = Some(image);
+        let bytes = candidates.iter().find_map(|path| match fs.read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                last_err = Some(format!("missing: {}", path.as_str()));
+                None
             }
-        }
-        let mut image = best.ok_or_else(|| {
+        });
+        let bytes = bytes.ok_or_else(|| {
             // Mirror the historical phrasing so any tooling that scrapes
             // the warning still recognises it.
             "Could not read icon file".to_string()
         })?;
         let _ = last_err;
+        let mut image =
+            Image::from_bytes(&bytes).map_err(|e| format!("Could not parse icon image: {e}"))?;
         // UIPrerenderedIcon is used to avoid iOS applying a sheen effect,
         // should be boolean, but some apps use a string, so we check both.
         // See https://developer.apple.com/library/archive/qa/qa1614/_index.html
@@ -408,11 +383,8 @@ impl Bundle {
         // 10px radius rounded corner (see e.g. documentation of
         // UIPrerenderedIcon). If the icon is larger for some reason,
         // let's scale to match.
-        // The corner radius is defined for the 57px baseline icon; scale it
-        // with the source resolution so a 2x icon keeps the same rounded
-        // appearance once scaled down for display.
-        let (width, _) = image.dimensions();
-        let corner_radius = 12.0 * (width as f32 / 57.0).max(1.0);
+        // Use a slightly smaller fixed corner radius for higher-resolution icons.
+        let corner_radius = 12.0;
         image.round_corners(corner_radius, /* four_corners: */ true, add_sheen);
         Ok(image)
     }
@@ -503,41 +475,6 @@ impl Bundle {
         }
 
         vec!["UIInterfaceOrientationPortrait"]
-    }
-
-    /// `supported_interface_orientations` honouring `~ipad` plist key
-    /// overrides. Universal apps carry `UISupportedInterfaceOrientations~ipad`
-    /// (and/or `UIInterfaceOrientation~ipad`) whose landscape order regularly
-    /// differs from the iPhone list; using the iPhone list when emulating an
-    /// iPad rotates the screen 180 degrees (HyperHLE af60a979).
-    pub fn supported_interface_orientations_for_family(&self, ipad: bool) -> Vec<&str> {
-        if ipad {
-            for key in [
-                "UISupportedInterfaceOrientations~ipad",
-                "UIInterfaceOrientation~ipad",
-            ] {
-                if let Some(v) = self.plist.get(key) {
-                    if let Some(arr) = v.as_array() {
-                        let orientations: Vec<&str> =
-                            arr.iter().filter_map(|o| o.as_string()).collect();
-                        if !orientations.is_empty() {
-                            return orientations;
-                        }
-                    }
-                    if let Some(s) = v.as_string() {
-                        let orientations: Vec<&str> = s
-                            .split(',')
-                            .map(|p| p.trim())
-                            .filter(|p| !p.is_empty())
-                            .collect();
-                        if !orientations.is_empty() {
-                            return orientations;
-                        }
-                    }
-                }
-            }
-        }
-        self.supported_interface_orientations()
     }
 
     pub fn device_family_array(&self) -> Vec<DeviceFamily> {
