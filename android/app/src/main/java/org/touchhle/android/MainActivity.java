@@ -13,6 +13,7 @@ import android.content.ContentResolver;
 import android.content.Intent;
 import android.net.wifi.WifiManager;
 import android.database.Cursor;
+import android.provider.DocumentsContract;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
@@ -21,6 +22,7 @@ import android.util.Log;
 import org.libsdl.app.SDLActivity;
 
 import java.io.File;
+import java.util.Locale;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -90,6 +92,10 @@ public class MainActivity extends SDLActivity {
 
     // Request code for the system file picker started by this activity.
     private static final int REQUEST_ADD_IPA = 1;
+    private static final int GAME_FOLDER_REQUEST = 4711;
+    private static final int CUSTOM_DRIVER_REQUEST = 4712;
+    private static final int MSG_GAME_FOLDER = 0x8002;
+    private static final int MSG_CUSTOM_DRIVER = 0x8003;
 
     // =====================================================================
     // Real WebView overlay support (called from Rust via JNI; see
@@ -386,6 +392,22 @@ public class MainActivity extends SDLActivity {
             });
             return true;
         }
+        if (message == MSG_GAME_FOLDER) {
+            runOnUiThread(new Runnable() {
+                public void run() {
+                    openGameFolderPicker();
+                }
+            });
+            return true;
+        }
+        if (message == MSG_CUSTOM_DRIVER) {
+            runOnUiThread(new Runnable() {
+                public void run() {
+                    openCustomDriverPicker();
+                }
+            });
+            return true;
+        }
         // MSG_WEB_OVERLAY (0x8001) is reserved: native code notifies the
         // emulated app about page loads itself (via NSTimer), so there is
         // nothing to handle here yet.
@@ -411,8 +433,19 @@ public class MainActivity extends SDLActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_ADD_IPA || resultCode != Activity.RESULT_OK
-                || data == null || data.getData() == null) {
+        if (resultCode != Activity.RESULT_OK || data == null
+                || data.getData() == null) {
+            return;
+        }
+        if (requestCode == GAME_FOLDER_REQUEST) {
+            importSelectedFolder(data.getData());
+            return;
+        }
+        if (requestCode == CUSTOM_DRIVER_REQUEST) {
+            importSelectedCustomDriver(data.getData());
+            return;
+        }
+        if (requestCode != REQUEST_ADD_IPA) {
             return;
         }
         Uri uri = data.getData();
@@ -488,6 +521,230 @@ public class MainActivity extends SDLActivity {
                 } catch (IOException e) {
                     // Nothing to do.
                 }
+            }
+        }
+    }
+
+    private static File gameFolderTarget() {
+        return new File(getActivity().getExternalFilesDir(null), "touchHLE_apps");
+    }
+
+    private static File customDriverTarget() {
+        return new File(getActivity().getExternalFilesDir(null), "touchHLE_custom_drivers");
+    }
+
+    private static void launchFilePicker(android.content.Intent picker, int requestCode) {
+        if (mSingleton == null) {
+            Log.e(TAG, "Couldn't open file picker because the activity is not ready");
+            return;
+        }
+        mSingleton.runOnUiThread(() -> {
+            try {
+                mSingleton.startActivityForResult(picker, requestCode);
+            } catch (Exception ex) {
+                Log.e(TAG, "Couldn't open file picker", ex);
+            }
+        });
+    }
+
+    private void openGameFolderPicker() {
+        android.content.Intent picker =
+                new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT_TREE);
+        picker.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            | android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            | android.content.Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+        try {
+            startActivityForResult(picker, GAME_FOLDER_REQUEST);
+        } catch (Exception e) {
+            Log.e(TAG, "Couldn't open game folder picker", e);
+        }
+    }
+
+    private void openCustomDriverPicker() {
+        android.content.Intent picker =
+                new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
+        picker.setType("*/*");
+        picker.putExtra(android.content.Intent.EXTRA_MIME_TYPES, new String[]{
+            "application/zip", "application/x-zip-compressed", "application/octet-stream"});
+        picker.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+        picker.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            | android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(picker, CUSTOM_DRIVER_REQUEST);
+        } catch (Exception e) {
+            Log.e(TAG, "Couldn't open custom driver picker", e);
+        }
+    }
+
+    private void importSelectedFolder(Uri treeUri) {
+        new Thread(() -> {
+            int copied = copySelectedFolder(treeUri);
+            Log.i(TAG, "Imported " + copied
+                    + " files from the selected game folder; restarting to rescan all games.");
+            if (mSingleton != null) {
+                mSingleton.runOnUiThread(() -> mSingleton.recreate());
+            }
+        }, "MetalHLE-game-folder-import").start();
+    }
+
+    private void importSelectedCustomDriver(Uri uri) {
+        new Thread(() -> {
+            File target = customDriverTarget();
+            if (!target.exists() && !target.mkdirs()) {
+                Log.e(TAG, "Couldn't create custom-driver folder: " + target);
+                return;
+            }
+            String name = selectedDocumentName(uri);
+            if (name == null || !name.toLowerCase(Locale.ROOT).endsWith(".zip")) {
+                Log.e(TAG, "Selected custom driver is not a ZIP file: " + name);
+                return;
+            }
+            File destination = new File(target, name);
+            if (copyDocumentUri(uri, destination)) {
+                Log.i(TAG, "Imported custom driver ZIP: " + name);
+                if (mSingleton != null) {
+                    mSingleton.runOnUiThread(() -> mSingleton.recreate());
+                }
+            }
+        }, "MetalHLE-custom-driver-import").start();
+    }
+
+    private static int copySelectedFolder(Uri treeUri) {
+        File target = gameFolderTarget();
+        if (!target.exists() && !target.mkdirs()) {
+            Log.e(TAG, "Couldn't create game folder: " + target);
+            return 0;
+        }
+        String documentId = DocumentsContract.getTreeDocumentId(treeUri);
+        Uri childrenUri =
+                DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId);
+        String selectedName = selectedDocumentName(treeUri);
+        if (isGamePackageName(selectedName) && selectedName != null) {
+            File bundleTarget = new File(target, selectedName);
+            if (!bundleTarget.isDirectory() && !bundleTarget.mkdirs()) {
+                Log.e(TAG, "Couldn't create imported game bundle directory: " + bundleTarget);
+                return 0;
+            }
+            return copyDocumentChildren(childrenUri, treeUri, bundleTarget, true);
+        }
+        return copyDocumentChildren(childrenUri, treeUri, target, false);
+    }
+
+    private static boolean isGamePackageName(String name) {
+        if (name == null) return false;
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".ipa") || lower.endsWith(".app") || lower.endsWith(".zip");
+    }
+
+    private static int copyDocumentChildren(Uri childrenUri, Uri treeUri, File target,
+            boolean copyAll) {
+        String[] projection = {
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        };
+        int copied = 0;
+        Cursor cursor = getActivity().getContentResolver()
+                .query(childrenUri, projection, null, null, null);
+        if (cursor == null) return 0;
+        try {
+            int idColumn = cursor.getColumnIndexOrThrow(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID);
+            int nameColumn = cursor.getColumnIndexOrThrow(
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+            int mimeColumn = cursor.getColumnIndexOrThrow(
+                    DocumentsContract.Document.COLUMN_MIME_TYPE);
+            while (cursor.moveToNext()) {
+                String documentId = cursor.getString(idColumn);
+                String name = cursor.getString(nameColumn);
+                String mimeType = cursor.getString(mimeColumn);
+                if (name == null || name.isEmpty()
+                        || name.equals(".") || name.equals("..")) {
+                    continue;
+                }
+                File destination = new File(target, name);
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mimeType)) {
+                    if (destination.isDirectory() || destination.mkdirs()) {
+                        Uri childUri = DocumentsContract
+                                .buildChildDocumentsUriUsingTree(treeUri, documentId);
+                        copied += copyDocumentChildren(childUri, treeUri, destination, true);
+                    } else {
+                        Log.e(TAG, "Couldn't create imported game directory: " + destination);
+                    }
+                } else {
+                    if (!copyAll && !isGamePackageName(name)) {
+                        Log.i(TAG, "Skipping non-game entry in selected folder: " + name);
+                        continue;
+                    }
+                    if (copyDocument(treeUri, documentId, destination)) copied++;
+                }
+            }
+        } catch (Exception ex) {
+            Log.e(TAG, "Couldn't read selected game folder", ex);
+        } finally {
+            cursor.close();
+        }
+        return copied;
+    }
+
+    private static boolean copyDocument(Uri treeUri, String documentId, File destination) {
+        Uri documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId);
+        return copyDocumentUri(documentUri, destination);
+    }
+
+    private static String selectedDocumentName(Uri uri) {
+        try (Cursor cursor = getActivity().getContentResolver().query(uri,
+                new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) return cursor.getString(0);
+        } catch (Exception ex) {
+            Log.e(TAG, "Couldn't read selected document name", ex);
+        }
+        return null;
+    }
+
+    private static boolean copyDocumentUri(Uri uri, File destination) {
+        File temporary = new File(destination.getPath() + ".metalhle-part");
+        InputStream input = null;
+        FileOutputStream output = null;
+        try {
+            input = getActivity().getContentResolver().openInputStream(uri);
+            if (input == null) return false;
+            if (temporary.exists() && !temporary.delete()) {
+                Log.e(TAG, "Couldn't replace partial imported file: " + temporary);
+                return false;
+            }
+            output = new FileOutputStream(temporary);
+            byte[] buffer = new byte[1024 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+            output.flush();
+            output.getFD().sync();
+            output.close();
+            output = null;
+            input.close();
+            input = null;
+            if (destination.exists() && !destination.delete()) {
+                Log.e(TAG, "Couldn't replace imported file: " + destination);
+                temporary.delete();
+                return false;
+            }
+            if (!temporary.renameTo(destination)) {
+                Log.e(TAG, "Couldn't publish imported file: " + destination);
+                temporary.delete();
+                return false;
+            }
+            return true;
+        } catch (Exception ex) {
+            Log.e(TAG, "Couldn't copy selected file: " + destination, ex);
+            temporary.delete();
+            return false;
+        } finally {
+            if (input != null) {
+                try { input.close(); } catch (IOException ignored) {}
+            }
+            if (output != null) {
+                try { output.close(); } catch (IOException ignored) {}
             }
         }
     }

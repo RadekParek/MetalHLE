@@ -32,7 +32,7 @@ if [ "$PHASE" = "--prepare-files" ]; then
 
     cp ../OPTIONS_HELP.txt new_release/
     cp ../touchHLE_default_options.txt new_release/
-    cp ../touchHLE_wallpaper.png new_release/
+    cp ../res/MetalHLE_v7_wallpaper.png new_release/
     cp ../touchHLE_options.txt new_release/
 elif [ "$PHASE" = "--create-zip-windows" ] || [ "$PHASE" = "--create-zip-linux" ] || [ "$PHASE" = "--create-zip-macos" ] || [ "$PHASE" = "--create-zip-android" ]; then
     shift

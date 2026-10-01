@@ -150,6 +150,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         return this;
     }
     let alloc = env.mem.alloc(length);
+    if alloc.is_null() {
+        log!(
+            "NSData initWithBytes:length: allocation failed for {:#x} bytes; returning empty data",
+            length
+        );
+        return this;
+    }
     env.mem.memmove(alloc, bytes, length);
     host_object.bytes = alloc;
     host_object.length = length;
@@ -183,12 +190,37 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
     let path_str = to_rust_string(env, path);
-    let bytes = env.fs.read(GuestPath::new(&path_str)).ok();
-    let Some(bytes) = bytes else {
+    let mut candidates = vec![path_str.clone()];
+    let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+    if env.bundle.bundle_identifier() == "com.dvloper.granny"
+        && (path_str == "Data/data.unity3d"
+            || path_str.ends_with("/Data/data.unity3d")
+            || path_str.ends_with("/Data/Data/globalgamemanagers")
+            || path_str.ends_with("/Data/globalgamemanagers"))
+    {
+        candidates.insert(0, format!("{bundle_root}/Data/globalgamemanagers").into());
+    }
+    let relative_path = path_str.trim_start_matches("./");
+    let data_relative_path = relative_path.strip_prefix("Data/").unwrap_or(relative_path);
+    if !path_str.starts_with('/') {
+        candidates.push(format!("{bundle_root}/{relative_path}").into());
+        candidates.push(format!("{bundle_root}/Data/{data_relative_path}").into());
+    }
+    let Some(bytes) = candidates
+        .iter()
+        .find_map(|candidate| env.fs.read(GuestPath::new(candidate)).ok())
+    else {
         log_dbg!("NSData: Failed to read file at {:?}", path_str);
         release(env, this);
         return nil;
     };
+    if env.bundle.bundle_identifier() == "com.dvloper.granny"
+        && (path_str.ends_with("/Data/globalgamemanagers")
+            || path_str.ends_with("/Data/Data/globalgamemanagers")
+            || path_str.ends_with("/Data/data.unity3d"))
+    {
+        log!("Granny NSData file load: {} bytes from {}", bytes.len(), path_str);
+    }
     let size: NSUInteger = bytes.len().try_into().unwrap();
     if size == 0 {
         return this;
@@ -483,6 +515,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Pre-allocate but leave length at 0.
     if capacity > 0 {
         let alloc = env.mem.alloc(capacity);
+        if alloc.is_null() {
+            log!(
+                "NSMutableData initWithCapacity: allocation failed for {:#x} bytes; returning empty data",
+                capacity
+            );
+            return this;
+        }
         let host_object = env.objc.borrow_mut::<NSDataHostObject>(this);
         host_object.bytes = alloc;
         // length intentionally remains 0.
@@ -493,6 +532,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithLength:(NSUInteger)length {
     if length > 0 {
         let alloc = env.mem.alloc(length);
+        if alloc.is_null() {
+            log!(
+                "NSMutableData initWithLength: allocation failed for {:#x} bytes; returning empty data",
+                length
+            );
+            return this;
+        }
         env.mem.bytes_at_mut(alloc.cast(), length).fill(0);
         let host_object = env.objc.borrow_mut::<NSDataHostObject>(this);
         host_object.bytes = alloc;
@@ -535,6 +581,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         let old_len = host_object.length;
         let alloc = env.mem.realloc(host_object.bytes, length);
+        if alloc.is_null() {
+            log!(
+                "NSMutableData setLength: allocation failed for {:#x} bytes; preserving existing data",
+                length
+            );
+            return;
+        }
         if length > old_len {
             let diff = length - old_len;
             let offset_ptr: MutPtr<u8> = alloc.cast() + old_len;

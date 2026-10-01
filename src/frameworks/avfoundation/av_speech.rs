@@ -205,7 +205,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)name { // NSString*
-    ns_string::get_static_str(env, "touchHLE")
+    ns_string::get_static_str(env, "MetalHLE")
 }
 
 - (())dealloc {

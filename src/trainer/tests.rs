@@ -18,11 +18,19 @@ pub(super) fn memory(size: u32) -> (Mem, u32) {
 pub(super) fn result(mem: &mut Mem, addr: u32, vtype: VType, value: &str) -> SearchResult {
     let bits = vtype.parse(value).unwrap();
     assert!(vtype.write_at(mem, addr, bits));
-    SearchResult { addr, vtype, bits, changed: false, analysis: Analysis::default() }
+    SearchResult {
+        addr,
+        vtype,
+        bits,
+        changed: false,
+        analysis: Analysis::default(),
+    }
 }
 
 fn snapshot(mem: &Mem, addr: u32, size: u32) -> Vec<u8> {
-    mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), size).unwrap().to_vec()
+    mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), size)
+        .unwrap()
+        .to_vec()
 }
 
 #[test]
@@ -33,7 +41,13 @@ fn values_must_fit_their_integer_type() {
         (VType::U16, "0", "65535", "-1", "65536"),
         (VType::I16, "-32768", "32767", "-32769", "32768"),
         (VType::U32, "0", "4294967295", "-1", "4294967296"),
-        (VType::I32, "-2147483648", "2147483647", "-2147483649", "2147483648"),
+        (
+            VType::I32,
+            "-2147483648",
+            "2147483647",
+            "-2147483649",
+            "2147483648",
+        ),
     ] {
         assert!(t.parse(min).is_some(), "{t:?}");
         assert!(t.parse(max).is_some(), "{t:?}");
@@ -63,9 +77,15 @@ fn auto_search_does_not_find_truncated_values() {
     let float = result(&mut mem, base + 8, VType::F32, "600");
     let byte = result(&mut mem, base + 16, VType::U8, "88");
     let hits = search_all(&mem, VType::Auto, "600", None);
-    assert!(hits.iter().any(|r| r.addr == integer.addr && r.vtype == VType::I32));
-    assert!(hits.iter().any(|r| r.addr == float.addr && r.vtype == VType::F32));
-    assert!(!hits.iter().any(|r| matches!(r.vtype, VType::U8 | VType::I8)));
+    assert!(hits
+        .iter()
+        .any(|r| r.addr == integer.addr && r.vtype == VType::I32));
+    assert!(hits
+        .iter()
+        .any(|r| r.addr == float.addr && r.vtype == VType::F32));
+    assert!(!hits
+        .iter()
+        .any(|r| matches!(r.vtype, VType::U8 | VType::I8)));
     let refined = search_all(&mem, VType::Auto, "600", Some(&[integer, float, byte]));
     assert_eq!(refined.len(), 2);
     assert_eq!(refined[0].addr, integer.addr);
@@ -112,10 +132,17 @@ fn changing_ui_type_cannot_widen_a_bulk_write() {
 fn overlapping_results_are_all_skipped_not_arbitrarily_selected() {
     let (mut mem, base) = memory(64);
     let wide = result(&mut mem, base, VType::I32, "600");
-    let narrow = SearchResult { vtype: VType::U16, ..wide };
+    let narrow = SearchResult {
+        vtype: VType::U16,
+        ..wide
+    };
     let good = result(&mut mem, base + 8, VType::I32, "600");
     let before = snapshot(&mem, base, 64);
-    for hits in [[wide, narrow, good], [narrow, wide, good], [wide, wide, good]] {
+    for hits in [
+        [wide, narrow, good],
+        [narrow, wide, good],
+        [wide, wide, good],
+    ] {
         let plan = plan_bulk(&mem, &hits, VType::Auto, "1000", true, ResultFilter::All).unwrap();
         assert_eq!((plan.writes.len(), plan.skipped), (1, 2));
         assert_eq!(snapshot(&mem, base, 64), before);
@@ -140,7 +167,9 @@ fn more_than_32_matches_are_previewed_and_written_without_truncation() {
     assert_eq!((plan.writes.len(), plan.skipped), (COUNT, 0));
     assert_eq!(snapshot(&mem, base, size), before);
     assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(COUNT));
-    assert!(hits.iter().all(|hit| VType::I32.read_at(&mem, hit.addr) == Some(999)));
+    assert!(hits
+        .iter()
+        .all(|hit| VType::I32.read_at(&mem, hit.addr) == Some(999)));
 }
 
 #[test]
@@ -166,7 +195,10 @@ fn ineligible_hits_are_filtered_and_counted() {
     let (mut mem, base) = memory(64);
     let good = result(&mut mem, base, VType::I32, "600");
     let unaligned = result(&mut mem, base + 9, VType::I32, "600");
-    let outside = SearchResult { addr: base + 64, ..good };
+    let outside = SearchResult {
+        addr: base + 64,
+        ..good
+    };
     let stale = result(&mut mem, base + 16, VType::I32, "600");
     assert!(VType::I32.write_at(&mut mem, stale.addr, 601));
     let unchanged = result(&mut mem, base + 24, VType::I32, "1000");
@@ -193,7 +225,10 @@ fn valid_batch_preserves_types_neighbours_and_displayed_values() {
         let expected = hit.vtype.parse("1000").unwrap();
         assert_eq!(hit.bits, expected);
         assert_eq!(hit.vtype.read_at(&mem, hit.addr), Some(expected));
-        assert_eq!(VType::U8.read_at(&mem, hit.addr + hit.vtype.size()), Some(0xAA));
+        assert_eq!(
+            VType::U8.read_at(&mem, hit.addr + hit.vtype.size()),
+            Some(0xAA)
+        );
     }
 }
 
@@ -208,7 +243,13 @@ fn invalid_memory_accesses_fail_without_a_panic_or_sink_write() {
 }
 
 fn bulk_command(text: &str, confirm: bool) -> TrainerCmd {
-    TrainerCmd::SetAll { vtype: VType::I32, text: text.to_string(), confirm, safe_mode: true, filter: ResultFilter::All }
+    TrainerCmd::SetAll {
+        vtype: VType::I32,
+        text: text.to_string(),
+        confirm,
+        safe_mode: true,
+        filter: ResultFilter::All,
+    }
 }
 
 #[test]
@@ -258,13 +299,11 @@ fn cancelled_or_expired_confirmation_cannot_write() {
     assert!(trainer.state.pending_bulk.is_none());
     trainer.handle_command(&mut mem, bulk_command("999", true));
     assert_eq!(VType::I32.read_at(&mem, base), Some(135));
-    trainer.state.pending_bulk.as_mut().unwrap().created_at =
-        Instant::now() - BULK_CONFIRM_TIMEOUT;
+    trainer.state.pending_bulk.as_mut().unwrap().created_at = Instant::now() - BULK_CONFIRM_TIMEOUT;
     trainer.handle_command(&mut mem, bulk_command("999", true));
     assert_eq!(VType::I32.read_at(&mem, base), Some(135));
     assert!(trainer.state.pending_bulk.is_some());
 }
-
 
 #[test]
 fn safe_mode_filters_unaligned_hits_while_normal_mode_includes_them() {
@@ -289,7 +328,11 @@ fn mode_change_cannot_confirm_another_modes_preview() {
     trainer.state.results = vec![result(&mut mem, base, VType::I32, "135")];
     trainer.handle_command(&mut mem, bulk_command("999", false));
     let normal_confirm = TrainerCmd::SetAll {
-        vtype: VType::I32, text: "999".to_string(), confirm: true, safe_mode: false, filter: ResultFilter::All,
+        vtype: VType::I32,
+        text: "999".to_string(),
+        confirm: true,
+        safe_mode: false,
+        filter: ResultFilter::All,
     };
     trainer.handle_command(&mut mem, normal_confirm.clone());
     assert_eq!(VType::I32.read_at(&mem, base), Some(135));
@@ -302,10 +345,29 @@ fn normal_mode_still_rejects_invalid_types_and_expired_addresses() {
     let (mut mem, base) = memory(64);
     let good = result(&mut mem, base, VType::I32, "135");
     let narrow = result(&mut mem, base + 8, VType::U8, "135");
-    let invalid = SearchResult { addr: base + 64, ..good };
+    let invalid = SearchResult {
+        addr: base + 64,
+        ..good
+    };
     let before = snapshot(&mem, base, 64);
-    assert!(plan_bulk(&mem, &[good, narrow], VType::Auto, "999", false, ResultFilter::All).is_err());
-    assert!(plan_bulk(&mem, &[good, invalid], VType::I32, "999", false, ResultFilter::All).is_err());
+    assert!(plan_bulk(
+        &mem,
+        &[good, narrow],
+        VType::Auto,
+        "999",
+        false,
+        ResultFilter::All
+    )
+    .is_err());
+    assert!(plan_bulk(
+        &mem,
+        &[good, invalid],
+        VType::I32,
+        "999",
+        false,
+        ResultFilter::All
+    )
+    .is_err());
     assert_eq!(snapshot(&mem, base, 64), before);
 }
 
@@ -314,7 +376,11 @@ fn normal_mode_reports_actual_contents_after_overlapping_writes() {
     let (mut mem, base) = memory(64);
     let wide = result(&mut mem, base, VType::I32, "135");
     let narrow = SearchResult {
-        addr: base + 2, vtype: VType::U16, bits: 0, changed: false, analysis: Analysis::default(),
+        addr: base + 2,
+        vtype: VType::U16,
+        bits: 0,
+        changed: false,
+        analysis: Analysis::default(),
     };
     let mut hits = [wide, narrow];
     assert!(plan_bulk(&mem, &hits, VType::Auto, "999", true, ResultFilter::All).is_err());
@@ -356,9 +422,18 @@ fn changed_category_rejects_an_entire_pending_batch() {
         result(&mut mem, base, VType::I32, "135"),
         result(&mut mem, base + 16, VType::I32, "135"),
     ];
-    for hit in &mut hits { hit.analysis.category = Category::Money; }
-    let plan = plan_bulk(&mem, &hits, VType::I32, "999", true,
-        ResultFilter::Category(Category::Money)).unwrap();
+    for hit in &mut hits {
+        hit.analysis.category = Category::Money;
+    }
+    let plan = plan_bulk(
+        &mem,
+        &hits,
+        VType::I32,
+        "999",
+        true,
+        ResultFilter::Category(Category::Money),
+    )
+    .unwrap();
     let before = snapshot(&mem, base, 64);
     hits[1].analysis.category = Category::Unknown;
     assert!(apply_bulk(&mut mem, &mut hits, &plan).is_err());
@@ -376,8 +451,11 @@ fn switching_group_cannot_confirm_another_groups_preview() {
     trainer.handle_command(&mut mem, bulk_command("999", false));
     // Same writes but a different filter must still require a new preview.
     let command = TrainerCmd::SetAll {
-        vtype: VType::I32, text: "999".to_string(), confirm: true,
-        safe_mode: true, filter: ResultFilter::Category(Category::Money),
+        vtype: VType::I32,
+        text: "999".to_string(),
+        confirm: true,
+        safe_mode: true,
+        filter: ResultFilter::Category(Category::Money),
     };
     trainer.handle_command(&mut mem, command.clone());
     assert_eq!(VType::I32.read_at(&mem, base), Some(135));
@@ -390,7 +468,16 @@ fn trainer_writes_reset_observations_for_overlapping_aliases() {
     use classify::Category;
     let (mut mem, base) = memory(64);
     let mut hits = [result(&mut mem, base + 1, VType::U8, "27")];
-    for (old, new) in [(30, 29), (29, 28), (28, 27), (27, 30), (30, 29), (29, 28), (28, 27), (27, 30)] {
+    for (old, new) in [
+        (30, 29),
+        (29, 28),
+        (28, 27),
+        (27, 30),
+        (30, 29),
+        (29, 28),
+        (28, 27),
+        (27, 30),
+    ] {
         hits[0].analysis.observe(VType::U8, old, new);
     }
     assert_eq!(hits[0].analysis.category, Category::Ammo);
@@ -406,12 +493,19 @@ fn frozen_aliases_do_not_teach_ammo_patterns() {
     let (mut mem, base) = memory(64);
     let mut trainer = Trainer::new(true);
     trainer.state.results = vec![result(&mut mem, base + 1, VType::U8, "30")];
-    trainer.state.frozen.push(Patch { addr: base, vtype: VType::I32, bits: 0, freeze: true });
+    trainer.state.frozen.push(Patch {
+        addr: base,
+        vtype: VType::I32,
+        bits: 0,
+    });
     for value in [29, 28, 27] {
         VType::U8.write_at(&mut mem, base + 1, value);
         trainer.refresh_live_values(&mut mem, None, 0.25);
     }
-    assert_eq!(trainer.state.results[0].analysis.category, Category::Unknown);
+    assert_eq!(
+        trainer.state.results[0].analysis.category,
+        Category::Unknown
+    );
 }
 
 #[test]
@@ -424,10 +518,15 @@ fn activity_reports_before_after_but_not_trainer_writes_or_frozen_aliases() {
     let change = trainer.state.activity.entries[0];
     assert_eq!((change.addr, change.before, change.after), (base, 30, 29));
     trainer.state.activity = Activity::default();
-    trainer.handle_command(&mut mem, TrainerCmd::ApplyHack { addr: base, vtype: VType::I32, bits: 28 });
+    assert!(VType::I32.write_at(&mut mem, base, 28));
+    record_trainer_write(&mem, &mut trainer.state.results, base, VType::I32.size());
     trainer.refresh_live_values(&mut mem, None, 0.25);
     assert!(trainer.state.activity.entries.is_empty());
-    trainer.state.frozen.push(Patch { addr: base, vtype: VType::I32, bits: 28, freeze: true });
+    trainer.state.frozen.push(Patch {
+        addr: base,
+        vtype: VType::I32,
+        bits: 28,
+    });
     VType::I32.write_at(&mut mem, base, 27);
     trainer.refresh_live_values(&mut mem, None, 0.25);
     assert!(trainer.state.activity.entries.is_empty());
@@ -437,8 +536,10 @@ fn activity_reports_before_after_but_not_trainer_writes_or_frozen_aliases() {
 fn mark_comparison_is_read_only_and_rebases_after_filtering() {
     let (mut mem, base) = memory(64);
     let mut trainer = Trainer::new(true);
-    trainer.state.results = vec![result(&mut mem, base, VType::I32, "30"),
-        result(&mut mem, base + 8, VType::I32, "30")];
+    trainer.state.results = vec![
+        result(&mut mem, base, VType::I32, "30"),
+        result(&mut mem, base + 8, VType::I32, "30"),
+    ];
     trainer.handle_command(&mut mem, TrainerCmd::Mark);
     VType::I32.write_at(&mut mem, base, 29);
     trainer.refresh_live_values(&mut mem, None, 0.25);
@@ -455,17 +556,25 @@ fn mark_comparison_is_read_only_and_rebases_after_filtering() {
 fn watch_write_uses_explicit_concrete_target_even_after_value_changes() {
     let (mut mem, base) = memory(64);
     let mut trainer = Trainer::new(true);
-    trainer.state.results = vec![result(&mut mem, base, VType::U8, "30"),
-        result(&mut mem, base + 8, VType::I32, "30")];
+    trainer.state.results = vec![
+        result(&mut mem, base, VType::U8, "30"),
+        result(&mut mem, base + 8, VType::I32, "30"),
+    ];
     trainer.state.snapshot = Some(Snapshot::capture(&mem, &trainer.state.results));
     VType::U8.write_at(&mut mem, base, 28);
     let before = snapshot(&mem, base, 64);
-    assert_eq!(trainer.set_watch_value(&mut mem, base, VType::U8, "99"), Ok(99));
+    assert_eq!(
+        trainer.set_watch_value(&mut mem, base, VType::U8, "99"),
+        Ok(99)
+    );
     assert_eq!(snapshot(&mem, base + 1, 63), before[1..]);
     assert_eq!(trainer.state.results[0].bits, 99);
     assert!(trainer.state.snapshot.is_none());
     trainer.refresh_live_values(&mut mem, None, 0.25);
-    assert!(trainer.state.activity.entries.is_empty(), "own writes are not game events");
+    assert!(
+        trainer.state.activity.entries.is_empty(),
+        "own writes are not game events"
+    );
 }
 
 #[test]
@@ -474,14 +583,40 @@ fn watch_write_rejects_overflow_type_changes_frozen_aliases_and_expiry() {
     let mut trainer = Trainer::new(true);
     trainer.state.results = vec![result(&mut mem, base + 1, VType::U8, "30")];
     let before = snapshot(&mem, base, 64);
-    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::U8, "999").is_err());
-    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::I32, "99").is_err());
-    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::Auto, "99").is_err());
-    assert!(trainer.set_watch_value(&mut mem, base + 8, VType::U8, "99").is_err());
-    trainer.state.frozen.push(Patch { addr: base, vtype: VType::I32, bits: 0, freeze: true });
-    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::U8, "99").is_err());
+    assert!(trainer
+        .set_watch_value(&mut mem, base + 1, VType::U8, "999")
+        .is_err());
+    assert!(trainer
+        .set_watch_value(&mut mem, base + 1, VType::I32, "99")
+        .is_err());
+    assert!(trainer
+        .set_watch_value(&mut mem, base + 1, VType::Auto, "99")
+        .is_err());
+    assert!(trainer
+        .set_watch_value(&mut mem, base + 8, VType::U8, "99")
+        .is_err());
+    trainer.state.frozen.push(Patch {
+        addr: base,
+        vtype: VType::I32,
+        bits: 0,
+    });
+    assert!(trainer
+        .set_watch_value(&mut mem, base + 1, VType::U8, "99")
+        .is_err());
     assert_eq!(snapshot(&mem, base, 64), before);
     trainer.state.frozen.clear();
     mem.free(MutVoidPtr::from_bits(base));
-    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::U8, "99").is_err());
+    assert!(trainer
+        .set_watch_value(&mut mem, base + 1, VType::U8, "99")
+        .is_err());
+}
+
+#[test]
+fn hack_filenames_sanitize_app_ids() {
+    for app_id in ["../outside", r"..\outside", ".", "..", ""] {
+        let tag = safe_app_tag(app_id);
+        assert_eq!(std::path::Path::new(&tag).components().count(), 1);
+        assert_ne!(tag, ".");
+        assert_ne!(tag, "..");
+    }
 }

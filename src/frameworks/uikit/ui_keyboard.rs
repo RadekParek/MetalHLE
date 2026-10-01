@@ -3,7 +3,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! `UIKeyboard` — host soft keyboard bridge and notification constants.
+//! `UIKeyboard` — keyboard appearance/dismissal stubs and notification
+//! constants.
 
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::CGSize;
@@ -160,36 +161,6 @@ pub struct State {
     ui_keyboard_impl_shared_instance: Option<id>,
 }
 
-pub fn start_text_input(env: &mut crate::Environment) {
-    if env.window.is_some() {
-        env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
-    }
-}
-
-pub fn stop_text_input(env: &mut crate::Environment) {
-    if env.window.is_some() {
-        env.on_parent_stack_in_coroutine(|window, _| window.stop_text_input());
-    }
-}
-
-pub fn is_text_input_active(env: &mut crate::Environment) -> bool {
-    if env.window.is_none() {
-        return false;
-    }
-    let mut active = false;
-    env.on_parent_stack_in_coroutine(|window, _| active = window.is_text_input_active());
-    active
-}
-
-pub fn is_screen_keyboard_shown(env: &mut crate::Environment) -> bool {
-    if env.window.is_none() {
-        return false;
-    }
-    let mut shown = false;
-    env.on_parent_stack_in_coroutine(|window, _| shown = window.is_screen_keyboard_shown());
-    shown
-}
-
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -212,7 +183,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (bool)isOnScreen {
-    is_screen_keyboard_shown(env)
+    false
 }
 
 + (CGSize)defaultSizeForOrientation:(NSInteger)_orientation {
@@ -225,23 +196,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())orderInWithAnimation:(bool)_animated {
-    start_text_input(env);
+    log!("UIKeyboard orderInWithAnimation: stubbed (no keyboard shown)");
 }
 
 - (())orderOutWithAnimation:(bool)_animated {
-    stop_text_input(env);
+    log!("UIKeyboard orderOutWithAnimation: stubbed");
 }
 
 - (())activate {
-    start_text_input(env);
+    log!("UIKeyboard activate: stubbed");
 }
 
 - (())deactivate {
-    stop_text_input(env);
+    log!("UIKeyboard deactivate: stubbed");
 }
 
 - (bool)isVisible {
-    is_screen_keyboard_shown(env)
+    false
 }
 
 @end
@@ -260,31 +231,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)activeInstance {
-    if is_text_input_active(env) {
-        msg_class![env; this sharedInstance]
-    } else {
-        nil
-    }
-}
-
-- (())orderInWithAnimation:(bool)_animated {
-    start_text_input(env);
-}
-
-- (())orderOutWithAnimation:(bool)_animated {
-    stop_text_input(env);
-}
-
-- (())activate {
-    start_text_input(env);
-}
-
-- (())deactivate {
-    stop_text_input(env);
-}
-
-- (bool)isVisible {
-    is_screen_keyboard_shown(env)
+    nil
 }
 
 - (())setDelegate:(id)_delegate {
@@ -371,7 +318,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 /// Helper called by text-input views (UITextField, UITextView) to post the
 /// standard keyboard-will/did-show notifications with an empty frame userInfo.
-/// The host soft keyboard itself is shown through SDL text input.
+/// In touchHLE we never actually show a keyboard, but apps that observe these
+/// notifications (to scroll their content) need them to fire.
 pub fn post_keyboard_notifications(env: &mut crate::Environment, will_show: bool) {
     use crate::frameworks::foundation::ns_string::get_static_str;
     use crate::objc::msg;

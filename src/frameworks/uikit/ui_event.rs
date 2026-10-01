@@ -8,8 +8,7 @@
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
-    NSZonePtr,
+    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 use crate::Environment;
 
@@ -86,11 +85,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         }
     }
-    // `-allObjects` returns an autoreleased array; releasing it here would
-    // over-release it when the pool drains. Apple's -touchesForView: returns
-    // an autoreleased set (+0); ours is +1 from -allocWithZone:, so
-    // autorelease it to match and avoid leaks.
-    autorelease(env, touches_for_view)
+    release(env, touches_arr);
+    touches_for_view
 }
 
 - (id)allTouches {
@@ -115,11 +111,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         }
     }
-    // `-allObjects` returns an autoreleased array; releasing it here would
-    // over-release it when the pool drains. Apple's -touchesForWindow:
-    // returns an autoreleased set (+0); ours is +1 from -new, so autorelease
-    // it to match and avoid leaks.
-    autorelease(env, result)
+    release(env, touches_arr);
+    result
 }
 
 - (id)touchesForGestureRecognizer:(id)_recognizer {

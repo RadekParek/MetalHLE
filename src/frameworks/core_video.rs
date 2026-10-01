@@ -135,6 +135,7 @@ struct PixelBufferInfo {
     pixel_format: u32,
     plane_count: u32,
     is_locked: bool,
+    owned_by_capture: bool,
 }
 
 // Глобальное хранилище для pixel buffers
@@ -207,6 +208,7 @@ pub fn CVPixelBufferGetBaseAddress(env: &mut Environment, _pixel_buffer: MutVoid
         pixel_format: K_CV_PIXEL_FORMAT_TYPE_32BGRA,
         plane_count: 1,
         is_locked: false,
+        owned_by_capture: false,
     });
 
     guest_ptr
@@ -388,8 +390,7 @@ pub fn CVPixelBufferRetain(_env: &mut Environment, _pixel_buffer: MutVoidPtr) ->
 // ===== ФУНКЦИИ SAMPLE BUFFER =====
 
 pub fn CMSampleBufferGetImageBuffer(_env: &mut Environment, _sample_buffer: MutVoidPtr) -> u32 {
-    // Возвращаем фейковый не-нулевой указатель на pixel buffer
-    1
+    current_camera_pixel_buffer().to_bits()
 }
 
 pub fn CMSampleBufferGetNumSamples(_env: &mut Environment, _sample_buffer: MutVoidPtr) -> i32 {
@@ -504,11 +505,55 @@ pub fn CVPixelBufferCreate(
             2
         },
         is_locked: false,
+        owned_by_capture: false,
     });
 
     // Записываем указатель в выходной параметр
     env.mem.write(pixel_buffer_out, guest_ptr);
     K_CV_RETURN_SUCCESS
+}
+
+pub fn install_camera_frame(
+    env: &mut Environment,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> MutVoidPtr {
+    let bytes_per_row = width.saturating_mul(4);
+    let size = bytes_per_row.saturating_mul(height) as usize;
+    if size == 0 || rgba.len() < size {
+        return MutVoidPtr::null();
+    }
+    let ptr = env.mem.alloc(size as GuestUSize);
+    env.mem
+        .bytes_at_mut(ptr.cast(), size as GuestUSize)
+        .copy_from_slice(&rgba[..size]);
+    let mut buffers = PIXEL_BUFFERS.lock().unwrap();
+    if let Some(previous) = buffers.take() {
+        if previous.owned_by_capture {
+            env.mem.free(MutVoidPtr::from_bits(previous.guest_ptr));
+        }
+    }
+    let guest_ptr = ptr.to_bits();
+    *buffers = Some(PixelBufferInfo {
+        guest_ptr,
+        width,
+        height,
+        bytes_per_row,
+        pixel_format: K_CV_PIXEL_FORMAT_TYPE_32BGRA,
+        plane_count: 1,
+        is_locked: false,
+        owned_by_capture: true,
+    });
+    MutVoidPtr::from_bits(guest_ptr)
+}
+
+pub fn current_camera_pixel_buffer() -> MutVoidPtr {
+    PIXEL_BUFFERS
+        .lock()
+        .ok()
+        .and_then(|buffers| buffers.as_ref().map(|info| MutVoidPtr::from_bits(info.guest_ptr)))
+        .unwrap_or_else(MutVoidPtr::null)
 }
 
 // ===== РЕГИСТРАЦИЯ ВСЕХ ФУНКЦИЙ ДЛЯ ЭМУЛЯТОРА =====

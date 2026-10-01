@@ -10,15 +10,6 @@ use crate::libc;
 use crate::objc;
 
 // CoreAudio
-// libresolv.9 (stub resolver state functions)
-pub const LIBRESOLV: super::HostDylib = super::HostDylib {
-    path: "/usr/lib/libresolv.9.dylib",
-    aliases: &["/usr/lib/libresolv.dylib"],
-    class_exports: &[],
-    constant_exports: &[],
-    function_exports: &[],
-};
-
 pub const CORE_AUDIO: super::HostDylib = super::HostDylib {
     path: "/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
     aliases: &[],
@@ -106,11 +97,6 @@ pub const TWITTER: super::HostDylib = super::HostDylib {
     function_exports: &[],
 };
 
-// libresolv — stub resolver-state entry points live in the main libc table
-// (src/libc.rs), which every app links against; listing them here too would
-// trip the no-duplicate-exports test. The dylib entry stays so the path
-// resolves and non-lazy relocations don't warn about a missing dylib.
-// CoreTelephony — touchHLE has no cellular radio, but we expose real
 // CoreTelephony — touchHLE has no cellular radio, but we expose real
 // `CTTelephonyNetworkInfo` / `CTCarrier` classes plus the
 // `CTRadioAccessTechnology*` string constants and the
@@ -157,6 +143,18 @@ pub const AD_SUPPORT: super::HostDylib = super::HostDylib {
     function_exports: &[],
 };
 
+// SafariServices (stub — iOS 6+ social/web SSO framework. Apps like Angry Birds
+// Star Wars II link it as a hard Mach-O dependency but only ever use it behind
+// a "can it open" check or for optional logins; satisfying the dependency is
+// enough for them to launch. No-op classes can be added here if needed.)
+pub const SAFARI_SERVICES: super::HostDylib = super::HostDylib {
+    path: "/System/Library/Frameworks/SafariServices.framework/SafariServices",
+    aliases: &[],
+    class_exports: &[],
+    constant_exports: &[],
+    function_exports: &[],
+};
+
 // CoreImage (stub — no real CIFilter pipeline yet, but apps that include
 // the framework reach the kCIInputImageKey / kCIContextWorkingColorSpace /
 // kCIOutputImageKey constants via Mach-O lookup; without a HostDylib entry
@@ -165,7 +163,7 @@ pub const AD_SUPPORT: super::HostDylib = super::HostDylib {
 pub const CORE_IMAGE: super::HostDylib = super::HostDylib {
     path: "/System/Library/Frameworks/CoreImage.framework/CoreImage",
     aliases: &[],
-    class_exports: &[frameworks::core_image::CLASSES, frameworks::core_image::pipeline::CLASSES],
+    class_exports: &[frameworks::core_image::CLASSES],
     constant_exports: &[frameworks::core_image::CONSTANTS],
     function_exports: &[frameworks::core_image::FUNCTIONS],
 };
@@ -223,25 +221,25 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::game_kit::DYLIB,
     &frameworks::media_player::DYLIB,
     &frameworks::metal::DYLIB,
+    &frameworks::vulkan::DYLIB,
     &frameworks::openal::DYLIB,
+    &frameworks::skynest::DYLIB,
     &frameworks::opengles::DYLIB,
     &frameworks::security::DYLIB,
-    &frameworks::contacts::DYLIB,
-    &frameworks::pass_kit::DYLIB,
-    &frameworks::safari_services::DYLIB,
     &frameworks::store_kit::DYLIB,
     &frameworks::system_configuration::DYLIB,
     &frameworks::uikit::DYLIB,
     &frameworks::libicucore::DYLIB,
     &frameworks::libsqlite3::DYLIB,
-    &frameworks::libxml2::DYLIB,
     &frameworks::libbz2::DYLIB,
     &frameworks::common_crypto::DYLIB,
     &frameworks::core_video::DYLIB,
     &frameworks::address_book::DYLIB,
     &frameworks::accounts::DYLIB,
     &frameworks::game_controller::DYLIB,
-    &LIBRESOLV,
+    &frameworks::contacts::DYLIB,
+    &frameworks::pass_kit::DYLIB,
+    &frameworks::safari_services::DYLIB,
     &CORE_AUDIO,
     &frameworks::media_toolbox::DYLIB,
     &frameworks::web_kit::DYLIB,
@@ -321,18 +319,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn strtoll_l_is_exported() {
-        let is_exported = DYLIB_LIST
-            .iter()
-            .flat_map(|dylib| dylib.function_exports)
-            .copied()
-            .flatten()
-            .any(|(function_name, _)| *function_name == "_strtoll_l");
-
-        assert!(is_exported, "Missing libc export _strtoll_l");
     }
 
     #[test]

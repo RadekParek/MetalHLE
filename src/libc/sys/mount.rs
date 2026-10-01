@@ -12,6 +12,8 @@ use crate::libc::posix_io::stat::uid_t;
 use crate::libc::posix_io::{FileDescriptor, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use crate::mem::{ConstPtr, MutPtr, SafeRead};
 use crate::Environment;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 const MFSTYPENAMELEN: usize = 16;
 
@@ -45,15 +47,44 @@ pub struct statfs {
 }
 unsafe impl SafeRead for statfs {}
 
+/// Host free/total bytes. Unix reads statvfs; Windows (where the emulated
+/// volume is just a folder on the app data drive) falls back to the
+/// iOS baseline constants rather than shelling out to Win32.
+#[cfg(unix)]
+fn real_free_bytes() -> Option<(u64, u64)> {
+    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let base = crate::paths::user_data_base_path();
+    let ok = unsafe { libc::statvfs(base.as_os_str().as_bytes().as_ptr() as *const _, vfs.as_mut_ptr()) == 0 };
+    if !ok {
+        return None;
+    }
+    let vfs = unsafe { vfs.assume_init() };
+    Some((vfs.f_bavail as u64 * vfs.f_bsize as u64, vfs.f_frsize as u64 * vfs.f_blocks as u64))
+}
+
+#[cfg(not(unix))]
+fn real_free_bytes() -> Option<(u64, u64)> {
+    None
+}
+
 /// A plausible `statfs` for the (single, fake) filesystem we present to apps.
 /// Values are taken from a test run of iOS 4.3 Simulator.
 fn fake_statfs() -> statfs {
+    // Overlay the host filesystem's real capacity on the iOS baseline so
+    // apps that check free space before writing (e.g. large downloads)
+    // make decisions based on actual available storage.
+    let (real_free_bytes, real_total_bytes) = real_free_bytes()
+        .map(|(free, total)| (Some(free), Some(total)))
+        .unwrap_or((None, None));
+    let to_blocks = |bytes: Option<u64>| {
+        bytes.map(|b| u64::from(b / 4096)).unwrap_or(0)
+    };
     let mut statfs = statfs {
         f_bsize: 4096,
         f_iosize: 1048576,
-        f_blocks: 16567314,
-        f_bfree: 12461147,
-        f_bavail: 12397147,
+        f_blocks: to_blocks(real_total_bytes).max(16567314),
+        f_bfree: to_blocks(real_free_bytes).max(12461147),
+        f_bavail: to_blocks(real_free_bytes).max(12397147),
         f_files: 16567312,
         f_ffree: 12397147,
         f_fsid: fsid_t {

@@ -18,7 +18,8 @@ use crate::libc::semaphore::{host_create_semaphore, host_destroy_semaphore, sem_
 use crate::mem::MutVoidPtr;
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, nil,
-    objc_classes, release, retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, SEL,
+    objc_classes, objc_super, release, retain, Class, ClassExports, NSZonePtr, ObjC,
+    TrivialHostObject, SEL,
 };
 use crate::Environment;
 use std::sync::Mutex;
@@ -220,11 +221,11 @@ fn perform_selector_on_thread(
     if let Some(semaphore) = semaphore {
         sem_wait(env, semaphore);
         host_destroy_semaphore(env, semaphore);
-    }
+}
 }
 
 fn object_class_hierarchy(env: &Environment, object: id) -> Vec<Class> {
-    let mut class = ObjC::read_isa(object, &env.mem);
+    let mut class = crate::objc::ObjC::read_isa(object, &env.mem);
     let mut hierarchy = Vec::new();
     while !class.is_null() {
         hierarchy.push(class);
@@ -238,6 +239,11 @@ fn object_class_hierarchy(env: &Environment, object: id) -> Vec<Class> {
     hierarchy
 }
 
+/// Runs the guest's `.cxx_construct` chain (base class first). Objective-C++
+/// classes implement `.cxx_construct` to zero-/initialize their C++ instance
+/// variables; skipping it leaves guest C++ sub-objects unconstructed and any
+/// code touching them dereferences garbage (asserts like Terraria's
+/// `GetWidget`, Dr. Driving startup crashes, ...).
 pub(crate) fn invoke_cxx_constructors(env: &mut Environment, object: id) {
     let Some(selector) = env.objc.lookup_selector(".cxx_construct") else {
         return;
@@ -268,37 +274,6 @@ pub(crate) fn invoke_cxx_constructors(env: &mut Environment, object: id) {
     }
     env.mem.free(super_info.cast::<std::ffi::c_void>());
     env.cpu.regs_mut()[0] = return_value;
-}
-
-pub(crate) fn invoke_cxx_destructors(env: &mut Environment, object: id) {
-    let Some(selector) = env.objc.lookup_selector(".cxx_destruct") else {
-        return;
-    };
-    let hierarchy = object_class_hierarchy(env, object);
-    if !hierarchy
-        .iter()
-        .any(|&class| env.objc.class_has_uninherited_method(class, selector))
-    {
-        return;
-    }
-    let super_info = env.mem.alloc(8).cast::<u32>();
-    for index in (0..hierarchy.len()).rev() {
-        let class = hierarchy[index];
-        if !env.objc.class_has_uninherited_method(class, selector) {
-            continue;
-        }
-        if index + 1 == hierarchy.len() {
-            let _: () = msg_send(env, (object, selector));
-        } else {
-            env.mem.write(super_info, object.to_bits());
-            env.mem
-                .write(super_info + 1, hierarchy[index + 1].to_bits());
-            let super_info_ptr: crate::mem::ConstPtr<crate::objc::objc_super> =
-                super_info.cast_const().cast();
-            let _: () = msg_send_super2(env, (super_info_ptr, selector));
-        }
-    }
-    env.mem.free(super_info.cast::<std::ffi::c_void>());
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -459,7 +434,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     log_dbg!("[{:?} dealloc]", this);
-    invoke_cxx_destructors(env, this);
 
     // Очищаем и высвобождаем динамические свойства KVC
     let mut to_release = Vec::new();
@@ -698,29 +672,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     sig
 }
 
-// MARK: - Telemetry no-ops
-// Some SDKs (e.g. the analytics bundled with MCPE 0.14.x) call generic
-// setters like setSessionId:/enqueueTelemetryItem: on whatever object they
-// keep in a static. Because these are ordinary method calls, every object
-// must respond to avoid "does not respond to selector" warnings. Telemetry
-// itself is a no-op in the emulator, so these are silent no-ops too.
-
-- (())setSessionId:(id)session_id {
-    log_dbg!("setSessionId:{:?} — telemetry no-op", session_id);
-}
-
-- (())setIsFirstSession:(bool)is_first_session {
-    log_dbg!("setIsFirstSession:{} — telemetry no-op", is_first_session);
-}
-
-- (())setIsNewSession:(bool)is_new_session {
-    log_dbg!("setIsNewSession:{} — telemetry no-op", is_new_session);
-}
-
-- (())enqueueTelemetryItem:(id)item {
-    log_dbg!("enqueueTelemetryItem:{:?} — telemetry no-op", item);
-}
-
 - (id)performSelector:(SEL)sel {
     assert!(!sel.is_null());
     msg_send_no_type_checking(env, (this, sel))
@@ -784,7 +735,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    if env.current_thread == 0 && wait {
+    if env.current_thread == 0 {
         if sel_name.ends_with(':') {
             () = msg_send(env, (this, sel, arg));
         } else {
@@ -860,7 +811,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     log_dbg!(
-        "performSelectorOnMainThread:{} from thread {} (wait={}) — scheduling",
+        "performSelectorOnMainThread:{} from background thread {} (wait={}) — scheduling",
         sel_name, env.current_thread, wait
     );
     msg![env; this performSelector:sel withObject:arg afterDelay:0.0]
@@ -890,38 +841,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     // out from under us) rather than panicking. With no selector there is
     // nothing to fire, so just release any waiter and bail.
     if sel_str.is_empty() {
-        // The userInfo dictionary carries the performSelector bookkeeping.
-        // If it is missing (e.g. the dict was released out from under us, or
-        // the timer reached us through another creation path), fall back to
-        // firing the timer's own target/selector pair, exactly as
-        // -[NSTimer fire] does, so a legitimate timer is not silently
-        // dropped. Never recurse through this method itself.
-        let (t_target, t_selector, t_repeats, t_valid) = {
-            let host = env
-                .objc
-                .borrow::<crate::frameworks::foundation::ns_timer::NSTimerHostObject>(which);
-            (host.target, host.selector, host.repeats, host.due_by.is_some())
-        };
-        let fire_sel = env.objc.lookup_selector("_touchHLE_timerFireMethod:").unwrap();
-        if t_valid && t_target != nil && !t_selector.is_null() && t_selector != fire_sel {
-            log_dbg!(
-                "_touchHLE_timerFireMethod: timer {:?} has no userInfo selector; \
-                 firing its own selector {} instead.",
-                which,
-                t_selector.as_str(&env.mem)
-            );
-            let pool: id = msg_class![env; NSAutoreleasePool new];
-            let _: () = msg_send(env, (t_target, t_selector, which));
-            release(env, pool);
-            if !t_repeats {
-                let _: () = msg![env; which invalidate];
-            }
-        } else {
-            log_dbg!(
-                "_touchHLE_timerFireMethod: timer {:?} has no stored selector; skipping.",
-                which
-            );
-        }
+        log!(
+            "Warning: _touchHLE_timerFireMethod: timer {:?} has no stored selector; skipping.",
+            which
+        );
         if let Some(sem_bits) = sem_to_post {
             let sem: crate::mem::MutPtr<crate::libc::semaphore::sem_t> =
                 crate::mem::MutPtr::from_bits(sem_bits);

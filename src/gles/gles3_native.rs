@@ -546,12 +546,6 @@ impl GLES for GLES3Native<'_> {
         }
         gles30::TexParameterfv(target, pname, params)
     }
-    unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
-        gles30::GetTexParameteriv(target, pname, params)
-    }
-    unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
-        gles30::GetTexParameterfv(target, pname, params)
-    }
     #[allow(clippy::too_many_arguments)]
     unsafe fn TexImage2D(
         &mut self,
@@ -619,7 +613,11 @@ impl GLES for GLES3Native<'_> {
         // GL_INVALID_ENUM and leaves the texture in its default (black)
         // state. Mirror the behaviour of the ES 1.1 backends here and
         // software-decode PVRTC to plain RGBA when the host can't do it.
-        if !self.pvrtc_native && !data.is_null() && image_size > 0 {
+        if crate::gles::should_decode_pvrtc()
+            && !self.pvrtc_native
+            && !data.is_null()
+            && image_size > 0
+        {
             let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
             if try_decode_pvrtc(
                 self,
@@ -720,22 +718,6 @@ impl GLES for GLES3Native<'_> {
             border,
             image_size,
             data,
-        )
-    }
-    unsafe fn CompressedTexSubImage2D(
-        &mut self,
-        target: GLenum,
-        level: GLint,
-        xoffset: GLint,
-        yoffset: GLint,
-        width: GLsizei,
-        height: GLsizei,
-        format: GLenum,
-        image_size: GLsizei,
-        data: *const GLvoid,
-    ) {
-        gles30::CompressedTexSubImage2D(
-            target, level, xoffset, yoffset, width, height, format, image_size, data,
         )
     }
     unsafe fn CopyTexImage2D(

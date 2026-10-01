@@ -39,6 +39,7 @@ pub mod core_audio;
 pub mod core_audio_types;
 pub mod core_bluetooth;
 pub mod core_foundation;
+pub mod contacts;
 pub mod core_graphics;
 pub mod core_image;
 pub mod core_location;
@@ -49,37 +50,38 @@ pub mod core_text;
 pub mod core_video;
 pub mod foundation;
 pub mod game_controller;
+pub mod javascript_core;
 pub mod game_kit;
 pub mod gl_kit;
 pub mod image_io;
-pub mod javascript_core;
 pub mod libbz2;
 pub mod libicucore;
 pub mod libsqlite3;
 pub mod libxml2;
+pub mod pass_kit;
+pub mod safari_services;
 pub mod map_kit;
 pub mod media_player;
 pub mod media_toolbox;
-pub mod message_ui;
-pub mod metal;
-pub mod mobile_core_services;
-pub mod mopub;
-pub mod openal;
-pub mod opengles;
+pub mod watch_connectivity;
+pub mod xsapitcui;
 pub mod photos;
 pub mod quick_look;
+pub mod message_ui;
+pub mod mopub;
+pub mod metal;
+pub mod mobile_core_services;
+pub mod openal;
+pub mod opengles;
 pub mod security;
+pub mod skynest;
 pub mod social;
-pub mod contacts;
-pub mod pass_kit;
-pub mod safari_services;
 pub mod store_kit;
 pub mod system_configuration;
 pub mod tw_tweet_compose_view_controller;
 pub mod uikit;
-pub mod watch_connectivity;
+pub mod vulkan;
 pub mod web_kit;
-pub mod xsapitcui;
 
 /// Container for state of various child modules
 #[derive(Default)]
@@ -97,6 +99,7 @@ pub struct State {
     opengles: opengles::State,
     uikit: uikit::State,
     watch_connectivity: watch_connectivity::State,
+    skynest: skynest::State,
 }
 
 /// Container for thread local state of various child modules

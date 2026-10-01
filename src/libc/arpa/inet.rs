@@ -7,10 +7,10 @@
 
 use crate::dyld::FunctionExports;
 use crate::libc::netdb::socklen_t;
-use crate::libc::sys::socket::{AF_INET, AF_INET6};
+use crate::libc::sys::socket::AF_INET;
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::{export_c_func, Environment};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 
 #[allow(non_camel_case_types)]
 type in_addr_t = u32;
@@ -24,7 +24,8 @@ const INADDR_BROADCAST: in_addr_t = 0xFFFFFFFF;
 #[allow(dead_code)]
 const INADDR_LOOPBACK: in_addr_t = 0x7F000001;
 
-const INET6_ADDRSTRLEN: u32 = 46;
+/// AF_INET6 — we don't support IPv6 but accept the constant gracefully.
+const AF_INET6: i32 = 30;
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
@@ -120,16 +121,12 @@ fn inet_ntop(
             dst.cast_const()
         }
         x if x == AF_INET6 => {
-            let addr: [u8; 16] = env.mem.bytes_at(src.cast::<u8>(), 16).try_into().unwrap();
-            let value = Ipv6Addr::from(addr);
-            let text = value.to_string();
-            let bytes = text.as_bytes();
-            let len = bytes.len() as u32;
-            if len + 1 > size || size == 0 || size > INET6_ADDRSTRLEN {
+            log!("inet_ntop: AF_INET6 not supported, writing '::' stub");
+            let s = b"::\0";
+            if (s.len() as u32) > size {
                 return ConstPtr::null();
             }
-            env.mem.bytes_at_mut(dst, len).copy_from_slice(bytes);
-            env.mem.write(dst + len, b'\0');
+            env.mem.bytes_at_mut(dst, s.len() as u32).copy_from_slice(s);
             dst.cast_const()
         }
         _ => {
@@ -152,23 +149,14 @@ fn inet_pton(env: &mut Environment, af: i32, src: ConstPtr<u8>, dst: MutVoidPtr)
                 1
             }
             Err(_) => {
-                log_dbg!("inet_pton AF_INET {:?}: invalid, returning 0", s);
+                log!("inet_pton AF_INET {:?}: invalid, returning 0", s);
                 0
             }
         },
-        x if x == AF_INET6 => match s.parse::<Ipv6Addr>() {
-            Ok(addr) => {
-                env.mem
-                    .bytes_at_mut(dst.cast::<u8>(), 16)
-                    .copy_from_slice(&addr.octets());
-                log_dbg!("inet_pton AF_INET6 {:?} => 1", s);
-                1
-            }
-            Err(_) => {
-                log!("inet_pton AF_INET6 {:?}: invalid, returning 0", s);
-                0
-            }
-        },
+        x if x == AF_INET6 => {
+            log!("inet_pton: AF_INET6 not supported, returning 0");
+            0
+        }
         _ => {
             log!("inet_pton: unsupported address family {}, returning -1", af);
             -1

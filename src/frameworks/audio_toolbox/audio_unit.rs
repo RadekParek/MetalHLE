@@ -21,55 +21,20 @@ use crate::dyld::FunctionExports;
 use crate::environment::Environment;
 use crate::export_c_func;
 use crate::frameworks::audio_toolbox::audio_components;
-use crate::frameworks::audio_toolbox::au_graph;
-use crate::frameworks::audio_toolbox::audio_queue::{
-    decode_buffer, decode_buffer_from_bytes, log_if_broken_audio_format,
-};
+use crate::frameworks::audio_toolbox::audio_queue::log_if_broken_audio_format;
 use crate::frameworks::carbon_core::{paramErr, OSStatus};
-use crate::frameworks::core_audio_types::{
-    fourcc, AudioStreamBasicDescription, AudioTimeStamp, SMPTETime,
-    kAudioFormatFlagIsNonInterleaved,
-};
+use crate::frameworks::core_audio_types::{fourcc, AudioStreamBasicDescription};
 use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
 use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
 use crate::frameworks::foundation::ns_run_loop;
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{guest_size_of, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
-use crate::objc::{autorelease, id, msg, msg_class};
+use crate::objc::{autorelease, id, msg, msg_class, nil};
 
-use super::audio_components::{
-    AURenderCallback, AURenderCallbackStruct, AudioComponentInstance,
-};
+use super::audio_components::{AURenderCallbackStruct, AudioComponentInstance};
+use super::audio_queue::decode_buffer;
 
 pub type AudioUnit = AudioComponentInstance;
-
-fn interleave_planar_pcm(planes: &[&[u8]], bytes_per_sample: usize) -> Option<Vec<u8>> {
-    let first = *planes.first()?;
-    if bytes_per_sample == 0
-        || first.len() % bytes_per_sample != 0
-        || planes.iter().any(|plane| plane.len() != first.len())
-    {
-        return None;
-    }
-
-    let capacity = first.len().checked_mul(planes.len())?;
-    let mut interleaved = Vec::with_capacity(capacity);
-    for offset in (0..first.len()).step_by(bytes_per_sample) {
-        for plane in planes {
-            interleaved.extend_from_slice(&plane[offset..offset + bytes_per_sample]);
-        }
-    }
-    Some(interleaved)
-}
-
-fn interleaved_format_for_planar_pcm(
-    mut format: AudioStreamBasicDescription,
-) -> AudioStreamBasicDescription {
-    format.format_flags &= !kAudioFormatFlagIsNonInterleaved;
-    format.bytes_per_frame *= format.channels_per_frame;
-    format.bytes_per_packet *= format.channels_per_frame;
-    format
-}
 
 type AudioUnitPropertyID = u32;
 type AudioUnitScope = u32;
@@ -1035,9 +1000,7 @@ fn AudioOutputUnitStart(env: &mut Environment, ci: AudioUnit) -> OSStatus {
         ci,
         has_callback
     );
-    if !au_graph::start_graph_for_output(env, ci) {
-        setup_audio_unit_for_render(env, ci);
-    }
+    setup_audio_unit_for_render(env, ci);
     0
 }
 
@@ -1137,7 +1100,6 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
 }
 
 fn AudioOutputUnitStop(env: &mut Environment, ci: AudioUnit) -> OSStatus {
-    au_graph::stop_graph_for_output(env, ci);
     let was_started = audio_components::State::get(&mut env.framework_state)
         .audio_component_instances
         .get(&ci)
@@ -1179,9 +1141,9 @@ fn AudioOutputUnitStop(env: &mut Environment, ci: AudioUnit) -> OSStatus {
 // =========================================================================
 
 fn AudioUnitAddRenderNotify(
-    env: &mut Environment,
+    _e: &mut Environment,
     u: AudioUnit,
-    p: AURenderCallback,
+    p: ConstVoidPtr,
     r: ConstVoidPtr,
 ) -> OSStatus {
     log_dbg!(
@@ -1190,21 +1152,12 @@ fn AudioUnitAddRenderNotify(
         p,
         r
     );
-    if p.to_ptr().is_null() {
-        return paramErr;
-    }
-    if let Some(obj) = audio_components::State::get(&mut env.framework_state)
-        .audio_component_instances
-        .get_mut(&u)
-    {
-        obj.render_notifies.push((p, r));
-    }
     0
 }
 fn AudioUnitRemoveRenderNotify(
-    env: &mut Environment,
+    _e: &mut Environment,
     u: AudioUnit,
-    p: AURenderCallback,
+    p: ConstVoidPtr,
     r: ConstVoidPtr,
 ) -> OSStatus {
     log_dbg!(
@@ -1213,50 +1166,7 @@ fn AudioUnitRemoveRenderNotify(
         p,
         r
     );
-    if let Some(obj) = audio_components::State::get(&mut env.framework_state)
-        .audio_component_instances
-        .get_mut(&u)
-    {
-        obj.render_notifies
-            .retain(|(proc, ref_con)| proc.to_ptr() != p.to_ptr() || *ref_con != r);
-    }
     0
-}
-
-/// Invoke every render notify registered on this unit, mimicking CoreAudio's
-/// pre/post-render notification pass. `action_flags_ptr` is written with
-/// `flag` before each call so guest code can tell the phases apart; the
-/// remaining arguments mirror the AURenderCallback signature.
-fn call_render_notifies(
-    env: &mut Environment,
-    audio_unit: AudioUnit,
-    action_flags_ptr: MutPtr<u32>,
-    flag: u32,
-    timestamp: ConstVoidPtr,
-    bus: u32,
-    frames: u32,
-    io_data: MutVoidPtr,
-) {
-    let notifies: Vec<(GuestFunction, ConstVoidPtr)> = {
-        let obj = audio_components::State::get(&mut env.framework_state)
-            .audio_component_instances
-            .get(&audio_unit);
-        match obj {
-            Some(obj) if !obj.render_notifies.is_empty() => obj
-                .render_notifies
-                .iter()
-                .map(|(proc, ref_con)| (*proc, *ref_con))
-                .collect(),
-            _ => return,
-        }
-    };
-    env.mem.write(action_flags_ptr, flag);
-    for (proc, ref_con) in notifies {
-        let _: OSStatus = proc.call_from_host(
-            env,
-            (ref_con, action_flags_ptr, timestamp, bus, frames, io_data),
-        );
-    }
 }
 
 fn AudioUnitRender(
@@ -1433,59 +1343,6 @@ fn AudioUnitComplexRender(
     0
 }
 
-/// `AudioTimeStampFlags` from `<CoreAudio/CoreAudioTypes.h>`.
-const kAudioTimeStampSampleTimeValid: u32 = 1 << 0;
-const kAudioTimeStampHostTimeValid: u32 = 1 << 1;
-const kAudioTimeStampRateScalarValid: u32 = 1 << 2;
-
-/// Allocates a guest-visible `AudioTimeStamp` describing the current render
-/// pass. The caller owns it and must `env.mem.free()` it once the callback has
-/// returned.
-///
-/// `sample_time` is the number of frames rendered so far: it has to advance by
-/// `frames` on every pass. `host_time` is expressed in the same units
-/// `mach_absolute_time` reports, so a callback can correlate the two clocks.
-///
-/// Passing `nil` here instead — which this code used to do — is not a harmless
-/// omission. `inTimeStamp` is a documented input of `AURenderCallback`, and
-/// middleware that mixes *streams* (long music tracks decoded on a worker
-/// thread) rather than one-shot samples reads `mSampleTime`/`mHostTime` to work
-/// out how much audio the device consumed and therefore how far ahead to mix.
-/// FMOD's AudioUnit output — the engine Geometry Dash 2.11 uses for both its
-/// music and its sound effects — is such a mixer; with no timestamp at all it
-/// has nothing to synchronise its stream buffer against.
-fn alloc_render_timestamp(env: &mut Environment, sample_time: f64) -> MutVoidPtr {
-    let host_time: u64 = env
-        .guest_clock
-        .now()
-        .duration_since(env.startup_time)
-        .as_nanos() as u64;
-    let timestamp = env.mem.alloc_and_write(AudioTimeStamp {
-        sample_time,
-        host_time,
-        // We hand the callback exactly as many frames as it asked for, at the
-        // format's nominal rate, i.e. no drift.
-        rate_scalar: 1.0,
-        world_clock_type: 0,
-        SMPTE_time: SMPTETime {
-            subframes: 0,
-            subframe_divisor: 0,
-            counter: 0,
-            type_: 0,
-            flags: 0,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
-            frames: 0,
-        },
-        flags: kAudioTimeStampSampleTimeValid
-            | kAudioTimeStampHostTimeValid
-            | kAudioTimeStampRateScalarValid,
-        _reserved: 0,
-    });
-    timestamp.cast_void()
-}
-
 /// Per-bus рендеринг для 3D Mixer / любого юнита, в котором через
 /// `AUGraphSetNodeInputCallback` (или эквивалент) задан input render
 /// callback на отдельные шины. Для каждой такой шины вызывает гостевой
@@ -1493,8 +1350,7 @@ fn alloc_render_timestamp(env: &mut Environment, sample_time: f64) -> MutVoidPtr
 /// OpenAL Soft сам микширует все источники вместе.
 fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
     use crate::frameworks::core_audio_types::{
-        kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
-        kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
+        kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
     };
 
     // Готовим план: список
@@ -1505,7 +1361,6 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         ALuint,
         Instant,
         AudioStreamBasicDescription,
-        f64,
     )> = {
         let at = &mut env.framework_state.audio_toolbox;
         let hardware_sr = at.audio_session.current_hardware_sample_rate;
@@ -1516,7 +1371,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         else {
             return;
         };
-        if !obj.started || obj.mixer_buses.is_empty() {
+        if obj.mixer_buses.is_empty() {
             return;
         }
         // Дефолтный формат шины 3D Mixer, если игра его явно не задавала:
@@ -1544,7 +1399,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                 continue;
             };
             let fmt = bus.stream_format.unwrap_or(default_format);
-            v.push((*bus_id, cb, src, last, fmt, bus.sample_time));
+            v.push((*bus_id, cb, src, last, fmt));
         }
         v
     };
@@ -1558,10 +1413,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
     );
 
     let now = Instant::now();
-    for (bus_id, callback, al_source, last_render_time, fmt, start_sample_time) in plan {
-        // Frames rendered for this bus so far; handed to the callback through
-        // the `AudioTimeStamp` below and advanced by every render pass.
-        let mut sample_time = start_sample_time;
+    for (bus_id, callback, al_source, last_render_time, fmt) in plan {
         // Ограничиваем глубину очереди OpenAL, чтобы буферы не накапливались
         // быстрее, чем воспроизводятся. Если этого не делать, при длительной
         // игре источник набирает всё больше необработанных буферов, звук
@@ -1618,15 +1470,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
             .current_hardware_io_buffer_duration as f64)
             * fmt.sample_rate as f64) as u32;
         let mut frames = ((elapsed.as_secs_f64() * fmt.sample_rate) as u32).clamp(64, 4096);
-        let is_planar_stereo = fmt.format_id == kAudioFormatLinearPCM
-            && fmt.channels_per_frame == 2
-            && fmt.format_flags & kAudioFormatFlagIsNonInterleaved != 0
-            && fmt.bytes_per_frame == fmt.bits_per_channel / 8;
-        let mut buffer_size = if is_planar_stereo {
-            frames * fmt.bytes_per_frame
-        } else {
-            frames * fmt.channels_per_frame * (fmt.bits_per_channel / 8)
-        };
+        let mut buffer_size = frames * fmt.channels_per_frame * (fmt.bits_per_channel / 8);
         if buffer_size == 0 {
             continue;
         }
@@ -1665,109 +1509,44 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         for audio_pass in 0..render_passes {
             if audio_pass > 0 {
                 frames = nominal_frames.clamp(64, 4096);
-                buffer_size = if is_planar_stereo {
-                    frames * fmt.bytes_per_frame
-                } else {
-                    frames * fmt.channels_per_frame * (fmt.bits_per_channel / 8)
-                };
+                buffer_size = frames * fmt.channels_per_frame * (fmt.bits_per_channel / 8);
                 if buffer_size == 0 {
                     break;
                 }
             }
 
-            // Prepare one interleaved buffer or two mono planes, depending on the stream format.
+            // Готовим AudioBufferList<1> и вызываем гостевой callback.
             let action_flags = env.mem.alloc_and_write(0u32);
-            let (abl, buffer_data, second_buffer_data) = if is_planar_stereo {
-                let left = env.mem.alloc(buffer_size);
-                let right = env.mem.alloc(buffer_size);
-                let abl = env.mem.alloc_and_write(AudioBufferList::<2> {
-                    number_buffers: 2,
-                    buffers: [
-                        AudioBuffer {
-                            number_channels: 1,
-                            data_byte_size: buffer_size,
-                            data: left,
-                        },
-                        AudioBuffer {
-                            number_channels: 1,
-                            data_byte_size: buffer_size,
-                            data: right,
-                        },
-                    ],
-                });
-                (abl.cast::<std::ffi::c_void>(), left, Some(right))
-            } else {
-                let buffer = env.mem.alloc(buffer_size);
-                let abl = env.mem.alloc_and_write(AudioBufferList::<1> {
-                    number_buffers: 1,
-                    buffers: [AudioBuffer {
-                        number_channels: fmt.channels_per_frame,
-                        data_byte_size: buffer_size,
-                        data: buffer,
-                    }],
-                });
-                (abl.cast::<std::ffi::c_void>(), buffer, None)
-            };
+            let buffer_data = env.mem.alloc(buffer_size);
+            let abl = env.mem.alloc_and_write(AudioBufferList::<1> {
+                number_buffers: 1,
+                buffers: [AudioBuffer {
+                    number_channels: fmt.channels_per_frame,
+                    data_byte_size: buffer_size,
+                    data: buffer_data,
+                }],
+            });
 
-            let timestamp = alloc_render_timestamp(env, sample_time);
-            call_render_notifies(
-                env,
-                audio_unit,
-                action_flags,
-                kAudioUnitRenderAction_PreRender,
-                timestamp.cast_const(),
-                bus_id,
-                frames,
-                abl.cast::<std::ffi::c_void>(),
-            );
-            env.mem.write(action_flags, 0u32);
             let _: OSStatus = input_proc.call_from_host(
                 env,
                 (
                     input_proc_ref,
                     action_flags,
-                    timestamp.cast_const(),
+                    nil.cast_void().cast_const(),
                     bus_id,
                     frames,
-                    abl,
+                    abl.cast::<std::ffi::c_void>(),
                 ),
             );
-            call_render_notifies(
-                env,
-                audio_unit,
-                action_flags,
-                kAudioUnitRenderAction_PostRender,
-                timestamp.cast_const(),
-                bus_id,
-                frames,
-                abl.cast::<std::ffi::c_void>(),
-            );
-            sample_time += frames as f64;
 
-            let (al_fmt, _, processed) = if let Some(right) = second_buffer_data {
-                let planes = [
-                    env.mem.bytes_at(buffer_data.cast(), buffer_size),
-                    env.mem.bytes_at(right.cast(), buffer_size),
-                ];
-                let interleaved = interleave_planar_pcm(
-                    &planes,
-                    (fmt.bits_per_channel / 8) as usize,
-                )
-                .unwrap_or_default();
-                let interleaved_format = interleaved_format_for_planar_pcm(fmt);
-                decode_buffer_from_bytes(&interleaved_format, &interleaved, &[])
-            } else {
-                decode_buffer(&env.mem, &fmt, buffer_data.cast(), buffer_size, &[])
-            };
+            let (al_fmt, _, processed) =
+                decode_buffer(&env.mem, &fmt, buffer_data.cast(), buffer_size);
+
             if processed.is_empty() {
                 // Если callback ничего не записал — прекращаем burst.
                 env.mem.free(action_flags.cast_void());
                 env.mem.free(buffer_data.cast_void());
-                if let Some(right) = second_buffer_data {
-                    env.mem.free(right.cast_void());
-                }
-                env.mem.free(abl);
-                env.mem.free(timestamp);
+                env.mem.free(abl.cast_void().cast());
                 break;
             }
 
@@ -1801,11 +1580,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
 
             env.mem.free(action_flags.cast_void());
             env.mem.free(buffer_data.cast_void());
-            if let Some(right) = second_buffer_data {
-                env.mem.free(right.cast_void());
-            }
-            env.mem.free(abl);
-            env.mem.free(timestamp);
+            env.mem.free(abl.cast_void().cast());
         }
 
         // Освобождаем неиспользованные дренированные буферы, чтобы они не утекли.
@@ -1820,14 +1595,13 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
             }
         }
 
-        // Обновляем last_render_time и sample_time для шины.
+        // Обновляем last_render_time для шины.
         if let Some(obj) = audio_components::State::get(&mut env.framework_state)
             .audio_component_instances
             .get_mut(&audio_unit)
         {
             if let Some(bus) = obj.mixer_buses.get_mut(&bus_id) {
                 bus.last_render_time = Some(now);
-                bus.sample_time = sample_time;
             }
         }
     }
@@ -1839,11 +1613,6 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
 // before an audible underrun. The throttle below still drains and re-syncs
 // if we ever run ahead of playback.
 const AUDIO_RENDER_TARGET_DEPTH: i32 = 6;
-
-/// `kAudioUnitRenderAction_PreRender` / `PostRender` flags passed to render
-/// notify callbacks (see AudioUnitProperties.h).
-const kAudioUnitRenderAction_PreRender: u32 = 1 << 0;
-const kAudioUnitRenderAction_PostRender: u32 = 1 << 1;
 
 pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
     if env.bundle.bundle_identifier().starts_with("com.ea.simcity") {
@@ -1864,7 +1633,6 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         al_source,
         last_render_time,
         callback,
-        start_sample_time,
     ) = {
         let at = &mut env.framework_state.audio_toolbox;
         let Some(obj) = at
@@ -1887,7 +1655,6 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             obj.al_source,
             obj.last_render_time,
             obj.render_callback,
-            obj.sample_time,
         )
     };
 
@@ -1951,6 +1718,8 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         }
         return;
     };
+    log_once!("render_audio_unit: entering callback for the first time");
+
     let now = Instant::now();
     let mut queued_buffers = 0;
     let mut processed_buffers = 0;
@@ -2047,11 +1816,6 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
 
     let input_proc = callback.input_proc;
     let input_proc_ref = callback.input_proc_ref_con;
-    log_once!("render_audio_unit: entering callback for the first time");
-
-    // Frames rendered by this unit so far, passed to the callback through the
-    // `AudioTimeStamp` below and advanced by every render pass.
-    let mut sample_time = start_sample_time;
 
     for _ in 0..render_passes {
         // Восстанавливаем логику из оригинала: Resident Evil 4 ожидает 2 буфера
@@ -2091,43 +1855,20 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             (abl.cast(), buf1, Some(buf2))
         };
 
-        let timestamp = alloc_render_timestamp(env, sample_time);
-        call_render_notifies(
-            env,
-            audio_unit,
-            action_flags,
-            kAudioUnitRenderAction_PreRender,
-            timestamp.cast_const(),
-            0u32,
-            frames,
-            audio_buffer_list,
-        );
-        env.mem.write(action_flags, 0u32);
         let _: OSStatus = input_proc.call_from_host(
             env,
             (
                 input_proc_ref,
                 action_flags,
-                timestamp.cast_const(),
+                nil.cast_void().cast_const(),
                 0u32,
                 frames,
                 audio_buffer_list,
             ),
         );
-        call_render_notifies(
-            env,
-            audio_unit,
-            action_flags,
-            kAudioUnitRenderAction_PostRender,
-            timestamp.cast_const(),
-            0u32,
-            frames,
-            audio_buffer_list,
-        );
-        sample_time += frames as f64;
 
         let (al_fmt, _, processed) =
-            decode_buffer(&env.mem, &stream_format, buffer1_data.cast(), buffer_size, &[]);
+            decode_buffer(&env.mem, &stream_format, buffer1_data.cast(), buffer_size);
         {
             let context = env
                 .framework_state
@@ -2158,7 +1899,6 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
 
         env.mem.free(audio_buffer_list.cast_void());
         env.mem.free(buffer1_data.cast_void());
-        env.mem.free(timestamp);
         if let Some(b2) = buffer2_data {
             env.mem.free(b2.cast_void());
         }
@@ -2188,7 +1928,6 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
     {
         obj.last_render_time = Some(now);
         obj.is_running_handler = false;
-        obj.sample_time = sample_time;
     }
 }
 
@@ -2213,59 +1952,3 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioUnitProcess(_, _, _, _, _)),
     export_c_func!(AudioUnitProcessMultiple(_, _, _, _, _, _, _)),
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::{interleave_planar_pcm, interleaved_format_for_planar_pcm};
-    use crate::audio::openal::AL_FORMAT_STEREO16;
-    use crate::frameworks::audio_toolbox::audio_queue::decode_buffer_from_bytes;
-    use crate::frameworks::core_audio_types::{
-        AudioStreamBasicDescription, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
-        kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
-    };
-
-    fn planar_f32_stereo_format() -> AudioStreamBasicDescription {
-        AudioStreamBasicDescription {
-            sample_rate: 48_000.0,
-            format_id: kAudioFormatLinearPCM,
-            format_flags: kAudioFormatFlagIsFloat
-                | kAudioFormatFlagIsPacked
-                | kAudioFormatFlagIsNonInterleaved,
-            bytes_per_packet: 4,
-            frames_per_packet: 1,
-            bytes_per_frame: 4,
-            channels_per_frame: 2,
-            bits_per_channel: 32,
-            _reserved: 0,
-        }
-    }
-
-    #[test]
-    fn planar_f32_stereo_is_interleaved_and_decoded() {
-        let left = [0.5_f32, -0.25]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let right = [-0.5_f32, 0.75]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let interleaved = interleave_planar_pcm(&[&left, &right], 4).unwrap();
-        let format = interleaved_format_for_planar_pcm(planar_f32_stereo_format());
-        let (decoded_format, sample_rate, decoded) =
-            decode_buffer_from_bytes(&format, &interleaved, &[]);
-        let decoded_samples = decoded
-            .chunks_exact(2)
-            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
-            .collect::<Vec<_>>();
-
-        assert_eq!(decoded_format, AL_FORMAT_STEREO16);
-        assert_eq!(sample_rate, 48_000);
-        assert_eq!(decoded_samples, [16_383, -16_383, -8_191, 24_575]);
-    }
-
-    #[test]
-    fn planar_pcm_rejects_mismatched_plane_lengths() {
-        assert_eq!(interleave_planar_pcm(&[&[1, 2], &[3]], 1), None);
-    }
-}

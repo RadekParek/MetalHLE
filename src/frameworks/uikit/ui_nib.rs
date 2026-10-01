@@ -86,8 +86,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bundle: id = if bundle == nil {
         main_bundle
     } else {
+        // TODO: non-main bundles
+        assert_eq!(bundle, main_bundle);
         bundle
     };
+
     retain(env, nib_name);
     retain(env, bundle);
     let host_object = Box::new(UINibHostObject {
@@ -248,6 +251,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, this);
         msg![env; dummy init]
     } else if id == "IBFirstResponder" {
+        log!("[NIB] Resolving IBFirstResponder as a responder-chain target");
         release(env, this);
         nil
     } else {

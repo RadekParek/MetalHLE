@@ -8,7 +8,7 @@
 //! AddressBook.framework stub
 
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
-use crate::frameworks::core_foundation::cf_string::{CFStringCompare, CFStringRef};
+use crate::frameworks::core_foundation::cf_string::CFStringRef;
 use crate::frameworks::core_foundation::CFIndex;
 use crate::mem::{MutVoidPtr, Ptr};
 use crate::Environment;
@@ -203,9 +203,7 @@ fn ABPersonComparePeopleByName(
         }
         let s1: CFStringRef = name1.cast();
         let s2: CFStringRef = name2.cast();
-        let cmp = crate::frameworks::core_foundation::cf_string::CFStringCompare(
-            env, s1, s2, 0,
-        );
+        let cmp = crate::frameworks::core_foundation::cf_string::CFStringCompare(env, s1, s2, 0);
         if cmp != 0 {
             return cmp;
         }

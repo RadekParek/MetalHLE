@@ -9,9 +9,7 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::mach::init::MACH_TASK_SELF;
 use crate::libc::mach::port::mach_port_t;
 use crate::libc::mach::thread_info::{kern_return_t, KERN_INVALID_ADDRESS, KERN_SUCCESS};
-use crate::mem::{
-    ConstPtr, MutPtr, Ptr, SafeRead, SafeWrite, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK,
-};
+use crate::mem::{ConstPtr, MutPtr, Ptr, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK};
 use crate::Environment;
 use std::collections::HashMap;
 
@@ -25,77 +23,12 @@ type vm_inherit_t = u32;
 const VM_PROT_READ: vm_prot_t = 1;
 const VM_PROT_WRITE: vm_prot_t = 2;
 const VM_PROT_EXECUTE: vm_prot_t = 4;
+const KERN_INVALID_ARGUMENT: kern_return_t = 4;
 
 #[derive(Default)]
 pub struct State {
-    /// Keeping track of `vm_allocate` allocations: base address of the region
-    /// -> its bookkeeping.
-    allocations: HashMap<mach_vm_address_t, VmRegion>,
-}
-
-/// Round a byte count up to a whole number of pages, as Mach does for every
-/// region size it hands out or accepts.
-fn round_up_to_page(size: mach_vm_size_t) -> mach_vm_size_t {
-    if !size.is_multiple_of(PAGE_SIZE) {
-        size + PAGE_SIZE - (size % PAGE_SIZE)
-    } else {
-        size
-    }
-}
-
-/// Bookkeeping for a single region handed out by `vm_allocate`/`vm_remap`.
-#[derive(Default)]
-struct VmRegion {
-    /// Size the guest originally requested.
-    size: mach_vm_size_t,
-    /// Page-rounded size actually backed by a heap allocation.
-    rounded_size: mach_vm_size_t,
-    /// Sorted, disjoint `[start, end)` ranges within this region that the guest
-    /// has already deallocated.
-    ///
-    /// Real Mach lets a caller deallocate *any* sub-range of a mapping — apps
-    /// legitimately split one `vm_allocate` region into several buffers and
-    /// release them one at a time — but the host heap allocation underneath can
-    /// only be returned once the whole region has been released. Until then the
-    /// sub-range deallocations are recorded here (and reported as successful, as
-    /// the kernel would) instead of being rejected.
-    released: Vec<(mach_vm_address_t, mach_vm_address_t)>,
-}
-
-impl VmRegion {
-    /// Record that `[start, end)` has been deallocated and report whether that
-    /// completes the region.
-    fn release(
-        &mut self,
-        base: mach_vm_address_t,
-        start: mach_vm_address_t,
-        end: mach_vm_address_t,
-    ) -> bool {
-        let mut ranges = std::mem::take(&mut self.released);
-        ranges.push((start, end));
-        ranges.sort_unstable();
-        let mut coalesced: Vec<(mach_vm_address_t, mach_vm_address_t)> =
-            Vec::with_capacity(ranges.len());
-        for (s, e) in ranges {
-            // Sorted order means the new range can only extend the last one.
-            let touches_previous = match coalesced.last() {
-                Some(&(_, last_end)) => s <= last_end,
-                None => false,
-            };
-            if touches_previous {
-                let last = coalesced.last_mut().unwrap();
-                last.1 = last.1.max(e);
-            } else {
-                coalesced.push((s, e));
-            }
-        }
-        self.released = coalesced;
-
-        let region_end = base.saturating_add(self.rounded_size);
-        self.released.len() == 1
-            && self.released[0].0 <= base
-            && self.released[0].1 >= region_end
-    }
+    /// Keeping track of `vm_allocate` allocations
+    allocations: HashMap<mach_vm_address_t, mach_vm_size_t>,
 }
 
 pub fn vm_allocate(
@@ -109,7 +42,11 @@ pub fn vm_allocate(
     assert_eq!(flags, 1); // TRUE
 
     // `size is always rounded up to an integral number of pages`
-    let new_size = round_up_to_page(size);
+    let new_size = if !size.is_multiple_of(PAGE_SIZE) {
+        size + PAGE_SIZE - (size % PAGE_SIZE)
+    } else {
+        size
+    };
     // touchHLE delegates page-granularity Mach VM allocations to the
     // standard guest heap allocator. This is fine in practice — apps
     // call vm_allocate to obtain page-aligned scratch buffers, which
@@ -124,12 +61,9 @@ pub fn vm_allocate(
     env.mem.write(address_ptr, address);
 
     assert!(!env.libc_state.mach_vm.allocations.contains_key(&address));
-    // Note: we keep track of the original size as well as the page-rounded one,
-    // because guests pass either back to vm_deallocate.
-    env.libc_state.mach_vm.allocations.insert(
-        address,
-        VmRegion { size, rounded_size: new_size, released: Vec::new() },
-    );
+    // Note: we keep track of the original size,
+    // not the one what was actually allocated!
+    env.libc_state.mach_vm.allocations.insert(address, size);
 
     KERN_SUCCESS
 }
@@ -143,42 +77,12 @@ fn vm_deallocate(
     assert_eq!(target_task, MACH_TASK_SELF);
     log_dbg!("vm_deallocate() implemented atop standard allocator");
 
-    if size == 0 {
-        return KERN_SUCCESS;
-    }
-    let Some(end) = address.checked_add(size) else {
-        log!(
-            "Warning: vm_deallocate({:#x}, {:#x}) overflows the address space; returning KERN_INVALID_ADDRESS.",
-            address,
-            size
-        );
-        return KERN_INVALID_ADDRESS;
-    };
-
-    // Find the region this range belongs to. Mach accepts the deallocation of
-    // any sub-range of a mapping, so an exact base-address match is only the
-    // most common case: apps that carve one vm_allocate region into several
-    // buffers release each buffer separately, and all of those calls succeed on
-    // a real kernel.
-    let base = if env.libc_state.mach_vm.allocations.contains_key(&address) {
-        Some(address)
-    } else {
-        env.libc_state
-            .mach_vm
-            .allocations
-            .iter()
-            .find(|(base, region)| {
-                let region_end = base.saturating_add(region.rounded_size);
-                **base <= address && end <= region_end
-            })
-            .map(|(&base, _)| base)
-    };
-
-    // The guest may ask us to free a range that was never handed out via
-    // vm_allocate (a double free, a region obtained by other means, or a bogus
-    // pointer). A real Mach kernel returns KERN_INVALID_ADDRESS in that case
-    // rather than aborting the task, so mirror that instead of panicking.
-    let Some(base) = base else {
+    // The guest may ask us to free a region we never handed out via
+    // vm_allocate (a double free, a region obtained by other means, or a
+    // bogus pointer). A real Mach kernel returns KERN_INVALID_ADDRESS in
+    // that case rather than aborting the task, so mirror that instead of
+    // panicking on the missing map entry.
+    let Some(&tracked_size) = env.libc_state.mach_vm.allocations.get(&address) else {
         log!(
             "Warning: vm_deallocate({:#x}, {:#x}) for an address that was not allocated via vm_allocate; returning KERN_INVALID_ADDRESS.",
             address,
@@ -187,36 +91,25 @@ fn vm_deallocate(
         return KERN_INVALID_ADDRESS;
     };
 
-    let region = env.libc_state.mach_vm.allocations.get_mut(&base).unwrap();
-    let requested_size = region.size;
-    let region_end = base.saturating_add(region.rounded_size);
-    // We record the original requested size in `vm_allocate`, but the guest is
-    // free to pass either that or the page-rounded size it was effectively
-    // given. Anything wider than the region itself is worth a note, since those
-    // extra bytes belong to whatever is mapped next; the region is released
-    // either way.
-    if base == address && end > region_end {
+    // We record the original requested size in `vm_allocate`, but the guest
+    // is free to pass either the original size or the page-rounded size it
+    // was effectively given. Accept both.
+    let rounded_tracked_size = if !tracked_size.is_multiple_of(PAGE_SIZE) {
+        tracked_size + PAGE_SIZE - (tracked_size % PAGE_SIZE)
+    } else {
+        tracked_size
+    };
+    if size != tracked_size && size != rounded_tracked_size {
         log!(
             "Warning: vm_deallocate({:#x}, {:#x}) size mismatch (region was allocated with size {:#x}); freeing the whole region anyway.",
             address,
             size,
-            requested_size
+            tracked_size
         );
     }
-    let complete = region.release(base, address.max(base), end.min(region_end));
-    log_dbg!(
-        "vm_deallocate({:#x}, {:#x}) released part of region {:#x} (size {:#x}); complete: {}",
-        address,
-        size,
-        base,
-        region.rounded_size,
-        complete
-    );
 
-    if complete {
-        env.mem.free(Ptr::from_bits(base));
-        env.libc_state.mach_vm.allocations.remove(&base);
-    }
+    env.mem.free(Ptr::from_bits(address));
+    env.libc_state.mach_vm.allocations.remove(&address);
 
     KERN_SUCCESS
 }
@@ -260,7 +153,11 @@ fn vm_remap(
     }
 
     // `size` is always rounded up to an integral number of pages.
-    let new_size = round_up_to_page(size);
+    let new_size = if !size.is_multiple_of(PAGE_SIZE) {
+        size + PAGE_SIZE - (size % PAGE_SIZE)
+    } else {
+        size
+    };
 
     log_dbg!(
         "vm_remap(src={:#x}, size={:#x}, copy={}) approximated by allocate + copy",
@@ -297,11 +194,71 @@ fn vm_remap(
     }
 
     assert!(!env.libc_state.mach_vm.allocations.contains_key(&address));
-    env.libc_state.mach_vm.allocations.insert(
-        address,
-        VmRegion { size, rounded_size: new_size, released: Vec::new() },
-    );
+    env.libc_state.mach_vm.allocations.insert(address, size);
 
+    KERN_SUCCESS
+}
+
+fn vm_region_recurse(
+    env: &mut Environment,
+    target_task: vm_map_t,
+    address: MutPtr<mach_vm_address_t>,
+    size: MutPtr<mach_vm_size_t>,
+    depth: MutPtr<u32>,
+    info: MutPtr<u32>,
+    info_count: MutPtr<u32>,
+) -> kern_return_t {
+    if target_task != MACH_TASK_SELF
+        || address.is_null()
+        || size.is_null()
+        || depth.is_null()
+        || info_count.is_null()
+    {
+        return KERN_INVALID_ARGUMENT;
+    }
+
+    let requested = env.mem.read(address);
+    let region_start = requested & !PAGE_SIZE_ALIGN_MASK;
+    let region_size = if region_start < 0x3f00_0000 {
+        0x3f00_0000 - region_start
+    } else {
+        PAGE_SIZE
+    };
+    env.mem.write(address, region_start);
+    env.mem.write(size, region_size.max(PAGE_SIZE));
+    env.mem.write(depth, 0);
+
+    let requested_words = env.mem.read(info_count).min(16);
+    if !info.is_null() {
+        env.mem
+            .bytes_at_mut(info.cast(), requested_words * 4)
+            .fill(0);
+    }
+    env.mem.write(info_count, requested_words);
+    log_dbg!(
+        "vm_region_recurse({:#x}) => start={:#x}, size={:#x}",
+        requested,
+        region_start,
+        region_size.max(PAGE_SIZE)
+    );
+    KERN_SUCCESS
+}
+
+fn vm_protect(
+    _env: &mut Environment,
+    target_task: vm_map_t,
+    address: mach_vm_address_t,
+    size: mach_vm_size_t,
+    _set_maximum: i32,
+    new_protection: vm_prot_t,
+) -> kern_return_t {
+    assert_eq!(target_task, MACH_TASK_SELF);
+    log_dbg!(
+        "vm_protect({:#x}, {:#x}, protection={:#x}) accepted as a guest-memory no-op",
+        address,
+        size,
+        new_protection
+    );
     KERN_SUCCESS
 }
 
@@ -317,101 +274,11 @@ fn vm_purgable_control(
     KERN_SUCCESS
 }
 
-/// `kern_return_t vm_protect(vm_map_t target_task, vm_address_t address,
-/// vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection)`
-///
-/// Guest memory has no per-page protection enforcement, so this is a no-op
-/// that reports success (a real kernel would return KERN_INVALID_ADDRESS for
-/// unmapped ranges; callers like Chrome's sandbox setup ignore the result).
-fn vm_protect(
-    _env: &mut Environment,
-    target_task: vm_map_t,
-    address: mach_vm_address_t,
-    size: mach_vm_size_t,
-    set_maximum: i32,
-    new_protection: vm_prot_t,
-) -> kern_return_t {
-    if target_task != MACH_TASK_SELF {
-        return KERN_INVALID_ADDRESS;
-    }
-    log_dbg!(
-        "vm_protect({:#x}, {:#x}, set_max={}, prot={:#x}) accepted (no-op)",
-        address,
-        size,
-        set_maximum != 0,
-        new_protection
-    );
-    KERN_SUCCESS
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct vm_region_basic_info_data_t {
-    protection: vm_prot_t,
-    max_protection: vm_prot_t,
-    inheritance: vm_inherit_t,
-    reserved: u32,
-    offset: u32,
-}
-unsafe impl SafeRead for vm_region_basic_info_data_t {}
-
-
-/// `kern_return_t vm_region_recurse(vm_map_t target_task,
-/// vm_address_t *address, vm_size_t *size, uint32_t *nesting_depth,
-/// vm_region_recurse_info_t info, mach_msg_type_number_t *info_count)`
-///
-/// Reports tracked heap regions. Apps like Chrome use this to probe mappings
-/// and tolerate failure, but returning success for tracked regions is closer
-/// to a real kernel.
-fn vm_region_recurse(
-    env: &mut Environment,
-    target_task: vm_map_t,
-    address_ptr: MutPtr<mach_vm_address_t>,
-    size_ptr: MutPtr<mach_vm_size_t>,
-    nesting_depth_ptr: MutPtr<u32>,
-    info_ptr: MutPtr<u8>,
-    info_count_ptr: MutPtr<u32>,
-) -> kern_return_t {
-    if target_task != MACH_TASK_SELF || address_ptr.is_null() || size_ptr.is_null() {
-        return KERN_INVALID_ADDRESS;
-    }
-    let address = env.mem.read(address_ptr);
-    let Some(tracked) = env.libc_state.mach_vm.allocations.get(&address) else {
-        log_dbg!(
-            "vm_region_recurse({:#x}): untracked region; returning KERN_INVALID_ADDRESS",
-            address
-        );
-        return KERN_INVALID_ADDRESS;
-    };
-    env.mem.write(size_ptr, tracked.size);
-    if !nesting_depth_ptr.is_null() {
-        env.mem.write(nesting_depth_ptr, 0);
-    }
-    if !info_ptr.is_null() && !info_count_ptr.is_null() {
-        let info_count = env.mem.read(info_count_ptr);
-        if info_count >= 9 {
-            // vm_region_basic_info_data_t: five u32 fields in our layout
-            let info: MutPtr<vm_region_basic_info_data_t> = Ptr::from_bits(info_ptr.to_bits());
-            env.mem.write(
-                info,
-                vm_region_basic_info_data_t {
-                    protection: VM_PROT_READ | VM_PROT_WRITE,
-                    max_protection: VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
-                    inheritance: 1, // VM_INHERIT_COPY
-                    reserved: 0,
-                    offset: 0,
-                },
-            );
-        }
-    }
-    KERN_SUCCESS
-}
-
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(vm_allocate(_, _, _, _)),
     export_c_func!(vm_deallocate(_, _, _)),
     export_c_func!(vm_remap(_, _, _, _, _, _, _, _, _, _, _)),
-    export_c_func!(vm_purgable_control(_, _, _, _)),
-    export_c_func!(vm_protect(_, _, _, _, _)),
     export_c_func!(vm_region_recurse(_, _, _, _, _, _)),
+    export_c_func!(vm_protect(_, _, _, _, _)),
+    export_c_func!(vm_purgable_control(_, _, _, _)),
 ];

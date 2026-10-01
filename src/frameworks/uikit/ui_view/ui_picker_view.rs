@@ -5,11 +5,11 @@
  */
 //! `UIPickerView`.
 
-use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::NSUInteger;
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, nil, objc_classes, ClassExports, NSZonePtr,
+    id, impl_HostObject_with_superclass, msg, msg_class, nil, objc_classes, release, retain,
+    ClassExports, NSZonePtr,
 };
 
 // TODO: rendering
@@ -42,13 +42,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
-- (id)initWithFrame:(CGRect)frame {
+- (id)initWithFrame:(id)frame {
     let _: () = msg![env; this setFrame:frame];
     this
 }
 
 - (())dealloc {
-    // delegate/dataSource are assign (non-retained); nothing to release.
+    let host = env.objc.borrow::<UIPickerViewHostObject>(this);
+    let (delegate, data_source) = (host.delegate, host.data_source);
+    release(env, delegate);
+    release(env, data_source);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
@@ -59,9 +62,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setDelegate:(id)delegate {
-    // Per Apple's reference, `delegate` is an assign (non-retaining)
-    // property; retaining it would create a retain cycle with the
-    // view controller that owns the picker.
+    let old = env.objc.borrow::<UIPickerViewHostObject>(this).delegate;
+    release(env, old);
+    retain(env, delegate);
     env.objc.borrow_mut::<UIPickerViewHostObject>(this).delegate = delegate;
 }
 
@@ -72,7 +75,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setDataSource:(id)data_source {
-    // Like `delegate`, `dataSource` is an assign (non-retaining) property.
+    let old = env.objc.borrow::<UIPickerViewHostObject>(this).data_source;
+    release(env, old);
+    retain(env, data_source);
     env.objc.borrow_mut::<UIPickerViewHostObject>(this).data_source = data_source;
     // Refresh component count from the new data source.
     let count: NSUInteger = if data_source != nil {
@@ -109,16 +114,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Row size (delegate query)
 
-- (CGSize)rowSizeForComponent:(NSUInteger)component {
+- (id)rowSizeForComponent:(NSUInteger)component {
     let delegate = env.objc.borrow::<UIPickerViewHostObject>(this).delegate;
     if delegate != nil {
         let width:  f32 = msg![env; delegate pickerView:this widthForComponent:component];
         let height: f32 = msg![env; delegate pickerView:this rowHeightForComponent:component];
         if width > 0.0 && height > 0.0 {
-            return crate::frameworks::core_graphics::CGSize { width, height };
+            let size = crate::frameworks::core_graphics::CGSize { width, height };
+            return msg_class![env; NSValue valueWithCGSize:size];
         }
     }
-    crate::frameworks::core_graphics::CGSize { width: 320.0, height: 44.0 }
+    let size = crate::frameworks::core_graphics::CGSize { width: 320.0, height: 44.0 };
+    msg_class![env; NSValue valueWithCGSize:size]
 }
 
 // MARK: - Selection
@@ -136,10 +143,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         "UIPickerView selectRow:{} inComponent:{} animated:{} — stub",
         row, component, animated
     );
-    // Per Apple's docs, programmatic -selectRow:inComponent:animated: does
-    // NOT cause pickerView:didSelectRow:inComponent: to be sent to the
-    // delegate; notifying it here can cause infinite recursion in apps
-    // that call selectRow: from that very delegate method.
+    // Notify delegate of the selection.
+    let delegate = env.objc.borrow::<UIPickerViewHostObject>(this).delegate;
+    if delegate != nil {
+        let _: () = msg![env; delegate pickerView:this
+                                     didSelectRow:row
+                                     inComponent:component];
+    }
 }
 
 // MARK: - View for row (delegate query)

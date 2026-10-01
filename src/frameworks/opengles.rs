@@ -10,7 +10,7 @@
 //! topic.
 
 mod eagl;
-mod gles_guest;
+pub(crate) mod gles_guest;
 
 use touchHLE_gl_bindings::gles11::types::GLenum;
 
@@ -37,8 +37,8 @@ pub struct State {
 }
 impl State {
     fn current_ctx_for_thread(&mut self, thread: crate::ThreadId) -> &mut Option<crate::objc::id> {
-        // PERF: this runs on every guest GL call; one hash lookup, not two.
-        self.current_ctxs.entry(thread).or_insert(None)
+        self.current_ctxs.entry(thread).or_insert(None);
+        self.current_ctxs.get_mut(&thread).unwrap()
     }
 }
 

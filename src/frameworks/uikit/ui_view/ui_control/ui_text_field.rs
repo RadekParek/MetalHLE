@@ -222,6 +222,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
     let bounds: CGRect = msg![env; this bounds];
     let _: () = msg![env; text_label setFrame:bounds];
+    let text: id = msg![env; text_label text];
+    let text_length: NSUInteger = if text == nil { 0 } else { msg![env; text length] };
+    let placeholder = env.objc.borrow::<UITextFieldHostObject>(this).placeholder;
+    if text_length == 0 && placeholder != nil {
+        let _: () = msg![env; text_label setText:placeholder];
+        let placeholder_color: id = msg_class![env; UIColor grayColor];
+        let _: () = msg![env; text_label setTextColor:placeholder_color];
+    }
+    () = msg![env; text_label setNeedsDisplay];
 }
 
 - (id)text {
@@ -232,6 +241,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setText:(id)text {
     let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
     let _: () = msg![env; text_label setText:text];
+    let text_length: NSUInteger = if text == nil { 0 } else { msg![env; text length] };
+    let color: id = if text_length > 0 {
+        msg_class![env; UIColor blackColor]
+    } else {
+        msg_class![env; UIColor grayColor]
+    };
+    let _: () = msg![env; text_label setTextColor:color];
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
     let name = ns_string::get_static_str(env, UITextFieldTextDidChangeNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
@@ -259,6 +275,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, placeholder);
     env.objc.borrow_mut::<UITextFieldHostObject>(this).placeholder = placeholder;
+    () = msg![env; this layoutSubviews];
 }
 
 - (id)attributedPlaceholder { env.objc.borrow::<UITextFieldHostObject>(this).attributed_placeholder }
@@ -405,10 +422,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)canResignFirstResponder { true }
 
 - (bool)becomeFirstResponder {
-    if env.objc.borrow::<UITextFieldHostObject>(this).editing {
-        crate::frameworks::uikit::ui_keyboard::start_text_input(env);
-        return true;
-    }
+    if env.objc.borrow::<UITextFieldHostObject>(this).editing { return true; }
 
     let delegate: id = env.objc.borrow::<UITextFieldHostObject>(this).delegate;
     let mut delegate_alive = false;
@@ -439,7 +453,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 
     env.framework_state.uikit.ui_responder.first_responder = this;
-    crate::frameworks::uikit::ui_keyboard::start_text_input(env);
+    env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
 
     let name = ns_string::get_static_str(env, UIKeyboardDidShowNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
@@ -476,7 +490,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 
     env.framework_state.uikit.ui_responder.first_responder = nil;
-    crate::frameworks::uikit::ui_keyboard::stop_text_input(env);
+    env.on_parent_stack_in_coroutine(|window, _| window.stop_text_input());
 
     let name = ns_string::get_static_str(env, UIKeyboardDidHideNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];

@@ -15,8 +15,8 @@ pub mod aio;
 pub mod arpa;
 pub mod asl;
 pub mod blocks;
-pub mod clocale;
 pub mod codesign;
+pub mod clocale;
 pub mod crypto;
 pub mod ctype;
 pub mod cxxabi;
@@ -92,8 +92,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         arpa::inet::FUNCTIONS,
         asl::FUNCTIONS,
         blocks::FUNCTIONS,
-        clocale::FUNCTIONS,
         codesign::FUNCTIONS,
+        clocale::FUNCTIONS,
         ctype::FUNCTIONS,
         cxxabi::FUNCTIONS,
         crypto::FUNCTIONS,
@@ -176,17 +176,16 @@ pub struct State {
     pub pthread: pthread::State,
     pub semaphore: semaphore::State,
     pub socket: sys::socket::State,
-    resource: sys::resource::State,
     stdlib: stdlib::State,
+    pub(crate) resource: sys::resource::State,
     string: string::State,
     signal: signal::State,
-    stdio: stdio::State,
+    pub(crate) stdio: stdio::State,
     time: time::State,
     errno: errno::State,
     clocale: clocale::State,
     mach_o: mach_o::State,
     mach_vm: mach::vm_map::State,
-    mach_ports: mach::mach_port::State,
     mach_error: mach::error::State,
     mmap: mmap::State,
 }

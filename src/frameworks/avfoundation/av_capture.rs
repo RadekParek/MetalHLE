@@ -23,9 +23,11 @@
 
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::CGRect;
+use crate::frameworks::core_video;
 use crate::frameworks::foundation::{ns_array, ns_string};
+use crate::media_capture;
 use crate::objc::{
-    autorelease, id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
+    autorelease, id, msg, msg_class, msg_send, msg_super, nil, objc_classes, release, retain, ClassExports,
     HostObject, NSZonePtr, TrivialHostObject,
 };
 
@@ -336,6 +338,7 @@ pub struct State {
     /// Live `AVCaptureSession` instances. We track them so the camera
     /// backend can deliver frames to whichever sessions are running.
     pub running_sessions: Vec<id>,
+    pub last_sample_buffer: crate::mem::MutVoidPtr,
 }
 
 // ============================================================================
@@ -425,7 +428,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow_mut::<AVCaptureSessionHostObject>(this);
         host.preset = preset;
     }
-    log!("[(AVCaptureSession*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} init] (MetalHLE stub)", this);
     this
 }
 
@@ -533,7 +536,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: Lifecycle
 
 - (())startRunning {
-    log!("[(AVCaptureSession*){:?} startRunning] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} startRunning] (MetalHLE stub)", this);
     env.objc.borrow_mut::<AVCaptureSessionHostObject>(this).running = true;
     if !env.framework_state.avfoundation.av_capture.running_sessions.contains(&this) {
         env.framework_state.avfoundation.av_capture.running_sessions.push(this);
@@ -545,7 +548,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())stopRunning {
-    log!("[(AVCaptureSession*){:?} stopRunning] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} stopRunning] (MetalHLE stub)", this);
     env.objc.borrow_mut::<AVCaptureSessionHostObject>(this).running = false;
     env.framework_state.avfoundation.av_capture.running_sessions.retain(|&s| s != this);
     let nc: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -579,7 +582,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let want_video = ns_string::get_static_str(env, AVMediaTypeVideo);
     let same: bool = msg![env; media_type isEqualToString:want_video];
-    if !same {
+    if !same || !media_capture::camera_available() {
         return nil;
     }
     make_default_video_device(env)
@@ -591,7 +594,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let want_video = ns_string::get_static_str(env, AVMediaTypeVideo);
     let same: bool = msg![env; media_type isEqualToString:want_video];
-    if !same {
+    if !same || !media_capture::camera_available() {
         return msg_class![env; NSArray array];
     }
     let dev = make_default_video_device(env);
@@ -600,6 +603,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)devices {
+    if !media_capture::camera_available() {
+        return msg_class![env; NSArray array];
+    }
     let dev = make_default_video_device(env);
     let arr: id = msg_class![env; NSArray arrayWithObject:dev];
     arr
@@ -719,7 +725,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    log!("[(AVCaptureVideoDataOutput*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureVideoDataOutput*){:?} init] (MetalHLE stub)", this);
     this
 }
 
@@ -783,7 +789,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    log!("[(AVCaptureMetadataOutput*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureMetadataOutput*){:?} init] (MetalHLE stub)", this);
     let host = env.objc.borrow_mut::<AVCaptureMetadataOutputHostObject>(this);
     host.rect_of_interest = CGRect {
         origin: crate::frameworks::core_graphics::CGPoint { x: 0.0, y: 0.0 },
@@ -917,8 +923,8 @@ fn make_default_video_device(env: &mut crate::Environment) -> id {
     let init: id = msg![env; alloc init];
     let media_type = ns_string::get_static_str(env, AVMediaTypeVideo);
     retain(env, media_type);
-    let name = ns_string::from_rust_string(env, "HyperHLE Stub Camera".to_string());
-    let uid = ns_string::from_rust_string(env, "com.hyperhle.camera.stub".to_string());
+    let name = ns_string::from_rust_string(env, "Android Native Camera".to_string());
+    let uid = ns_string::from_rust_string(env, "com.metalhle.android.camera".to_string());
     {
         let host = env.objc.borrow_mut::<AVCaptureDeviceHostObject>(init);
         host.media_type = media_type;
@@ -983,4 +989,62 @@ fn set_preview_layer_gravity(env: &mut crate::Environment, layer: id, gravity: i
         .entry(layer)
         .or_default()
         .video_gravity = gravity;
+}
+
+// ============================================================================
+// MARK: - Native capture delivery
+// ============================================================================
+
+pub fn deliver_native_frames(env: &mut crate::Environment) {
+    let Some(frame) = media_capture::take_camera_frame() else {
+        return;
+    };
+    let pixel_buffer = core_video::install_camera_frame(env, frame.width, frame.height, &frame.rgba);
+    if pixel_buffer.is_null() {
+        log_once!("Native camera frame was rejected because its guest pixel buffer could not be allocated");
+        return;
+    }
+    let sample_buffer = env.mem.alloc(4).cast::<std::ffi::c_void>();
+    let sessions = env
+        .framework_state
+        .avfoundation
+        .av_capture
+        .running_sessions
+        .clone();
+    let old_sample_buffer = std::mem::replace(
+        &mut env.framework_state.avfoundation.av_capture.last_sample_buffer,
+        sample_buffer,
+    );
+    if !old_sample_buffer.is_null() {
+        env.mem.free(old_sample_buffer);
+    }
+    for session in sessions {
+        let outputs = env
+            .objc
+            .borrow::<AVCaptureSessionHostObject>(session)
+            .outputs
+            .clone();
+        for output in outputs {
+            let delegate = env
+                .objc
+                .borrow::<AVCaptureVideoDataOutputHostObject>(output)
+                .sample_buffer_delegate;
+            if delegate == nil {
+                continue;
+            }
+            let Some(selector) = env
+                .objc
+                .lookup_selector("captureOutput:didOutputSampleBuffer:fromConnection:")
+            else {
+                continue;
+            };
+            let _: () = msg_send(env, (delegate, selector, output, sample_buffer, nil));
+        }
+    }
+    log_dbg!(
+        "Delivered native camera frame {}x{} (timestamp {}) to running AVCaptureVideoDataOutput delegates",
+        frame.width,
+        frame.height,
+        frame.timestamp
+    );
 }

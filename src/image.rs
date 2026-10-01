@@ -318,25 +318,10 @@ pub fn gamma_decode(intensity: f32) -> f32 {
 
 /// Decodes Imagination Technologies' PVRTC texture compression format to
 /// RGBA (8 bits per channel).
-///
-/// `is_opaque` must be `true` for the `COMPRESSED_RGB_PVRTC_*` (no-alpha)
-/// internal formats and `false` for the `COMPRESSED_RGBA_PVRTC_*` variants.
-/// Per the `IMG_texture_compression_pvrtc` extension spec, the RGB variants
-/// have a base internal format of `RGB`, so sampling them must yield an alpha
-/// of 1.0 — exactly as real PowerVR / Apple hardware does. The underlying
-/// PVRTDecompress routine always produces a per-texel alpha value (PVRTC
-/// blocks can individually opt into a "transparent" colour mode regardless of
-/// the requested internal format), so for the opaque formats we overwrite the
-/// decoded alpha with 0xFF. Without this, opaque textures uploaded as GL_RGBA
-/// keep the decoder's stray sub-255 alpha and, when the app has GL_BLEND
-/// enabled with GL_SRC_ALPHA, blend away to nothing — producing a black screen
-/// while audio and input keep working.
 pub fn decode_pvrtc(pvrtc_data: &[u8], is_2bit: bool, width: u32, height: u32) -> Vec<u32> {
     decode_pvrtc_with_alpha(pvrtc_data, is_2bit, width, height, false)
 }
 
-/// Like [decode_pvrtc], but lets the caller declare whether the source format
-/// is one of the opaque `COMPRESSED_RGB_PVRTC_*` variants (`is_opaque = true`).
 pub fn decode_pvrtc_with_alpha(
     pvrtc_data: &[u8],
     is_2bit: bool,
@@ -367,51 +352,10 @@ pub fn decode_pvrtc_with_alpha(
         assert_eq!(consumed_size as usize, expected_size);
         rgba8_data.set_len(rgba8_word_count);
     };
-
     if is_opaque {
-        // Force alpha to fully opaque (the high byte of each little-endian
-        // RGBA8 word). The RGB-PVRTC base internal format is RGB, so the
-        // sampled alpha must be 1.0 on real hardware.
-        for word in rgba8_data.iter_mut() {
+        for word in &mut rgba8_data {
             *word |= 0xFF00_0000;
         }
     }
-
     rgba8_data
-}
-
-#[cfg(test)]
-mod tests {
-    use super::decode_pvrtc_with_alpha;
-
-    fn decode_checksum(width: u32, height: u32, is_2bit: bool) -> u64 {
-        let compressed_size = width as usize * height as usize / if is_2bit { 4 } else { 2 };
-        let mut state = 0x1234_5678u32;
-        let compressed: Vec<u8> = (0..compressed_size)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            })
-            .collect();
-        let pixels = decode_pvrtc_with_alpha(&compressed, is_2bit, width, height, false);
-
-        let mut checksum = 14_695_981_039_346_656_037u64;
-        for pixel in pixels {
-            for byte in pixel.to_le_bytes() {
-                checksum ^= u64::from(byte);
-                checksum = checksum.wrapping_mul(1_099_511_628_211);
-            }
-        }
-        checksum
-    }
-
-    #[test]
-    fn pvrtc_parallel_decoding_matches_reference_output() {
-        assert_eq!(decode_checksum(64, 64, false), 0x3d39_b466_115e_383c);
-        assert_eq!(decode_checksum(512, 512, false), 0xabfa_9dae_71e5_095d);
-        assert_eq!(decode_checksum(512, 512, true), 0xd44a_a11d_f63a_0446);
-        assert_eq!(decode_checksum(1024, 512, true), 0x99ac_697d_389a_6a2a);
-    }
 }

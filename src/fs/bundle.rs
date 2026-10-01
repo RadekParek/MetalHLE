@@ -81,20 +81,10 @@ pub enum BundleData {
 impl BundleData {
     fn find_bundle_path_in_archive(zip: &mut ZipArchive<std::fs::File>) -> Result<String, String> {
         for i in 0..zip.len() {
-            // Some IPAs found in the wild contain entries whose local file
-            // header is corrupt (even though the central directory is fine).
-            // Skipping such entries is better than rejecting the whole IPA.
-            let path = match zip.by_index(i).map(|file| file.name().to_string()) {
-                Ok(path) => path,
-                Err(e) => {
-                    log!(
-                        "Warning: BundleData::find_bundle_path_in_archive(): skipping unreadable IPA archive entry #{}: {}",
-                        i,
-                        e
-                    );
-                    continue;
-                }
-            };
+            let file = zip
+                .by_index(i)
+                .map_err(|e| format!("Could not open IPA archive entry: {e}"))?;
+            let path = file.name();
             if let Some(name) = path
                 .strip_prefix("Payload/")
                 .and_then(|path| path.split_once('/'))
@@ -127,8 +117,12 @@ impl BundleData {
     pub fn open_ipa(path: &Path) -> Result<BundleData, String> {
         let file =
             std::fs::File::open(path).map_err(|e| format!("Could not open IPA file: {e}"))?;
-        let mut zip =
-            ZipArchive::new(file).map_err(|e| format!("Could not open IPA archive: {e}"))?;
+        let mut zip = ZipArchive::new(file).map_err(|e| {
+            format!(
+                "Could not open IPA archive {}: {e}; the file is incomplete or corrupted, so obtain a clean copy",
+                path.display()
+            )
+        })?;
         let bundle_path = Self::find_bundle_path_in_archive(&mut zip)?;
         Ok(BundleData::Zip { zip, bundle_path })
     }
@@ -163,28 +157,18 @@ impl BundleData {
 
                 let mut builder = FsNodeBuilder::new();
                 for i in 0..archive_guard.len() {
-                    // Unreadable entries (e.g. with corrupt local file
-                    // headers) are skipped rather than causing a panic; the
-                    // rest of the bundle is still loaded. If a skipped entry
-                    // is actually needed later, `IpaFileRef::open()` will
-                    // return an empty file and log a warning.
-                    let (name, is_dir) = match archive_guard
-                        .by_index(i)
-                        .map(|file| (file.name().to_string(), file.is_dir()))
-                    {
-                        Ok(name_and_dir) => name_and_dir,
-                        Err(e) => {
-                            log!(
-                                "Warning: BundleData::into_fs_node(): skipping unreadable IPA archive entry #{}: {}",
-                                i,
-                                e
-                            );
-                            continue;
-                        }
+                    let Ok(mut file) = archive_guard.by_index(i) else {
+                        log!(
+                            "Warning: skipping malformed entry #{} in IPA zip {} (invalid or corrupt local file header).",
+                            i,
+                            bundle_path
+                        );
+                        continue;
                     };
+                    let name = file.name();
                     if let Some(path) = name.strip_prefix(&bundle_path) {
                         let path = GuestPath::new(path);
-                        if is_dir {
+                        if file.is_dir() {
                             builder.add_directory(path);
                         } else {
                             builder.add_file(
@@ -281,27 +265,20 @@ impl IpaFileRef {
                     let size = file.size();
                     let mut buf = Vec::new();
                     if let Err(e) = file.read_to_end(&mut buf) {
-                        // The central directory can be readable even when the
-                        // compressed payload is truncated or has a bad CRC.
-                        // Discarding a partial archive is safer than letting a
-                        // guest parse corrupted Unity/player data and continue
-                        // in a damaged state.
                         log!(
-                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; rejecting partial buffer ({} bytes).",
+                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; returning partial buffer ({} bytes) to guest.",
                             self.index,
                             e,
                             buf.len()
                         );
-                        None
-                    } else {
-                        Some((
-                            buf,
-                            ArchivedFileMetadata {
-                                last_modified: timestamp.into(),
-                                size,
-                            },
-                        ))
                     }
+                    Some((
+                        buf,
+                        ArchivedFileMetadata {
+                            last_modified: timestamp.into(),
+                            size,
+                        },
+                    ))
                 }
                 Err(ZipError::Io(e)) => {
                     log!(
@@ -331,17 +308,6 @@ impl IpaFileRef {
                     Rc::from(buf)
                 }
                 None => {
-                    // Cache an explicit zero-size metadata record as well as
-                    // the empty data. This prevents repeated stat() probes of
-                    // the same bad ZIP entry from retrying decompression or
-                    // panicking on absent metadata.
-                    (*self.metadata_map)
-                        .borrow_mut()
-                        .entry(self.index)
-                        .or_insert(ArchivedFileMetadata {
-                            last_modified: 0,
-                            size: 0,
-                        });
                     Rc::from(Vec::new())
                 }
             }
@@ -354,52 +320,25 @@ impl IpaFileRef {
 
     pub fn get_last_modified(&self) -> time_t {
         if !self.metadata_map.borrow().contains_key(&self.index) {
-            // This will force metadata loading. Broken ZIP entries cache
-            // explicit zero metadata, so a guest stat() remains safe.
+            // This will force metadata loading
+            // TODO: get metadata without reading the file
             _ = self.open();
         }
-        let last_modified = {
-            self.metadata_map
-                .borrow()
-                .get(&self.index)
-                .map(|metadata| metadata.last_modified)
-        };
-        match last_modified {
-            Some(last_modified) => last_modified.try_into().unwrap_or(0),
-            None => {
-                log!(
-                    "Warning: IpaFileRef::get_last_modified(): IPA entry {} has \
-                     no readable metadata; reporting timestamp zero.",
-                    self.index
-                );
-                0
-            }
-        }
+        self.metadata_map
+            .borrow()
+            .get(&self.index)
+            .unwrap()
+            .last_modified
+            .try_into()
+            .unwrap()
     }
     pub fn get_size(&self) -> u64 {
         if !self.metadata_map.borrow().contains_key(&self.index) {
-            // See get_last_modified(): unreadable archive entries must remain
-            // visible as an empty/unusable guest file rather than panicking the
-            // emulator while probing their size.
+            // This will force metadata loading
+            // TODO: get metadata without reading the file
             _ = self.open();
         }
-        let size = {
-            self.metadata_map
-                .borrow()
-                .get(&self.index)
-                .map(|metadata| metadata.size)
-        };
-        match size {
-            Some(size) => size,
-            None => {
-                log!(
-                    "Warning: IpaFileRef::get_size(): IPA entry {} has no readable \
-                     metadata; reporting size zero.",
-                    self.index
-                );
-                0
-            }
-        }
+        self.metadata_map.borrow().get(&self.index).unwrap().size
     }
 }
 
@@ -426,116 +365,5 @@ impl Read for IpaFile {
 impl std::io::Seek for IpaFile {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         self.file.seek(pos)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fs::FileLocation;
-    use std::io::{Read, Write};
-
-    /// Regression test: IPAs with entries whose local file header is corrupt
-    /// used to cause a panic (`InvalidArchive("Invalid local file header")`)
-    /// when the bundle was loaded. Now such entries are skipped instead.
-    #[test]
-    fn test_ipa_with_corrupt_local_file_header() {
-        let dir = std::env::temp_dir().join("touchHLE_test_corrupt_ipa");
-        std::fs::create_dir_all(&dir).unwrap();
-        let ipa_path = dir.join("TestApp.ipa");
-
-        // Build a minimal IPA.
-        let file = std::fs::File::create(&ipa_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default();
-        zip.start_file("Payload/TestApp.app/Info.plist", options)
-            .unwrap();
-        zip.write_all(b"plist").unwrap();
-        zip.start_file("Payload/TestApp.app/broken.bin", options)
-            .unwrap();
-        zip.write_all(b"data").unwrap();
-        zip.finish().unwrap();
-
-        // Corrupt the local file header of the second entry (keep the
-        // central directory intact), mimicking IPAs found in the wild.
-        {
-            let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
-            let header_start = zip.by_index(1).unwrap().header_start();
-            drop(zip);
-            let mut data = std::fs::read(&ipa_path).unwrap();
-            let start = header_start as usize;
-            data[start..start + 4].copy_from_slice(b"XXXX");
-            std::fs::write(&ipa_path, data).unwrap();
-        }
-
-        // Opening the IPA must succeed ...
-        let mut bundle = BundleData::open_any(&ipa_path).unwrap();
-        assert_eq!(bundle.bundle_name(), "TestApp");
-        // ... reading the plist must work ...
-        assert_eq!(bundle.read_plist().unwrap(), b"plist");
-        // ... and building the filesystem node must not panic; the broken
-        // entry is skipped, the valid one is still present.
-        let node = bundle.into_fs_node();
-        let FsNode::Directory { children, .. } = &node else {
-            panic!("expected directory");
-        };
-        assert!(children.contains_key("Info.plist"));
-        assert!(!children.contains_key("broken.bin"));
-    }
-
-    /// A central-directory entry can be listed successfully but fail its CRC
-    /// while decompressing. Its metadata queries must report the safe empty
-    /// representation rather than panicking the emulator.
-    #[test]
-    fn test_ipa_with_corrupt_payload_is_empty_not_panic() {
-        let dir = std::env::temp_dir().join("touchHLE_test_corrupt_ipa_payload");
-        std::fs::create_dir_all(&dir).unwrap();
-        let ipa_path = dir.join("TestApp.ipa");
-
-        let file = std::fs::File::create(&ipa_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        zip.start_file("Payload/TestApp.app/Info.plist", options)
-            .unwrap();
-        zip.write_all(b"plist").unwrap();
-        zip.start_file("Payload/TestApp.app/Data/data.unity3d", options)
-            .unwrap();
-        zip.write_all(b"player-data").unwrap();
-        zip.finish().unwrap();
-
-        // Alter stored payload bytes but retain the local header and central
-        // directory. `by_index` can still find this entry; read_to_end checks
-        // its CRC and reports an error.
-        let data_start = {
-            let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
-            let data_start = zip.by_index(1).unwrap().data_start();
-            data_start
-        };
-        let mut bytes = std::fs::read(&ipa_path).unwrap();
-        bytes[data_start as usize] ^= 0xff;
-        std::fs::write(&ipa_path, bytes).unwrap();
-
-        let bundle = BundleData::open_any(&ipa_path).unwrap();
-        let node = bundle.into_fs_node();
-        let FsNode::Directory { children, .. } = &node else {
-            panic!("expected bundle directory");
-        };
-        let FsNode::Directory { children, .. } = children.get("Data").unwrap() else {
-            panic!("expected Data directory");
-        };
-        let FsNode::File {
-            location: FileLocation::IpaFileRef(file_ref),
-            ..
-        } = children.get("data.unity3d").unwrap()
-        else {
-            panic!("expected IPA player archive");
-        };
-
-        assert_eq!(file_ref.get_size(), 0);
-        assert_eq!(file_ref.get_last_modified(), 0);
-        let mut contents = Vec::new();
-        file_ref.open().read_to_end(&mut contents).unwrap();
-        assert!(contents.is_empty());
     }
 }

@@ -11,7 +11,6 @@
 //!   plists, e.g. `plutil -p` or `println!("{:#?}", plist::Value::...);`.
 //! - Apple's [Archives and Serializations Programming Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Archiving/Articles/archives.html)
 
-use super::ns_error::{NSCocoaErrorDomain, NSPropertyListReadCorruptError};
 use super::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use super::ns_value::NSNumberHostObject;
 use crate::dyld::{ConstantExports, HostConstant};
@@ -68,18 +67,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, unarchiver, &mut env.mem)
 }
 
-// Chrome (and other apps) re-map classes when unarchiving nibs:
-// [NSKeyedUnarchiver setClass:ActualClass forClassName:@"NibName"].
-// The nib decoder already resolves swapped classes via UIClassSwapper,
-// so acknowledging the mapping without storing it is enough.
-+ (())setClass:(id)_class forClassName:(id)_codename {
-    log_dbg!(
-        "NSKeyedUnarchiver setClass:{:?} forClassName:{:?} (mapping is a no-op)",
-        _class,
-        _codename
-    );
-}
-
 + (id)unarchiveObjectWithFile:(id)path { // NSString *
     let data: id = msg_class![env; NSData dataWithContentsOfFile:path];
     if data == nil {
@@ -96,44 +83,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, result)
 }
 
-+ (id)unarchiveTopLevelObjectWithData:(id)data
-                                error:(MutPtr<MutVoidPtr>)error {
-    if !error.is_null() {
-        env.mem.write(error, nil.cast());
-    }
-    let result: id = msg![env; this unarchiveObjectWithData:data];
-    if result == nil && !error.is_null() {
-        {
-            let err = plist_read_error(env);
-            env.mem.write(error, err.cast());
-        }
-    }
-    result
-}
+// TODO: other init methods.
 
-+ (id)unarchivedObjectOfClass:(id)_class
-                     fromData:(id)data
-                        error:(MutPtr<MutVoidPtr>)error {
-    // We never enforce class conformance (see setRequiresSecureCoding:),
-    // so this is identical to unarchiveTopLevelObjectWithData:error:.
-    msg![env; this unarchiveTopLevelObjectWithData:data error:error]
-}
-
-// iOS 9+ variant of initForReadingWithData:; same semantics, plus an
-// NSError out-param that is filled in on failure.
-- (id)initForReadingFromData:(id)data error:(MutPtr<MutVoidPtr>)error {
-    if !error.is_null() {
-        env.mem.write(error, nil.cast());
-    }
-    let unarchiver: id = msg![env; this initForReadingWithData:data];
-    if unarchiver == nil && !error.is_null() {
-        {
-            let err = plist_read_error(env);
-            env.mem.write(error, err.cast());
-        }
-    }
-    unarchiver
-}
 - (id)initForReadingWithData:(id)data { // NSData *
     if data == nil {
         release(env, this);
@@ -186,30 +137,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let key_count = plist.get("$objects").and_then(|v| v.as_array()).map_or(0, |a| a.len());
 
-    // 4. Re-initialising an unarchiver instance is unusual but must not
-    // panic the host: reset any previous state instead of asserting.
-    {
-        // Take the state out first so the host-object borrow is not held
-        // across the `release()` calls (same pattern as `dealloc`).
-        let (already_unarchived, temporary_buffers) = {
-            let host_obj = env.objc.borrow_mut::<NSKeyedUnarchiverHostObject>(this);
-            (
-                std::mem::take(&mut host_obj.already_unarchived),
-                std::mem::take(&mut host_obj.temporary_buffers),
-            )
-        };
-        for &object in already_unarchived.iter().flatten() {
-            release(env, object);
-        }
-        for &buffer in temporary_buffers.iter() {
-            env.mem.free(buffer);
-        }
-        env.objc
-            .borrow_mut::<NSKeyedUnarchiverHostObject>(this)
-            .current_key = None;
-    }
-
+    // 4. Инициализация объекта (borrow_mut вызывается только ПОСЛЕ всех
+    // проверок)
     let host_obj = env.objc.borrow_mut::<NSKeyedUnarchiverHostObject>(this);
+    assert!(host_obj.already_unarchived.is_empty());
+    assert!(host_obj.current_key.is_none());
+    assert!(host_obj.plist.is_empty());
+
     host_obj.already_unarchived = vec![None; key_count];
     host_obj.plist = plist;
 
@@ -232,10 +166,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
-// The delegate is consulted in `finishDecoding` (will/did finish) and after
-// each object has been decoded (`unarchiver:didDecodeObject:`, see
-// `unarchive_key` below). All of the delegate methods are optional, so every
-// call site checks that the delegate responds to the selector first.
+// TODO: implement calls to delegate methods
 // weak/non-retaining
 - (())setDelegate:(id)delegate { // id<NSKeyedUnarchiverDelegate>
     let host_object = env.objc.borrow_mut::<NSKeyedUnarchiverHostObject>(this);
@@ -353,12 +284,12 @@ pub const CLASSES: ClassExports = objc_classes! {
             env.mem.write(length, 0);
             return ConstPtr::null();
     };
-    let Ok(len) = data.len().try_into() else {
-        // A >4 GiB entry cannot exist in guest memory; allocating a
-        // GuestUSize::MAX-sized buffer would only waste memory. Fail cleanly.
-        log!("Warning: decodeBytesForKey: data of length {} exceeds u32; returning NULL.", data.len());
-        env.mem.write(length, 0);
-        return ConstPtr::null();
+    let len: GuestUSize = match data.len().try_into() {
+        Ok(l) => l,
+        Err(_) => {
+            log!("Warning: decodeBytesForKey: data of length {} exceeds u32; truncating.", data.len());
+            GuestUSize::MAX
+        }
     };
     let guest_bytes: MutVoidPtr = env.mem.alloc(len);
     env.objc.borrow_mut::<NSKeyedUnarchiverHostObject>(this)
@@ -377,30 +308,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     get_value_to_decode_for_key(env, this, key).is_some()
 }
 
-// The secure-coding variants skip class-conformance checks (we never
-// enforce them, see setRequiresSecureCoding:) and forward to
-// decodeObjectForKey:.
-- (id)decodeObjectOfClass:(id)_class forKey:(id)key { // Class, NSString*
-    msg![env; this decodeObjectForKey:key]
-}
-- (id)decodeObjectOfClasses:(id)_classes forKey:(id)key { // NSSet*, NSString*
-    msg![env; this decodeObjectForKey:key]
-}
-
-// These treat the root object like any other keyed value.
-- (id)decodeTopLevelObjectForKey:(id)key { // NSString*
-    msg![env; this decodeObjectForKey:key]
-}
-- (id)decodePropertyListForKey:(id)key { // NSString*
-    msg![env; this decodeObjectForKey:key]
-}
-- (id)decodeTopLevelObjectAndReturnError:(MutPtr<MutVoidPtr>)error {
-    if !error.is_null() {
-        env.mem.write(error, nil.cast());
-    }
-    let root_key = get_static_str(env, NSKeyedArchiveRootObjectKey);
-    msg![env; this decodeObjectForKey:root_key]
-}
+// TODO: add more decode methods
 
 // These come from a category in UIKit's UIGeometry.h
 - (CGPoint)decodeCGPointForKey:(id)key { // NSString*
@@ -426,11 +334,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 // is nothing to flush here — we simply notify the delegate if one has been
 // set and return.
 - (())finishDecoding {
-    // Apple calls the will-finish delegate method before the final object
-    // graph fixups and the did-finish method after them; our decode is
-    // already eager, so ordering is all that remains to emulate.
-    notify_delegate(env, this, "unarchiverWillFinish:");
-    notify_delegate(env, this, "unarchiverDidFinish:");
+    let delegate = env.objc.borrow::<NSKeyedUnarchiverHostObject>(this).delegate;
+    if delegate != nil {
+        // Call the delegate's `unarchiverDidFinish:` method if it responds.
+        let sel = env.objc.lookup_selector("unarchiverDidFinish:");
+        if let Some(sel) = sel {
+            if env.objc.class_has_method(
+                crate::objc::ObjC::read_isa(delegate, &env.mem),
+                sel,
+            ) {
+                let _: () = crate::objc::msg_send_no_type_checking(env, (delegate, sel, this));
+            }
+        }
+    }
 }
 
 // `- (void)setRequiresSecureCoding:(BOOL)flag`
@@ -454,66 +370,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 fn borrow_host_obj(env: &mut Environment, unarchiver: id) -> &mut NSKeyedUnarchiverHostObject {
     env.objc.borrow_mut(unarchiver)
-}
-
-/// Builds a generic "archive is corrupt" NSError for the error out-params of
-/// the modern `unarchive…` entry points.
-fn plist_read_error(env: &mut Environment) -> id {
-    let domain = get_static_str(env, NSCocoaErrorDomain);
-    msg_class![env; NSError errorWithDomain:domain
-                                       code:NSPropertyListReadCorruptError
-                                   userInfo:nil]
-}
-
-/// Sends an optional, no-result delegate method (`sel_name`) to the
-/// unarchiver's delegate, if the delegate implements it.
-fn notify_delegate(env: &mut Environment, unarchiver: id, sel_name: &str) {
-    let delegate = env
-        .objc
-        .borrow::<NSKeyedUnarchiverHostObject>(unarchiver)
-        .delegate;
-    if delegate == nil {
-        return;
-    }
-    let Some(sel) = env.objc.lookup_selector(sel_name) else {
-        return;
-    };
-    if !env
-        .objc
-        .class_has_method(crate::objc::ObjC::read_isa(delegate, &env.mem), sel)
-    {
-        return;
-    }
-    let _: () = crate::objc::msg_send_no_type_checking(env, (delegate, sel, unarchiver));
-}
-
-/// Notifies the delegate that an object has been decoded via the optional
-/// `unarchiver:didDecodeObject:` method. Returns the delegate's replacement
-/// object if one was supplied, or `object` otherwise.
-fn notify_did_decode_object(env: &mut Environment, unarchiver: id, object: id) -> id {
-    let delegate = env
-        .objc
-        .borrow::<NSKeyedUnarchiverHostObject>(unarchiver)
-        .delegate;
-    if delegate == nil {
-        return object;
-    }
-    let Some(sel) = env.objc.lookup_selector("unarchiver:didDecodeObject:") else {
-        return object;
-    };
-    if !env
-        .objc
-        .class_has_method(crate::objc::ObjC::read_isa(delegate, &env.mem), sel)
-    {
-        return object;
-    }
-    let replacement: id =
-        crate::objc::msg_send_no_type_checking(env, (delegate, sel, unarchiver, object));
-    if replacement == nil {
-        object
-    } else {
-        replacement
-    }
 }
 
 fn get_value_to_decode_for_key(env: &mut Environment, unarchiver: id, key: id) -> Option<&Value> {
@@ -748,14 +604,9 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
         Value::Data(data) => {
             let data = data.clone();
             let ns_data: id = msg_class![env; NSData alloc];
-            let Ok(len) = data.len().try_into() else {
-                // A >4 GiB entry cannot exist in guest memory; return nil
-                // rather than attempting a GuestUSize::MAX-sized allocation.
-                log!(
-                    "Warning: unarchive_key: data at uid {} too large for guest memory; returning nil.",
-                    key.get()
-                );
-                return nil;
+            let len: GuestUSize = match data.len().try_into() {
+                Ok(l) => l,
+                Err(_) => GuestUSize::MAX,
             };
             let bytes_ptr: MutVoidPtr = env.mem.alloc(len);
             let copy_len = std::cmp::min(len as usize, data.len());
@@ -784,8 +635,6 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
             nil
         }
     };
-
-    let new_object = notify_did_decode_object(env, unarchiver, new_object);
 
     let host_obj = borrow_host_obj(env, unarchiver); // reborrow
     host_obj.already_unarchived[key_idx] = Some(new_object);
@@ -831,14 +680,10 @@ pub fn decode_current_dict(env: &mut Environment, unarchiver: id) -> Vec<(id, id
 /// Shortcut for use by `[NSDate initWithCoder:]`.
 pub fn decode_current_date(env: &mut Environment, unarchiver: id) -> id {
     let key = get_static_str(env, "NS.time");
-    // A corrupt or missing NS.time entry must not panic the host; return nil
-    // so [NSDate initWithCoder:] fails gracefully.
-    let Some(timestamp) =
-        get_value_to_decode_for_key(env, unarchiver, key).and_then(|value| value.as_real())
-    else {
-        log!("Warning: decode_current_date: NS.time missing or not a real; returning nil.");
-        return nil;
-    };
+    let timestamp = get_value_to_decode_for_key(env, unarchiver, key)
+        .unwrap()
+        .as_real()
+        .unwrap();
 
     let date: id = msg_class![env; NSDate alloc];
     msg![env; date initWithTimeIntervalSinceReferenceDate:timestamp]
@@ -848,36 +693,20 @@ pub fn decode_current_date(env: &mut Environment, unarchiver: id) -> id {
 pub fn decode_current_data(env: &mut Environment, unarchiver: id, is_mutable: bool) -> id {
     let key = get_static_str(env, "NS.data");
     // TODO: avoid copying (twice!)
-    // Missing or non-data entries occur in corrupt archives; return nil
-    // instead of panicking.
-    let Some(bytes) = get_value_to_decode_for_key(env, unarchiver, key)
-        .and_then(|value| value.as_data())
-        .map(|data| data.to_vec())
-    else {
-        log!("Warning: decode_current_data: NS.data missing or not data; returning nil.");
-        return nil;
-    };
-    let Ok(len) = bytes.len().try_into() else {
-        // A >4 GiB entry cannot exist in guest memory.
-        log!(
-            "Warning: decode_current_data: data of length {} exceeds u32; returning nil.",
-            bytes.len()
-        );
-        return nil;
-    };
+    let bytes = get_value_to_decode_for_key(env, unarchiver, key)
+        .unwrap()
+        .as_data()
+        .unwrap()
+        .to_vec();
+    let len: GuestUSize = bytes.len().try_into().unwrap();
     let guest_bytes: MutVoidPtr = env.mem.alloc(len);
     env.mem
         .bytes_at_mut(guest_bytes.cast(), len)
         .copy_from_slice(bytes.as_slice());
 
-    let data: id = if is_mutable {
-        let new: id = msg_class![env; NSMutableData alloc];
-        msg![env; new initWithBytesNoCopy:guest_bytes length:len freeWhenDone:true]
-    } else {
-        let new: id = msg_class![env; NSData alloc];
-        msg![env; new initWithBytesNoCopy:guest_bytes length:len freeWhenDone:true]
-    };
-    data
+    assert!(is_mutable); // TODO
+    let data: id = msg_class![env; NSMutableData alloc];
+    msg![env; data initWithBytesNoCopy:guest_bytes length:len freeWhenDone:true]
 }
 
 fn keys_for_key(env: &mut Environment, unarchiver: id, key: &str) -> Vec<Uid> {

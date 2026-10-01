@@ -23,6 +23,8 @@ use crate::dyld::{
     export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant, HostDylib,
 };
 use crate::MutexId;
+use std::any::TypeId;
+use std::cell::RefCell;
 use crate::fastmap::{FxHashMap, FxHashSet};
 
 mod classes;
@@ -38,7 +40,7 @@ pub use classes::{
     __objc_deallocOnMainThreadHelper, class_addMethod, class_copyIvarList, class_copyMethodList,
     class_copyPropertyList, class_copyProtocolList, class_getClassMethod, class_getInstanceMethod,
     class_getInstanceSize, class_getMethodImplementation, class_getMethodImplementation_stret,
-    class_isMetaClass, class_getName, class_getProperty, class_getSuperclass, class_replaceMethod,
+    class_getName, class_getProperty, class_getSuperclass, class_replaceMethod,
     class_respondsToSelector, class_setSuperclass, method_exchangeImplementations,
     method_getImplementation, method_getName, method_getTypeEncoding, method_setImplementation,
     objc_alloc, objc_allocWithZone, objc_allocateClassPair, objc_autorelease,
@@ -49,7 +51,7 @@ pub use classes::{
     objc_registerClassPair, objc_release, objc_retain, objc_retainAutorelease,
     objc_retainAutoreleaseReturnValue, objc_retainAutoreleasedReturnValue, objc_retainBlock,
     objc_storeStrong, objc_unsafeClaimAutoreleasedReturnValue, object_getClass,
-    object_getClassName, object_getIndexedIvars, protocol_conformsToProtocol, protocol_getName,
+    object_getClassName, object_getIndexedIvars, imp_implementationWithBlock, class_isMetaClass, protocol_conformsToProtocol, protocol_getName,
     swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
 };
 pub use messages::{
@@ -64,7 +66,6 @@ pub use properties::todo_objc_setter;
 pub use selectors::{selector, SEL};
 
 use crate::objc::classes::___objc_personality_v0;
-use crate::objc::classes::imp_implementationWithBlock;
 use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
@@ -100,16 +101,24 @@ pub struct ObjC {
     /// Known selectors (interned method name strings).
     selectors: FxHashMap<String, SEL>,
 
+    /// Reverse index for selector names. Selectors are interned and immutable,
+    /// so this avoids scanning every registered selector on hot introspection
+    /// paths.
+    selector_names: FxHashMap<SEL, String>,
+
+    /// Reverse index for class and metaclass names.
+    class_names: FxHashMap<Class, String>,
+
+    /// Stable guest pointers returned by class_getName.
+    class_name_ptrs: FxHashMap<Class, crate::mem::ConstPtr<u8>>,
+
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
     objects: FxHashMap<id, HostObjectEntry>,
 
-    /// Fake-borrow warnings already logged, as (object id, host type).
-    /// Games commonly retry operations on missing/faked objects every
-    /// frame; without this set the log fills with thousands of identical
-    /// "SUPER HACK!" lines. One warning per pair is enough for diagnosis.
-    fake_borrow_warned: std::sync::Mutex<std::collections::HashSet<(id, std::any::TypeId)>>,
+    /// Isolated compatibility state for mutable access to a missing object.
+    missing_objects: RefCell<FxHashMap<(id, TypeId), Box<dyn AnyHostObject>>>,
 
     /// Known classes.
     ///
@@ -215,10 +224,13 @@ impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
             selectors: FxHashMap::default(),
+            selector_names: FxHashMap::default(),
+            class_names: FxHashMap::default(),
+            class_name_ptrs: FxHashMap::default(),
             objects: FxHashMap::default(),
+            missing_objects: RefCell::new(FxHashMap::default()),
             classes: FxHashMap::default(),
             sync_mutexes: FxHashMap::default(),
-            fake_borrow_warned: std::sync::Mutex::new(std::collections::HashSet::new()),
             property_locks: FxHashMap::default(),
             message_type_info: None,
             initialized_classes: FxHashSet::default(),
@@ -232,11 +244,26 @@ impl ObjC {
 
     /// Returns the name of a selector, panicking if it is unknown.
     pub fn get_selector_name(&self, sel: SEL) -> &str {
-        self.selectors
-            .iter()
-            .find(|(_k, v)| **v == sel)
-            .map(|(k, _v)| k.as_str())
+        self.selector_names
+            .get(&sel)
+            .map(String::as_str)
             .expect("get_selector_name: unknown selector")
+    }
+
+    pub fn cache_class_name(&mut self, class: Class, name: String) {
+        self.class_names.insert(class, name);
+    }
+
+    pub fn get_cached_class_name(&self, class: Class) -> Option<&str> {
+        self.class_names.get(&class).map(String::as_str)
+    }
+
+    pub fn class_name_pointer(&self, class: Class) -> Option<crate::mem::ConstPtr<u8>> {
+        self.class_name_ptrs.get(&class).copied()
+    }
+
+    pub fn cache_class_name_pointer(&mut self, class: Class, pointer: crate::mem::ConstPtr<u8>) {
+        self.class_name_ptrs.insert(class, pointer);
     }
 }
 
@@ -401,7 +428,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_unsafeClaimAutoreleasedReturnValue(_)),
     export_c_func!(objc_autoreleaseReturnValue(_)),
     export_c_func!(objc_retainAutoreleaseReturnValue(_)),
-    export_c_func!(objc_autoreleasePoolPush()),
+    export_c_func!(objc_autoreleasePoolPush(_)),
     export_c_func!(objc_autoreleasePoolPop(_)),
     export_c_func!(objc_retain(_)),
     export_c_func!(objc_retainAutorelease(_)),
@@ -417,8 +444,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_begin_catch(_)),
     export_c_func!(objc_end_catch(_)),
     export_c_func!(class_getSuperclass(_)),
-    export_c_func!(class_getInstanceSize(_, _)),
     export_c_func!(class_isMetaClass(_)),
+    export_c_func!(class_getInstanceSize(_, _)),
     export_c_func!(class_getInstanceMethod(_, _)),
     export_c_func!(class_getClassMethod(_, _)),
     export_c_func!(class_respondsToSelector(_, _)),

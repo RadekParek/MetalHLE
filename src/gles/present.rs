@@ -11,6 +11,7 @@ use super::GLES;
 use crate::matrix::Matrix;
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -26,41 +27,46 @@ static GLYPH_TEXTURES: OnceLock<Mutex<Option<Vec<u32>>>> = OnceLock::new();
 // Runtime-controlled flag to enable the on-screen FPS overlay without requiring
 // an environment variable. Use set_onscreen_fps_enabled(true/false) to control it
 // from other parts of the runtime (e.g., the app picker or window input).
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 static ONSCREEN_FPS_ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+static HUD_METRICS: OnceLock<Mutex<HudMetrics>> = OnceLock::new();
+static HUD_FPS_TENTHS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Default)]
+struct HudMetrics {
+    cpu_percent: Option<f32>,
+    gpu_percent: Option<f32>,
+    ram_mb: Option<u64>,
+    architecture: String,
+}
 
 impl FpsCounter {
     pub fn start() -> Self {
         LAST_FPS_TEXT.get_or_init(|| Mutex::new(String::new()));
         GLYPH_TEXTURES.get_or_init(|| Mutex::new(None));
+        let _ = process_cpu_percent();
         FpsCounter {
             time: Instant::now(),
             frames: 0,
         }
     }
 
-    pub fn count_frame(&mut self, label: std::fmt::Arguments<'_>) {
+    /// `hud` marks the counter that reflects the game's actual render rate.
+    /// Only that counter feeds the on-screen HUD: the Core Animation
+    /// compositor can run at hundreds of FPS when the guest is idle, and
+    /// letting both counters write the HUD made the displayed value flip
+    /// between the compositor rate and the render rate every second.
+    pub fn count_frame(&mut self, label: std::fmt::Arguments<'_>, hud: bool) {
         self.frames += 1;
         let now = Instant::now();
         let duration = now - self.time;
         if duration >= Duration::from_secs(1) {
             self.time = now;
             let fps = std::mem::take(&mut self.frames) as f32 / duration.as_secs_f32();
-            echo!("touchHLE: {} FPS: {:.2}", label, fps);
-            // Update global text cache for on-screen overlay if enabled via
-            // environment variable or the runtime flag.
-            let onscreen_env = std::env::var_os("TOUCHHLE_ONSCREEN_FPS").is_some();
-            let onscreen_runtime = ONSCREEN_FPS_ENABLED
-                .get()
-                .map(|b| b.load(Ordering::SeqCst))
-                .unwrap_or(false);
-            if onscreen_env || onscreen_runtime {
-                let text = format!("FPS: {:.1}", fps);
-                if let Some(mutex) = LAST_FPS_TEXT.get() {
-                    if let Ok(mut s) = mutex.lock() {
-                        *s = text;
-                    }
-                }
+            echo!("MetalHLE: {} FPS: {:.2}", label, fps);
+            if hud {
+                HUD_FPS_TENTHS.store((fps * 10.0).round() as u64, Ordering::Relaxed);
+                refresh_hud_metrics();
             }
         }
     }
@@ -71,6 +77,292 @@ pub fn set_onscreen_fps_enabled(enabled: bool) {
     ONSCREEN_FPS_ENABLED
         .get_or_init(|| AtomicBool::new(false))
         .store(enabled, Ordering::SeqCst);
+    if enabled {
+        let _ = process_cpu_percent();
+        refresh_hud_metrics();
+    }
+}
+
+pub fn set_onscreen_hud_architecture(architecture: &str) {
+    let mutex = HUD_METRICS.get_or_init(|| Mutex::new(HudMetrics::default()));
+    if let Ok(mut metrics) = mutex.lock() {
+        metrics.architecture = architecture.to_owned();
+    }
+    update_hud_text();
+}
+
+fn refresh_hud_metrics() {
+    let mutex = HUD_METRICS.get_or_init(|| Mutex::new(HudMetrics::default()));
+    if let Ok(mut metrics) = mutex.lock() {
+        // Exponential moving averages keep the HUD readable: instantaneous
+        // /proc and kgsl samples swing wildly between refreshes, which made
+        // the CPU/GPU readouts flip between implausibly high and low values.
+        const ALPHA: f32 = 0.4; // weight of the newest sample
+        metrics.cpu_percent = match (metrics.cpu_percent, process_cpu_percent()) {
+            (Some(old), Some(new)) => Some(old + ALPHA * (new - old)),
+            (None, new) => new,
+            (old, None) => old,
+        };
+        metrics.gpu_percent = match (metrics.gpu_percent, gpu_percent()) {
+            (Some(old), Some(new)) => Some(old + ALPHA * (new - old)),
+            (None, new) => new,
+            (old, None) => old,
+        };
+        metrics.ram_mb = resident_memory_mb();
+    }
+    update_hud_text();
+}
+
+fn update_hud_text() {
+    let fps = HUD_FPS_TENTHS.load(Ordering::Relaxed) as f32 / 10.0;
+    let metrics = HUD_METRICS
+        .get_or_init(|| Mutex::new(HudMetrics::default()))
+        .lock()
+        .ok()
+        .map(|metrics| metrics.clone())
+        .unwrap_or_default();
+    let cpu = metrics
+        .cpu_percent
+        .map_or_else(|| "0".to_owned(), |value| format!("{value:.0}"));
+    let gpu = metrics
+        .gpu_percent
+        .map_or_else(|| "--".to_owned(), |value| format!("{value:.0}"));
+    let ram = metrics
+        .ram_mb
+        .map_or_else(|| "--".to_owned(), |value| value.to_string());
+    let architecture = if metrics.architecture.is_empty() {
+        "ARM32/ARM64"
+    } else {
+        metrics.architecture.as_str()
+    };
+    if let Some(mutex) = LAST_FPS_TEXT.get() {
+        if let Ok(mut value) = mutex.lock() {
+            *value = format!("FPS: {fps:.1}\nCPU: {cpu}% GPU: {gpu}%\nRAM: {ram}MB {architecture}");
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_cpu_percent() -> Option<f32> {
+    use std::time::Instant;
+
+    static SAMPLE: OnceLock<Mutex<Option<(f32, Instant, u64)>>> = OnceLock::new();
+
+    fn process_time_ns() -> Option<u64> {
+        let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks_per_second > 0 {
+            if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+                if let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest) {
+                    let fields = rest.split_whitespace().collect::<Vec<_>>();
+                    if let (Some(user), Some(system)) = (fields.get(11), fields.get(12)) {
+                        if let (Ok(user), Ok(system)) = (user.parse::<u64>(), system.parse::<u64>())
+                        {
+                            let ticks = user.saturating_add(system);
+                            return Some(
+                                ticks.saturating_mul(1_000_000_000) / ticks_per_second as u64,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        Some(
+            (usage.ru_utime.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add((usage.ru_utime.tv_usec as u64).saturating_mul(1_000))
+                .saturating_add((usage.ru_stime.tv_sec as u64).saturating_mul(1_000_000_000))
+                .saturating_add((usage.ru_stime.tv_usec as u64).saturating_mul(1_000)),
+        )
+    }
+
+    let process_time = process_time_ns()?;
+    let now = Instant::now();
+    let mutex = SAMPLE.get_or_init(|| Mutex::new(None));
+    let mut previous = mutex.lock().ok()?;
+    // The sampler is called every frame, but the kernel reports CPU time at
+    // clock-tick granularity. Sampling on every call produced wild readings
+    // (one tick in a 2 ms window reads as 50%+ of a core). Cache the value
+    // and recompute at most four times per second.
+    const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+    if let Some((value, sampled_at, _)) = *previous {
+        if now.duration_since(sampled_at) < MIN_SAMPLE_INTERVAL {
+            return Some(value);
+        }
+    }
+    let result = previous
+        .take()
+        .map(|(_cached_value, old_time, old_process)| {
+            let wall_ns = now.duration_since(old_time).as_nanos() as f32;
+            let process_ns = process_time.saturating_sub(old_process) as f32;
+            let cores = std::thread::available_parallelism().map_or(1, |value| value.get()) as f32;
+            if wall_ns > 0.0 {
+                (process_ns / wall_ns * 100.0 / cores).clamp(0.0, 100.0)
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+    *previous = Some((result, now, process_time));
+    Some(result)
+}
+
+#[cfg(target_os = "windows")]
+fn process_cpu_percent() -> Option<f32> {
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    static SAMPLE: OnceLock<Mutex<Option<(f32, Instant, u64)>>> = OnceLock::new();
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let process_time = (u64::from(kernel.dwLowDateTime) | (u64::from(kernel.dwHighDateTime) << 32))
+        .saturating_add(u64::from(user.dwLowDateTime) | (u64::from(user.dwHighDateTime) << 32));
+    let now = Instant::now();
+    let mutex = SAMPLE.get_or_init(|| Mutex::new(None));
+    let mut previous = mutex.lock().ok()?;
+    const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+    if let Some((value, sampled_at, _)) = *previous {
+        if now.duration_since(sampled_at) < MIN_SAMPLE_INTERVAL {
+            return Some(value);
+        }
+    }
+    let result = previous.take().and_then(|(_, old_time, old_process)| {
+        let wall = now.duration_since(old_time).as_nanos() as f32 / 100.0;
+        let process = process_time.saturating_sub(old_process) as f32;
+        (wall > 0.0).then(|| {
+            let cores = std::thread::available_parallelism().map_or(1, |value| value.get()) as f32;
+            (process / wall * 100.0 / cores).clamp(0.0, 100.0)
+        })
+    });
+    *previous = Some((result.unwrap_or(0.0), now, process_time));
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn process_cpu_percent() -> Option<f32> {
+    use std::time::Instant;
+
+    static SAMPLE: OnceLock<Mutex<Option<(f32, Instant, u64)>>> = OnceLock::new();
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let process_time = (usage.ru_utime.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usage.ru_utime.tv_usec as u64).saturating_mul(1_000))
+        .saturating_add((usage.ru_stime.tv_sec as u64).saturating_mul(1_000_000_000))
+        .saturating_add((usage.ru_stime.tv_usec as u64).saturating_mul(1_000));
+    let now = Instant::now();
+    let mutex = SAMPLE.get_or_init(|| Mutex::new(None));
+    let mut previous = mutex.lock().ok()?;
+    const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+    if let Some((value, sampled_at, _)) = *previous {
+        if now.duration_since(sampled_at) < MIN_SAMPLE_INTERVAL {
+            return Some(value);
+        }
+    }
+    let result = previous.take().and_then(|(_, old_time, old_process)| {
+        let wall = now.duration_since(old_time).as_nanos() as f32;
+        let process = process_time.saturating_sub(old_process) as f32;
+        (wall > 0.0).then(|| {
+            let cores = std::thread::available_parallelism().map_or(1, |value| value.get()) as f32;
+            (process / wall * 100.0 / cores).clamp(0.0, 100.0)
+        })
+    });
+    *previous = Some((result.unwrap_or(0.0), now, process_time));
+    result
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "macos"
+)))]
+fn process_cpu_percent() -> Option<f32> {
+    None
+}
+
+fn resident_memory_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kilobytes = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()?;
+    Some((kilobytes + 1023) / 1024)
+}
+
+fn gpu_percent() -> Option<f32> {
+    const PATHS: &[&str] = &[
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy",
+        "/sys/class/devfreq/3d00000.gpu/load",
+        "/sys/class/devfreq/gpu/load",
+    ];
+    PATHS.iter().find_map(|path| {
+        let value = std::fs::read_to_string(path).ok()?;
+        let value = value
+            .trim()
+            .trim_end_matches('%')
+            .split('@')
+            .next()?
+            .trim()
+            .parse::<f32>()
+            .ok()?;
+        Some(value.clamp(0.0, 100.0))
+    })
+}
+
+pub fn centered_texture_rotation(rotation_matrix: Matrix<2>) -> Matrix<4> {
+    let columns = rotation_matrix.columns();
+    let r00 = columns[0][0];
+    let r01 = columns[1][0];
+    let r10 = columns[0][1];
+    let r11 = columns[1][1];
+    let tx = 0.5 - 0.5 * (r00 + r01);
+    let ty = 0.5 - 0.5 * (r10 + r11);
+    Matrix::from_columns([
+        [r00, r10, 0.0, 0.0],
+        [r01, r11, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [tx, ty, 0.0, 1.0],
+    ])
 }
 
 /// Present the the latest frame (e.g. the app's splash screen or rendering
@@ -100,17 +392,7 @@ pub unsafe fn present_frame(
         viewport.3 as _,
     );
     gles.ClearColor(0.0, 0.0, 0.0, 1.0);
-    // PERF: only the color buffer needs clearing here. The present quad runs
-    // with depth/stencil testing disabled (the caller disables caps before
-    // drawing), so clearing DEPTH|STENCIL is a wasted full-viewport pass —
-    // noticeable at scale-hack 4x on software rasterizers.
-    gles.Clear(gles11::COLOR_BUFFER_BIT);
-    // Keep the window's alpha channel at the 1.0 the clear just wrote. The
-    // frame texture's alpha is meaningless for an opaque CAEAGLLayer, but a
-    // window surface with an alpha channel may be blended by the OS
-    // compositor (Android's SurfaceFlinger), which would show through
-    // wherever the app left alpha < 1.
-    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::FALSE);
+    gles.Clear(gles11::COLOR_BUFFER_BIT | gles11::DEPTH_BUFFER_BIT | gles11::STENCIL_BUFFER_BIT);
     gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
     // Stretch the full rendered frame to fill the active host viewport.
     //
@@ -118,8 +400,7 @@ pub unsafe fn present_frame(
     // sampled from normal 0..1 texture coordinates and mapped to a full-screen
     // quad. This is the correct "fill the current window" behavior for
     // PotatoGold-style landscape tests.
-    // PERF: cached read-once flag; present_frame runs every frame.
-    if crate::env_flag_cached!("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT") {
+    if std::env::var_os("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT").is_some() {
         log_once!(
             "TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT=1: stretching full rendered frame to the active viewport [this log will only be shown once]"
         );
@@ -146,14 +427,7 @@ pub unsafe fn present_frame(
     // frame. Pre- and post-translating by (0.5, 0.5) keeps tex coords in
     // [0, 1]² for any 90°/180°/270°/identity device rotation while
     // producing the same visual output as before on lenient drivers.
-    let r = Matrix::<4>::from(&rotation_matrix);
-    let to_center = Matrix::<4>::translate_3d(-0.5, -0.5, 0.0);
-    let from_center = Matrix::<4>::translate_3d(0.5, 0.5, 0.0);
-    // Note: Matrix::multiply(&other) computes `other · self` in
-    // linear-algebra terms (other is applied AFTER self), so to get
-    // `from_center · r · to_center` we chain in the order
-    // to_center.multiply(&r).multiply(&from_center).
-    let centered_rotation = to_center.multiply(&r).multiply(&from_center);
+    let centered_rotation = centered_texture_rotation(rotation_matrix);
     gles.MatrixMode(gles11::TEXTURE);
     gles.LoadMatrixf(centered_rotation.columns().as_ptr() as *const _);
     gles.Enable(gles11::TEXTURE_2D);
@@ -188,8 +462,7 @@ pub unsafe fn present_frame(
     // On-screen FPS overlay (simple bitmap font). Enabled by env var
     // TOUCHHLE_ONSCREEN_FPS=1 or by the runtime flag set via
     // crate::gles::present::set_onscreen_fps_enabled(true).
-    // PERF: cached read-once flag; present_frame runs every frame.
-    let onscreen_env = crate::env_flag_cached!("TOUCHHLE_ONSCREEN_FPS");
+    let onscreen_env = std::env::var_os("TOUCHHLE_ONSCREEN_FPS").is_some();
     let onscreen_runtime = ONSCREEN_FPS_ENABLED
         .get()
         .map(|b| b.load(Ordering::SeqCst))
@@ -204,11 +477,7 @@ pub unsafe fn present_frame(
         }
     }
 
-    // Cheat Engine-style trainer overlay (floating button + panel). Drawn
-    // last so it sits on top of everything, including the FPS overlay.
     crate::trainer_ui::draw(gles, viewport);
-
-    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
 }
 
 // --- Tiny bitmap font & overlay drawing implementation ---
@@ -216,7 +485,7 @@ const GLYPH_W: u32 = 8;
 const GLYPH_H: u32 = 8;
 
 // Glyphs available in this tiny font: "0123456789:.FPS"
-const GLYPH_CHARS: &str = "0123456789:.FPS";
+const GLYPH_CHARS: &str = "0123456789:.FPSCUGRAMB%";
 // Each glyph is 8 bytes, each bit is a pixel (MSB left).
 const GLYPH_BITMAPS: &[[u8; 8]] = &[
     // 0
@@ -249,6 +518,22 @@ const GLYPH_BITMAPS: &[[u8; 8]] = &[
     [0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00],
     // S
     [0x3C, 0x66, 0x30, 0x1C, 0x06, 0x66, 0x3C, 0x00],
+    // C
+    [0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00],
+    // U
+    [0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00],
+    // G
+    [0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0x00],
+    // R
+    [0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00],
+    // A
+    [0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00],
+    // M
+    [0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00],
+    // B
+    [0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00],
+    // %
+    [0x62, 0x64, 0x08, 0x10, 0x26, 0x46, 0x00, 0x00],
 ];
 
 fn glyph_index(ch: char) -> Option<usize> {
@@ -335,8 +620,13 @@ unsafe fn ensure_glyph_textures(gles: &mut dyn GLES) -> Option<Vec<u32>> {
 unsafe fn draw_onscreen_text(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), text: &str) {
     use gles11::types::*;
     let (vx, vy, vw, vh) = viewport;
-    // Pixel size per glyph
-    let scale = 2u32; // 8x8 * 2 = 16px high font
+    let scale = if vw < 600 {
+        2
+    } else if vw < 1000 {
+        3
+    } else {
+        4
+    };
     let gw = (GLYPH_W * scale) as f32;
     let gh = (GLYPH_H * scale) as f32;
 
@@ -371,9 +661,15 @@ unsafe fn draw_onscreen_text(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)
 
     // Draw text at top-left with small margin
     let mut x_px = vx as f32 + 8.0;
-    let y_px = vy as f32 + 8.0;
+    let start_x = x_px;
+    let mut y_px = vy as f32 + 8.0;
 
     for ch in text.chars() {
+        if ch == '\n' {
+            x_px = start_x;
+            y_px += gh + 3.0;
+            continue;
+        }
         if let Some(idx) = glyph_index(ch) {
             let tex = texs[idx] as GLint;
             gles.BindTexture(gles11::TEXTURE_2D, tex as _);

@@ -138,7 +138,6 @@ pub mod al_defines {
     pub const AL_BUFFER: ALenum = 0x1009;
 
     pub const AL_MAX_GAIN: ALenum = 0x100E;
-    pub const AL_PITCH: ALenum = 0x1003;
 
     pub const AL_SOURCE_STATE: ALenum = 0x1010;
 
@@ -149,6 +148,8 @@ pub mod al_defines {
 
     pub const AL_BUFFERS_QUEUED: ALenum = 0x1015;
     pub const AL_BUFFERS_PROCESSED: ALenum = 0x1016;
+
+    pub const AL_PITCH: ALenum = 0x4003;
 
     pub const AL_FORMAT_MONO8: ALenum = 0x1100;
     pub const AL_FORMAT_MONO16: ALenum = 0x1101;

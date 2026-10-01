@@ -19,89 +19,6 @@
 //! `gl_FragColor` is fine; built-in attribute names; integer textures; …) are
 //! not handled. We can extend this when needed.
 
-/// Patch legacy ES 2.0 shadow-sampler shaders for the capabilities of the host driver.
-/// The extension is fragment-only; some apps require it in their shared vertex prefix.
-/// On hosts without it, emulate comparison sampling with an ordinary depth-texture sample.
-/// <https://registry.khronos.org/OpenGL/extensions/EXT/EXT_shadow_samplers.txt>
-pub fn patch_shadow_samplers_extension(
-    source: &str,
-    is_vertex_shader: bool,
-    shadow_samplers_ext_supported: bool,
-) -> String {
-    let mut output = String::with_capacity(source.len() + 160);
-    for line in source.split_inclusive('\n') {
-        let line_without_comment = line.split("//").next().unwrap_or(line);
-        let directive = line_without_comment
-            .trim_start()
-            .strip_prefix('#')
-            .map(str::trim_start);
-        let extension_action = directive.and_then(|directive| {
-            let rest = directive.strip_prefix("extension")?;
-            let keyword_boundary = rest
-                .chars()
-                .next()
-                .map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_');
-            if !keyword_boundary {
-                return None;
-            }
-            let mut parts = rest.trim_start().split_whitespace();
-            if parts.next()? != "GL_EXT_shadow_samplers" {
-                return None;
-            }
-            Some(parts.last().unwrap_or(""))
-        });
-
-        if extension_action.is_some() && (is_vertex_shader || !shadow_samplers_ext_supported) {
-            if line.ends_with("\r\n") {
-                output.push_str("\r\n");
-            } else if line.ends_with('\n') {
-                output.push('\n');
-            }
-        } else {
-            output.push_str(line);
-        }
-    }
-
-    if is_vertex_shader || shadow_samplers_ext_supported || !output.contains("shadow2DEXT") {
-        return output;
-    }
-
-    let sample_function = if output
-        .lines()
-        .any(|line| line.trim_start().starts_with("#version 300 es"))
-    {
-        "texture"
-    } else {
-        "texture2D"
-    };
-    let mut output = output
-        .replace("sampler2DShadow", "sampler2D")
-        .replace("shadow2DEXT", "touchHLE_shadow2DEXT");
-    let helper = format!(
-        "highp float touchHLE_shadow2DEXT(highp sampler2D shadow_map, highp vec3 shadow_coord) {{\n    highp float depth = {sample_function}(shadow_map, shadow_coord.xy).r;\n    return step(shadow_coord.z, depth);\n}}\n\n"
-    );
-    let mut offset = 0;
-    let mut insertion_point = None;
-    for line in output.split_inclusive('\n') {
-        if line.trim() == "#define FRAGMENT" {
-            insertion_point = Some(offset + line.len());
-            break;
-        }
-        offset += line.len();
-    }
-    let insertion_point = insertion_point.or_else(|| {
-        output.find("void main").map(|main_start| {
-            output[..main_start]
-                .rfind('\n')
-                .map_or(0, |newline| newline + 1)
-        })
-    });
-    if let Some(insertion_point) = insertion_point {
-        output.insert_str(insertion_point, &helper);
-    }
-    output
-}
-
 /// Translate a GLSL ES 1.00 shader source to GLSL 1.20.
 pub fn translate_glsl_es_to_120(source: &str) -> String {
     translate_glsl_es_with_version(source, "#version 120\n")
@@ -123,8 +40,6 @@ pub fn translate_glsl_es_to_120(source: &str) -> String {
 ///
 /// - Implicit conversions from `int` to `uint` that ES allows but desktop
 ///   doesn't (rare in hand-written shaders).
-/// - The ES-only built-in `gl_FragData[]` (legacy ES 2 fallback; ES 3 apps
-///   use named `out` variables).
 ///
 /// When a guest app trips one of these, extend this function rather than
 /// patching the guest shader source.
@@ -179,6 +94,8 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
         body_lines.push(stripped);
     }
 
+    let uses_frag_data = body_lines.iter().any(|line| line.contains("gl_FragData"));
+
     // Emit version directive first.
     out.push_str(version_directive);
 
@@ -187,6 +104,9 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
         out.push_str(ext);
         out.push('\n');
     }
+    if uses_frag_data && version_directive.contains("330") {
+        out.push_str("out vec4 metalhle_FragColor;\n");
+    }
 
     // Emit body.
     for line in &body_lines {
@@ -194,16 +114,7 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
         out.push('\n');
     }
 
-    // ES 1.00 fragment shaders may write to `gl_FragData[n]`. Desktop GLSL
-    // 1.20 has no `gl_FragData` built-in (GL 2.1 has a single color
-    // attachment), so map `gl_FragData[0]` to `gl_FragColor` and treat any
-    // other index as a write to `gl_FragColor` too — the extra attachments
-    // do not exist and their contents are never read back by our
-    // single-buffer surface model. GLSL 3.30 declares `gl_FragData`
-    // unavailable as well, so the same rewrite applies there via a named
-    // `pc_fragColor` out variable, which GL 3.3 Core predefines for
-    // fragment shaders.
-    out = translate_frag_data(&out);
+    out = translate_frag_data(&out, version_directive.contains("330"));
 
     // Replace texture*LodEXT calls with their desktop equivalents.
     // In GLSL 1.20 we have texture2DLod as a built-in (from GL_ARB_shader_texture_lod
@@ -215,6 +126,44 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
     }
 
     out
+}
+
+fn translate_frag_data(source: &str, glsl_330: bool) -> String {
+    if !source.contains("gl_FragData") {
+        return source.to_string();
+    }
+    let replacement = if glsl_330 {
+        "metalhle_FragColor"
+    } else {
+        "gl_FragColor"
+    };
+    let bytes = source.as_bytes();
+    let needle = b"gl_FragData";
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if source[index..].starts_with("gl_FragData") {
+            let mut cursor = index + needle.len();
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'[' {
+                let mut end = cursor + 1;
+                while end < bytes.len() && bytes[end] != b']' {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    output.push_str(replacement);
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        let character = source[index..].chars().next().unwrap();
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
 }
 
 /// In desktop GLSL 1.20, `texture2DLod` is available as a built-in (via
@@ -291,73 +240,6 @@ fn strip_half_types(line: &str) -> String {
         .replace("f16vec2", "vec2")
         .replace("float16_t", "float")
 }
-
-/// Rewrite `gl_FragData[n]` references to legal desktop-GLSL equivalents.
-///
-/// - `gl_FragData[0]` is exactly `gl_FragColor` in ES 1.00 semantics.
-/// - Higher indices only exist with GL_EXT_draw_buffers, which a single-
-///   attachment desktop context cannot honor; those writes become plain
-///   `gl_FragColor`/`out` writes (the last write wins, which matches the
-///   behavior guests observe on single-buffer surfaces).
-/// - A non-constant index (e.g. `gl_FragData[i]`) is left untouched; that is
-///   invalid ES usage anyway and the driver will reject it with a clear
-///   error rather than us guessing.
-fn translate_frag_data(source: &str) -> String {
-    if !source.contains("gl_FragData") {
-        return source.to_string();
-    }
-    let bytes = source.as_bytes();
-    let needle = b"gl_FragData";
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(needle) {
-            let mut k = i + needle.len();
-            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
-                k += 1;
-            }
-            if k < bytes.len() && bytes[k] == b'[' {
-                let mut m = k + 1;
-                while m < bytes.len() && (bytes[m] == b' ' || bytes[m] == b'\t') {
-                    m += 1;
-                }
-                let idx_start = m;
-                while m < bytes.len() && bytes[m].is_ascii_digit() {
-                    m += 1;
-                }
-                // Skip trailing whitespace and expect ']'.
-                while m < bytes.len() && (bytes[m] == b' ' || bytes[m] == b'\t') {
-                    m += 1;
-                }
-                if m < bytes.len() && bytes[m] == b']' {
-                    let idx: Option<u32> = source[i + needle.len()..k]
-                        .trim()
-                        .parse()
-                        .ok()
-                        .or_else(|| source[i + needle.len()..m].trim().parse().ok());
-                    let idx = idx.unwrap_or(u32::MAX);
-                    if idx == 0 {
-                        out.push_str("gl_FragColor");
-                    } else {
-                        // Attachments > 0 do not exist on the desktop target;
-                        // keep the expression syntactically valid by routing
-                        // the write to the primary color output.
-                        out.push_str("gl_FragColor");
-                    }
-                    i = m + 1;
-                    continue;
-                }
-            }
-            out.push_str("gl_FragData");
-            i += needle.len();
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
-}
-
 fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -365,33 +247,6 @@ fn is_ident_char(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn patches_shadow_sampler_extension_by_shader_stage() {
-        let src = "#version 100\n#  extension GL_EXT_shadow_samplers : require\nvoid main() {}\n";
-        let vertex = patch_shadow_samplers_extension(src, true, false);
-        assert!(!vertex.contains("GL_EXT_shadow_samplers"));
-        assert_eq!(vertex, "#version 100\n\nvoid main() {}\n");
-
-        let supported_fragment = patch_shadow_samplers_extension(src, false, true);
-        assert!(supported_fragment.contains("#  extension GL_EXT_shadow_samplers : require"));
-    }
-
-    #[test]
-    fn emulates_shadow_sampler_when_the_host_lacks_the_extension() {
-        let src = "#version 100\n#define FRAGMENT\n#extension GL_EXT_shadow_samplers : require\nprecision highp float;\nuniform highp sampler2DShadow u_shadowMap;\nvoid main() { highp float result = shadow2DEXT(u_shadowMap, vec3(0.5)); gl_FragColor = vec4(result); }\n";
-        let patched = patch_shadow_samplers_extension(src, false, false);
-        assert!(!patched.contains("GL_EXT_shadow_samplers"));
-        assert!(!patched.contains("sampler2DShadow"));
-        assert!(patched.contains("uniform highp sampler2D u_shadowMap;"));
-        assert!(patched.contains("touchHLE_shadow2DEXT(u_shadowMap, vec3(0.5))"));
-        assert!(patched.contains("texture2D(shadow_map, shadow_coord.xy).r"));
-        assert!(patched.contains("step(shadow_coord.z, depth)"));
-        assert!(
-            patched.find("highp float touchHLE_shadow2DEXT").unwrap()
-                < patched.find("void main").unwrap()
-        );
-    }
 
     #[test]
     fn rewrites_version_directive() {

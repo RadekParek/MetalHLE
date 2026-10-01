@@ -488,6 +488,31 @@ fn schedule_preload_sequence(env: &mut Environment, this: id) {
         host.preload_scheduled = true;
     }
 
+    // `--skip-intros`: fast-forward the whole lifecycle instead of playing.
+    // The notifications still flow so apps that only advance on
+    // `PlaybackDidFinish` (BioShock's intro screen among them) progress.
+    if env.options.skip_intros {
+        let host = env
+            .objc
+            .borrow_mut::<MPMoviePlayerControllerHostObject>(this);
+        host.finish_scheduled = true;
+        host.load_state = MPMovieLoadStatePlayable
+            | MPMovieLoadStatePlaythroughOK;
+        host.ready_for_display = true;
+        log!(
+            "MPMoviePlayerController: --skip-intros is active; finishing the movie immediately"
+        );
+        enqueue(
+            env,
+            PendingNotification::PlaybackDidFinish {
+                player: this,
+                reason: MPMovieFinishReasonUserExited,
+            },
+            Instant::now(),
+        );
+        return;
+    }
+
     // Check whether the file actually exists on disk so we can report a
     // meaningful finish reason later.
     let playback_error_reason = {
@@ -653,15 +678,28 @@ fn schedule_playback(env: &mut Environment, this: id, start_at: Instant) {
     );
 
     if !already_finish_scheduled {
-        // Treat the (undecoded) movie as having played to its end. Reason 0
-        // = MPMovieFinishReasonPlaybackEnded.
+        // Let the movie play for its real duration (from the container's
+        // `mvhd`), falling back to the short undecoded-movie delay when the
+        // duration is unknown or implausible. Games poll `playbackState`
+        // while the movie runs and treat a premature `Stopped` as an error.
+        // Reason 0 = MPMovieFinishReasonPlaybackEnded.
+        let finish_delay = {
+            let host = env
+                .objc
+                .borrow::<MPMoviePlayerControllerHostObject>(this);
+            if host.duration > 0.0 && host.duration < 600.0 {
+                Duration::from_secs_f64(host.duration.max(0.5))
+            } else {
+                Duration::from_millis(150)
+            }
+        };
         enqueue(
             env,
             PendingNotification::PlaybackDidFinish {
                 player: this,
                 reason: MPMovieFinishReasonPlaybackEnded,
             },
-            start_at + Duration::from_millis(150),
+            start_at + finish_delay,
         );
     }
 }
@@ -868,6 +906,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     // No audio session integration needed in the emulator.
 }
 
+- (())setCurrentPlaybackRate:(f32)rate { // no variable-speed playback in MetalHLE yet
+    // Accept and ignore: timing is driven by the internal playback clock, so
+    // 0.0 (pause-like) and 1.0 both map to existing clock behaviour.
+}
+
 - (())setFullscreen:(bool)_fullscreen {
     // Fullscreen is always implied; no UI chrome to hide.
 }
@@ -1006,11 +1049,33 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())stop {
-    let host = env.objc.borrow_mut::<MPMoviePlayerControllerHostObject>(this);
-    host.clock_offset = 0.0;
-    host.clock_started = None;
-    host.playback_state = MPMoviePlaybackStateStopped;
+    // Apple's -stop posts MPMoviePlayerPlaybackDidFinishNotification with
+    // MPMovieFinishReasonPlaybackEnded. Apps that show a looping background
+    // movie (e.g. BioShock's main menu) wait for that notification to dismiss
+    // their movie screen and continue, so omitting it hangs the app.
+    let finish_pending = {
+        let host = env.objc.borrow_mut::<MPMoviePlayerControllerHostObject>(this);
+        host.clock_offset = 0.0;
+        host.clock_started = None;
+        host.playback_state = MPMoviePlaybackStateStopped;
+        host.repeat_mode = 0;
+        host.finish_scheduled
+    };
     State::get(env).videos.remove(&this);
+    if !finish_pending {
+        // No finish is already queued (e.g. the looping-movie one was
+        // suppressed at dispatch time), so schedule one now. A pending one
+        // will post anyway once it dispatches, because the state above is no
+        // longer Playing.
+        enqueue(
+            env,
+            PendingNotification::PlaybackDidFinish {
+                player: this,
+                reason: MPMovieFinishReasonPlaybackEnded,
+            },
+            Instant::now() + Duration::from_millis(50),
+        );
+    }
     enqueue(env, PendingNotification::PlaybackStateChange(this), Instant::now());
     if env
         .framework_state

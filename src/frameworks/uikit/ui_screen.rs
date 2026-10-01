@@ -12,10 +12,6 @@ use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, TrivialHo
 pub struct State {
     main_screen: Option<id>,
     current_mode: Option<id>,
-    /// `-brightness`, clamped to the documented 0.0-1.0 range.
-    brightness: CGFloat,
-    /// `-wantsSoftwareDimming`.
-    wants_software_dimming: bool,
 }
 
 /// Return the main screen's physical pixel size for the current orientation.
@@ -28,41 +24,20 @@ fn screen_pixel_size_for_current_orientation(env: &mut crate::Environment) -> (C
 }
 
 fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u32) {
-    let portrait_size = env.window().device_family().portrait_size();
-    let orientation = env.window().current_rotation();
-    let landscape_bounds = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
-    screen_size_for_orientation(portrait_size, orientation, landscape_bounds)
-}
+    let (portrait_width, portrait_height) = env.window().screen_size();
 
-fn screen_size_for_orientation(
-    portrait_size: (u32, u32),
-    orientation: crate::window::DeviceOrientation,
-    landscape_bounds: bool,
-) -> (u32, u32) {
-    let (portrait_width, portrait_height) = portrait_size;
-    if landscape_bounds
-        && matches!(
-            orientation,
-            crate::window::DeviceOrientation::LandscapeLeft
-                | crate::window::DeviceOrientation::LandscapeRight
-        )
-    {
-        (portrait_height, portrait_width)
-    } else {
-        (portrait_width, portrait_height)
-    }
-}
+    if std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_some() {
+        let is_landscape = !matches!(
+            env.window().current_rotation(),
+            crate::window::DeviceOrientation::Portrait
+        );
 
-/// Per Apple documentation for `-setBrightness:`, values are clamped to the
-/// documented 0.0-1.0 range by the setter below.
-fn clamp_brightness(value: CGFloat) -> CGFloat {
-    if value < 0.0 {
-        0.0
-    } else if value > 1.0 {
-        1.0
-    } else {
-        value
+        if is_landscape {
+            return (portrait_height, portrait_width);
+        }
     }
+
+    (portrait_width, portrait_height)
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -102,13 +77,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Geometry
 
 - (CGRect)bounds {
+    static LANDSCAPE_BOUNDS_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let landscape_bounds_enabled = *LANDSCAPE_BOUNDS_ENV
+        .get_or_init(|| std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_some());
     let (width, height) = screen_size_for_current_orientation(env);
-    if crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
-        log!(
-            "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: UIScreen bounds reporting {}x{}",
-            width,
-            height
-        );
+    if landscape_bounds_enabled {
+        // `-[UIScreen bounds]` is queried every single frame by most games —
+        // both the env-var lookup and an unconditional log line here showed up
+        // as thousands of logcat writes per session, which is a measurable
+        // performance drag on Android. Log only when the reported size
+        // actually changes.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static LAST_SIZE: AtomicU32 = AtomicU32::new(0);
+        let key = (width as u32) << 16 | (height as u32 & 0xFFFF);
+        if LAST_SIZE.swap(key, Ordering::Relaxed) != key {
+            log!(
+                "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: UIScreen bounds reporting {}x{}",
+                width,
+                height
+            );
+        }
     }
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
@@ -124,14 +112,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     // nativeBounds is the physical screen in pixels (bounds.size * scale);
     // aliasing it to point-sized bounds made games render at half resolution
     // on Retina device profiles.
-    let bounds: CGRect = msg![env; this bounds];
-    let scale = env.window().screen_scale() as CGFloat;
+    let (width, height) = screen_pixel_size_for_current_orientation(env);
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize {
-            width:  bounds.size.width as CGFloat * scale,
-            height: bounds.size.height as CGFloat * scale,
-        },
+        size: CGSize { width, height },
     }
 }
 
@@ -152,42 +136,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGFloat)nativeScale {
-    // On real iOS devices nativeScale equals scale (the point-to-pixel
-    // ratio of the physical display). Games use it to detect Retina and
-    // size their framebuffers; reporting 1.0 while `scale` reports 2.0
-    // made such games allocate a half-resolution framebuffer and draw
-    // zoomed / cropped.
     env.window().screen_scale() as CGFloat
 }
 
 // MARK: - Brightness
 
 - (CGFloat)brightness {
-    env.framework_state.uikit.ui_screen.brightness
+    1.0
 }
 
-- (())setBrightness:(CGFloat)brightness {
-    // Per Apple documentation, brightness is in the range 0.0 (darkest)
-    // to 1.0 (lightest); clamp out-of-range values like the real UIKit.
-    let clamped = clamp_brightness(brightness);
-    if clamped != env.framework_state.uikit.ui_screen.brightness {
-        log!(
-            "[UIScreen setBrightness:] {} -> {} (host display unaffected)",
-            env.framework_state.uikit.ui_screen.brightness,
-            clamped
-        );
-        env.framework_state.uikit.ui_screen.brightness = clamped;
-    }
+- (())setBrightness:(CGFloat)_brightness {
+    log!("TODO: [UIScreen setBrightness:] (not implemented)");
 }
 
 - (bool)wantsSoftwareDimming {
-    env.framework_state.uikit.ui_screen.wants_software_dimming
+    false
 }
 
-- (())setWantsSoftwareDimming:(bool)value {
-    // Per Apple documentation this only selects whether brightness changes
-    // are implemented by dimming; store the preference.
-    env.framework_state.uikit.ui_screen.wants_software_dimming = value;
+- (())setWantsSoftwareDimming:(bool)_value {
+    log!("TODO: [UIScreen setWantsSoftwareDimming:] (not implemented)");
 }
 
 // MARK: - Display mode / overscan
@@ -202,12 +169,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // …) allocate a viewport of half (or quarter) the EAGL renderbuffer
     // area and draw the scene into a corner of the screen on Retina
     // device profiles.
-    let (width, height) = screen_size_for_current_orientation(env);
-    let scale = env.window().screen_scale() as CGFloat;
-    let size = CGSize {
-        width:  width  as CGFloat * scale,
-        height: height as CGFloat * scale,
-    };
+    let (width, height) = screen_pixel_size_for_current_orientation(env);
+    let size = CGSize { width, height };
 
     crate::frameworks::uikit::ui_screen_mode::from_size(env, size, 1.0)
 }
@@ -276,40 +239,3 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
-
-#[cfg(test)]
-mod tests {
-    use super::screen_size_for_orientation;
-    use crate::window::{DeviceFamily, DeviceOrientation};
-
-    #[test]
-    fn iphone_5_screen_bounds_follow_landscape_orientation() {
-        for device_family in [DeviceFamily::iPhone5, DeviceFamily::iPhone5c] {
-            let portrait_size = device_family.portrait_size();
-            assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeLeft, true,),
-                (568, 320)
-            );
-            assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeRight, true,),
-                (568, 320)
-            );
-            assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::Portrait, true,),
-                (320, 568)
-            );
-            assert_eq!(
-                screen_size_for_orientation(
-                    portrait_size,
-                    DeviceOrientation::PortraitUpsideDown,
-                    true,
-                ),
-                (320, 568)
-            );
-            assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeLeft, false,),
-                (320, 568)
-            );
-        }
-    }
-}

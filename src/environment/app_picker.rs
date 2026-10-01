@@ -58,7 +58,7 @@ pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
-        Err(format!("The {} directory couldn't be found. Check you're running MetalHLE from the right directory.", apps_dir.display()))
+        Err(format!("The {} directory couldn't be found. Check you're running touchHLE from the right directory.", apps_dir.display()))
     } else {
         enumerate_apps(&apps_dir).map_err(|err| {
             format!(
@@ -930,7 +930,7 @@ fn show_app_picker_gui(
         })
         .unwrap_or((320, 568));
     options.host_screen_size = Some(picker_canvas_size);
-    options.scale_hack = std::num::NonZeroU32::new(3).unwrap();
+    options.scale_hack = 3.0;
     log_dbg!(
         "App picker: using fixed {}x{} logical canvas at 3x internal resolution, preserving host aspect ratio.",
         picker_canvas_size.0,
@@ -1034,7 +1034,7 @@ fn app_picker_inner(
         break;
     }
     if !found_wallpaper {
-        if let Ok(mut resource) = paths::ResourceFile::open("MetalHLE_v7_wallpaper.png") {
+        if let Ok(mut resource) = paths::ResourceFile::open("MetalHLE_wallpaper.png") {
             let mut bytes = Vec::new();
             if resource.get().read_to_end(&mut bytes).is_ok() {
                 if let Ok(image) = Image::from_bytes(&bytes) {

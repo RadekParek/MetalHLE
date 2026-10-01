@@ -27,6 +27,26 @@ use crate::Environment;
 
 type CGInterpolationQuality = i32;
 
+/// Blend modes, using Apple's `CGContext.h` numbering (guest code passes
+/// these values as raw integers, so they must match the real SDK).
+pub const kCGBlendModeClear: i32 = 16;
+pub const kCGBlendModeNormal: i32 = 1;
+pub const kCGBlendModeMultiply: i32 = 2;
+pub const kCGBlendModeScreen: i32 = 3;
+pub const kCGBlendModeOverlay: i32 = 4;
+pub const kCGBlendModeDarken: i32 = 5;
+pub const kCGBlendModeLighten: i32 = 6;
+pub const kCGBlendModeColorDodge: i32 = 7;
+pub const kCGBlendModeColorBurn: i32 = 8;
+pub const kCGBlendModeSoftLight: i32 = 9;
+pub const kCGBlendModeDifference: i32 = 10;
+pub const kCGBlendModeExclusion: i32 = 11;
+pub const kCGBlendModeHue: i32 = 12;
+pub const kCGBlendModeSaturation: i32 = 13;
+pub const kCGBlendModeColor: i32 = 14;
+pub const kCGBlendModeLuminosity: i32 = 15;
+pub const kCGBlendModeCopy: i32 = 17;
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);

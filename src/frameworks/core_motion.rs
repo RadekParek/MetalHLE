@@ -32,6 +32,32 @@ use crate::objc::{
 use crate::Environment;
 use std::time::Instant;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Capabilities that the app itself declares in `UIRequiredDeviceCapabilities`.
+/// Games that *require* a sensor expect `isXxxAvailable` to answer YES even
+/// when the host device lacks the physical sensor (BioShock declares
+/// `magnetometer` and fails its device whitelist otherwise). For those
+/// sensors we report availability and back the data with synthesized values.
+static DECLARED_GYROSCOPE_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+/// Record that the running app declared a device capability that maps onto a
+/// Core Motion sensor. Called from the app-launch path after reading
+/// `UIRequiredDeviceCapabilities`.
+pub fn note_declared_device_capability(capability: &str) {
+    match capability {
+        "gyroscope" => DECLARED_GYROSCOPE_REQUIRED.store(true, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+/// Whether a gyroscope should be reported as available: a real host sensor,
+/// or the app explicitly requires one (in which case `read_sdl_gyroscope`'s
+/// stationary fallback provides the data).
+pub fn gyroscope_required_by_app() -> bool {
+    DECLARED_GYROSCOPE_REQUIRED.load(Ordering::Relaxed)
+}
+
 pub const DYLIB: HostDylib = HostDylib {
     path: "/System/Library/Frameworks/CoreMotion.framework/CoreMotion",
     aliases: &[],
@@ -296,11 +322,14 @@ fn read_sdl_accelerometer(env: &Environment) -> Option<CMAcceleration> {
 /// CMRotationRate's frame and units, or None if the host has no usable
 /// gyroscope sensor.
 fn read_sdl_gyroscope(env: &Environment) -> Option<CMRotationRate> {
-    // `Window::get_rotation_rate` already returns the host gyroscope reading
-    // in radians per second in the same device frame CMRotationRate uses, so
-    // we just forward those values.
+    // `Window::get_gyroscope` reports a stationary device (all zeros) when
+    // the host sensor is missing or fails, so gate on `has_gyroscope` to keep
+    // the Option semantics callers expect.
     let window = env.window.as_ref()?;
-    let (x, y, z) = window.get_rotation_rate()?;
+    if !window.has_gyroscope() {
+        return None;
+    }
+    let (x, y, z) = window.get_gyroscope();
     Some(CMRotationRate {
         x: x as f64,
         y: y as f64,

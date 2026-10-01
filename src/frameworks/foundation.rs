@@ -27,6 +27,9 @@ pub mod asidentifier_manager;
 pub mod chipmunk_space;
 pub mod ns_array;
 pub mod ns_attributed_string;
+pub mod ns_map_table;
+pub mod ns_net_service;
+pub mod ns_pointer_array;
 pub mod ns_assertion_handler;
 pub mod ns_autorelease_pool;
 pub mod ns_bundle;
@@ -58,7 +61,6 @@ pub mod ns_keyed_archiver;
 pub mod ns_keyed_unarchiver;
 pub mod ns_locale;
 pub mod ns_lock;
-pub mod ns_map_table;
 pub mod ns_log;
 pub mod ns_metadata_query;
 pub mod ns_notification;
@@ -70,7 +72,6 @@ pub mod ns_object;
 pub mod ns_operation;
 pub mod ns_ordered_set;
 pub mod ns_persistent_store_coordinator;
-pub mod ns_pointer_array;
 pub mod ns_port;
 pub mod ns_predicate;
 pub mod ns_process_info;
@@ -87,14 +88,13 @@ pub mod ns_time_zone;
 pub mod ns_timer;
 pub mod ns_ubiquitous_key_value_store;
 pub mod ns_undo_manager;
-pub mod ns_net_service;
 pub mod ns_url;
-pub mod ns_user_defaults;
-pub mod url_protocol;
 pub mod ns_url_connection;
 pub mod ns_url_request;
 pub mod ns_url_response;
 pub mod ns_url_session;
+pub mod url_protocol;
+pub mod ns_user_defaults;
 pub mod ns_uuid;
 pub mod ns_value;
 pub mod ns_xml_parser;
@@ -1504,7 +1504,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         asidentifier_manager::CLASSES,
         chipmunk_space::CLASSES,
         ns_array::CLASSES,
-        ns_attributed_string::CLASSES,
         ns_assertion_handler::CLASSES,
         ns_autorelease_pool::CLASSES,
         ns_bundle::CLASSES,
@@ -1535,12 +1534,15 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_keyed_unarchiver::CLASSES,
         ns_locale::CLASSES,
         ns_lock::CLASSES,
-        ns_map_table::CLASSES,
         ns_metadata_query::CLASSES,
         ns_notification::CLASSES,
         ns_notification_center::CLASSES,
         ns_null::CLASSES,
         ns_number_formatter::CLASSES,
+        ns_attributed_string::CLASSES,
+        ns_map_table::CLASSES,
+        ns_net_service::CLASSES,
+        ns_pointer_array::CLASSES,
         ns_object::CLASSES,
         ns_operation::CLASSES,
         ns_ordered_set::CLASSES,
@@ -1548,7 +1550,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_predicate::CLASSES,
         ns_port::CLASSES,
         ns_process_info::CLASSES,
-        ns_pointer_array::CLASSES,
         ns_property_list_serialization::CLASSES,
         ns_regular_expression::CLASSES,
         ns_run_loop::CLASSES,
@@ -1563,7 +1564,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_timer::CLASSES,
         ns_ubiquitous_key_value_store::CLASSES,
         ns_undo_manager::CLASSES,
-        ns_net_service::CLASSES,
         ns_url::CLASSES,
         ns_url_connection::CLASSES,
         ns_url_request::CLASSES,

@@ -5,21 +5,85 @@
  */
 //! Logging and terminal output macros.
 
-use std::fs::File;
+use std::io::BufWriter;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
+
+static FILE_LOGGING_ENABLED: AtomicBool = AtomicBool::new(true);
+static VERBOSE_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
+static LOG_LINES: AtomicUsize = AtomicUsize::new(0);
+const LOG_FLUSH_INTERVAL: usize = 64;
+
+fn should_flush_immediately(line: &str) -> bool {
+    [
+        "Warning:",
+        "Error:",
+        "Panic",
+        "GLES ERROR",
+        "AudioQueue underrun",
+        "audio underrun",
+        "Deadlock",
+        "deadlock",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker))
+}
+
+pub fn set_file_logging(enabled: bool) {
+    FILE_LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        let _ = std::fs::remove_file(crate::paths::user_data_base_path().join("touchHLE_log.txt"));
+    }
+}
+
+pub fn file_logging_enabled() -> bool {
+    FILE_LOGGING_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_verbose_logging(enabled: bool) {
+    VERBOSE_LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn verbose_logging_enabled() -> bool {
+    VERBOSE_LOGGING_ENABLED.load(Ordering::Relaxed)
+}
+pub fn append_log_line(line: &str) {
+    if !file_logging_enabled() {
+        return;
+    }
+    if let Ok(mut log_file) = get_log_file().lock() {
+        let _ = writeln!(log_file, "{line}");
+        let count = LOG_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % LOG_FLUSH_INTERVAL == 0 || should_flush_immediately(line) {
+            let _ = log_file.flush();
+        }
+    }
+}
+
+/// Flush the on-disk log file. Call this before the process may die (panic
+/// hook, guest exit) so the log is never truncated by buffered lines.
+pub fn flush_log_file() {
+    if file_logging_enabled() {
+        if let Ok(mut log_file) = get_log_file().lock() {
+            let _ = log_file.flush();
+        }
+    }
+}
 
 /// Get a handle to the log file. This is only for use by logging macros!
 ///
 /// All the logging macros print to stderr or (on Android) logcat, but this
 /// is not convenient for users who aren't accustomed to command-line tools or
 /// who don't have access to ADB, so we also write to a log file.
-pub fn get_log_file() -> &'static Mutex<File> {
-    static LOG_FILE: LazyLock<Mutex<File>> = LazyLock::new(|| {
+pub fn get_log_file() -> &'static Mutex<BufWriter<std::fs::File>> {
+    static LOG_FILE: LazyLock<Mutex<BufWriter<std::fs::File>>> = LazyLock::new(|| {
         let file =
-            File::create(crate::paths::user_data_base_path().join("touchHLE_log.txt")).unwrap();
+            std::fs::File::create(crate::paths::user_data_base_path().join("touchHLE_log.txt"))
+                .unwrap();
         #[cfg(unix)]
         crate::crash_handler::set_log_fd(std::os::fd::AsRawFd::as_raw_fd(&file));
-        Mutex::new(file)
+        Mutex::new(BufWriter::new(file))
     });
 
     &LOG_FILE
@@ -48,7 +112,9 @@ macro_rules! log_no_panic {
 /// when debugging.
 macro_rules! log_dbg {
     ($($arg:tt)+) => {
-        if $crate::log::ENABLED_MODULES.contains(&module_path!()) {
+        if $crate::log::verbose_logging_enabled()
+            || $crate::log::ENABLED_MODULES.contains(&module_path!())
+        {
             log!($($arg)*);
         }
     }
@@ -66,7 +132,33 @@ macro_rules! log_once {
     }};
 }
 
-/// Like [log_once], but supports format arguments.
+/// Like [log_once], but keeps normal logs focused on warnings and errors.
+macro_rules! log_dbg_once {
+    ($msg:literal) => {{
+        static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+        LOG_ONCE.call_once(|| {
+            if $crate::log::verbose_logging_enabled()
+                || $crate::log::ENABLED_MODULES.contains(&module_path!())
+            {
+                log!("{} [this debug log will only be shown once]", $msg);
+            }
+        });
+    }};
+}
+
+macro_rules! log_dbg_once_fmt {
+    ($($arg:tt)+) => {{
+        static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+        LOG_ONCE.call_once(|| {
+            if $crate::log::verbose_logging_enabled()
+                || $crate::log::ENABLED_MODULES.contains(&module_path!())
+            {
+                log!($($arg)+);
+            }
+        });
+    }};
+}
+
 macro_rules! log_once_fmt {
     ($($arg:tt)+) => {{
         static LOG_ONCE: std::sync::Once = std::sync::Once::new();
@@ -74,6 +166,52 @@ macro_rules! log_once_fmt {
             log!($($arg)+);
         });
     }};
+}
+
+/// Sample a debug log site while preserving an initial diagnostic window.
+/// The first few messages and every `every`th message are kept in the log.
+macro_rules! log_sampled {
+    ($every:expr, $($arg:tt)+) => {{
+        if $crate::log::verbose_logging_enabled()
+            || $crate::log::ENABLED_MODULES.contains(&module_path!())
+        {
+            static SAMPLE_COUNT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let count = SAMPLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 8 || count % $every == 0 {
+                log!("[sampled #{}] {}", count + 1, format_args!($($arg)+));
+            }
+        }
+    }};
+}
+
+/// Emit an already-formatted (possibly multi-line) message through the same
+/// channels as the `echo!` macro. Helper for code that builds its report as
+/// one `String` first (e.g. the GLES forensics dump), so a report is a single
+/// log event instead of many interleaved ones.
+/// SDL's log functions require valid C strings: any interior NUL byte makes
+/// them panic (and thus kills the whole emulator). Guest-influenced content
+/// (driver strings, forensics dumps, app-supplied text) can contain NULs, so
+/// every message passing through SDL logging must be sanitized.
+pub fn sanitize_for_sdl(msg: &str) -> String {
+    if msg.as_bytes().contains(&0) {
+        msg.replace('\0', "\\0")
+    } else {
+        msg.to_owned()
+    }
+}
+
+pub fn echo_preformatted(msg: &str) {
+    #[cfg(target_os = "android")]
+    {
+        sdl2::log::log(&sanitize_for_sdl(msg));
+    }
+    #[cfg(not(target_os = "android"))]
+    eprintln!("{}", msg);
+
+    for line in msg.lines() {
+        append_log_line(line);
+    }
 }
 
 /// Print a message (with implicit newline). This should be used for all
@@ -87,16 +225,12 @@ macro_rules! echo {
 
             #[cfg(target_os = "android")]
             {
-                sdl2::log::log(&formatted_str);
+                sdl2::log::log(&$crate::log::sanitize_for_sdl(&formatted_str));
             }
             #[cfg(not(target_os = "android"))]
             eprintln!("{}", formatted_str);
 
-            if let Ok(mut log_file) = $crate::log::get_log_file().lock() {
-                let _ = std::io::Write::write_all(&mut *log_file, formatted_str.as_bytes());
-                let _ = std::io::Write::write_all(&mut *log_file, b"\n");
-                let _ = std::io::Write::flush(&mut *log_file);
-            }
+            $crate::log::append_log_line(&formatted_str);
         }
     };
     () => {
@@ -108,37 +242,9 @@ macro_rules! echo {
             #[cfg(not(target_os = "android"))]
             eprintln!("");
 
-            if let Ok(mut log_file) = $crate::log::get_log_file().lock() {
-                let _ = std::io::Write::write_all(&mut *log_file, b"\n");
-                let _ = std::io::Write::flush(&mut *log_file);
-            }
+            $crate::log::append_log_line("");
         }
     }
-}
-
-/// Like [echo], but only writes to the in-file log: nothing is sent to
-/// logcat/stderr. Intended for opt-in tracing of extremely hot paths (e.g.
-/// per-call `--verbose-gles` output), where the logcat round-trip alone is a
-/// measurable frame-time cost on Android.
-macro_rules! echo_file_only {
-    ($($arg:tt)+) => {
-        {
-            let formatted_str = format!($($arg)+);
-
-            if let Ok(mut log_file) = $crate::log::get_log_file().lock() {
-                let _ = std::io::Write::write_all(&mut *log_file, formatted_str.as_bytes());
-                let _ = std::io::Write::write_all(&mut *log_file, b"\n");
-            }
-        }
-    };
-}
-
-/// Like [log], but only writes to the in-file log (never logcat/stderr). To
-/// be used for per-call traces that can emit thousands of lines per second.
-macro_rules! log_file_only {
-    ($($arg:tt)+) => {
-        echo_file_only!("{}: {}", module_path!(), format_args!($($arg)+))
-    };
 }
 
 /// Same as [echo], but silently fails on panic instead of
@@ -154,6 +260,64 @@ macro_rules! echo_no_panic {
 }
 
 /// Put modules to enable [log_dbg] for here, e.g. "touchHLE::mem" to see when
-/// memory is allocated and freed. Keep the default empty to avoid hot-path log
-/// traffic in normal builds.
-pub const ENABLED_MODULES: &[&str] = &["touchHLE::frameworks::media_player::movie_player"];
+/// memory is allocated and freed.
+pub const ENABLED_MODULES: &[&str] = &[];
+
+/// Suppress repetitive guest log lines (apps sometimes NSLog the same line
+/// thousands of times per second from device-check loops; each line is real
+/// I/O on Android). The first few occurrences of a distinct line are shown,
+/// then it is sampled and a running tally is attached.
+pub fn echo_guest_line_deduped(executable: &str, thread: u64, line: &str) {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static GATE: Mutex<Option<HashMap<u64, (u32, Instant)>>> = Mutex::new(None);
+    static TOTAL_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
+
+    const SHOW_FIRST: u32 = 3;
+    const SAMPLE_EVERY: u32 = 200;
+    const RESET_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+    // Cheap content key: length + FNV-1a of the body.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in line.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= (line.len() as u64) << 32;
+
+    let mut show = true;
+    let mut count = 0u32;
+    if let Ok(mut guard) = GATE.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        let entry = map.entry(hash).or_insert((0u32, Instant::now()));
+        entry.0 += 1;
+        count = entry.0;
+        if entry.1.elapsed() > RESET_AFTER {
+            *entry = (1, Instant::now());
+            count = 1;
+        }
+        show = count <= SHOW_FIRST || count % SAMPLE_EVERY == 0;
+        if !show {
+            TOTAL_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        }
+        // Bound memory: drop the table if it grows unusually large.
+        if map.len() > 256 {
+            map.clear();
+        }
+    }
+    if show {
+        let suffix = if count > 1 {
+            format!(" (x{})", count)
+        } else {
+            String::new()
+        };
+        echo!("{}[{}] {}{}", executable, thread, line, suffix);
+        let suppressed = TOTAL_SUPPRESSED.load(Ordering::Relaxed);
+        if suppressed > 0 && suppressed % 1000 == 0 {
+            echo!("Guest log: {} repetitive lines suppressed so far", suppressed);
+        }
+    }
+}

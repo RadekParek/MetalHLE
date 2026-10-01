@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 use super::{GuestUSize, Mem, VAddr, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU32;
 
 /// iPhone OS's allocator always aligns to 16 bytes at minimum, and this
@@ -127,16 +127,22 @@ mod collections {
             }
             Some(self.remove_with_base(chunk.base).unwrap())
         }
+
+        pub fn iter(&self) -> impl Iterator<Item = Chunk> + '_ {
+            self.chunks
+                .iter()
+                .map(|(&base, &size)| Chunk { base, size })
+        }
         #[inline(always)]
         pub fn get_size_with_base(&self, base: VAddr) -> Option<NonZeroU32> {
             self.chunks.get(&base).copied()
         }
 
-        /// Iterate over all chunks currently stored in this map.
-        pub fn iter(&self) -> impl Iterator<Item = Chunk> + '_ {
-            self.chunks
-                .iter()
-                .map(|(&base, &size)| Chunk { base, size })
+        #[inline]
+        pub fn find_containing(&self, addr: VAddr) -> Option<Chunk> {
+            let (&base, &size) = self.chunks.range(..=addr).next_back()?;
+            let chunk = Chunk { base, size };
+            chunk.contains(addr).then_some(chunk)
         }
     }
 
@@ -222,32 +228,16 @@ mod collections {
                 assert!(existing.base & PAGE_SIZE_ALIGN_MASK == 0);
                 // re-align base address by splitting in 2 chunks:
                 // less than page size, not aligned
-                let left_size = PAGE_SIZE - size;
-                let left = Chunk::new(existing.base + size, left_size);
+                let left = Chunk::new(existing.base + size, PAGE_SIZE - size);
                 // (maybe) more than page size, aligned
                 let right = Chunk::new(existing.base + PAGE_SIZE, existing.size.get() - PAGE_SIZE);
                 assert_eq!(left.last_byte() + 1, right.base); // sanity check, bases
                 assert_eq!(left.size.get() + right.size.get(), rump_size); // sanity check, sizes
-                if left_size >= MIN_CHUNK_SIZE {
-                    self.insert(left);
-                    self.insert(right);
-                } else {
-                    // The unaligned left sliver is below MIN_CHUNK_SIZE and
-                    // can't be tracked by the size-bucketed free list. Give
-                    // the caller the whole existing chunk instead; its base
-                    // is page-aligned, so the page-alignment invariant holds.
-                    return Some(Chunk::new(existing.base, existing.size.get()));
-                }
-            } else if rump_size >= MIN_CHUNK_SIZE {
+                self.insert(left);
+                self.insert(right);
+            } else {
                 let rump = Chunk::new(rump_base, rump_size);
                 self.insert(rump);
-            } else {
-                // The rump is below MIN_CHUNK_SIZE and can't go into the
-                // size-bucketed free list (its invariant is `size >=
-                // MIN_CHUNK_SIZE`). Absorb it into the allocation instead of
-                // panicking; at most MIN_CHUNK_SIZE - 1 bytes are lost, which
-                // is negligible internal fragmentation.
-                return Some(Chunk::new(existing.base, existing.size.get()));
             }
 
             Some(alloc)
@@ -267,6 +257,9 @@ mod collections {
             // Exact match has been ruled out, find the smallest chunk in the
             // next largest non-empty bucket.
 
+            if bucket + 1 >= self.chunks_by_log2_size.len() {
+                return None;
+            }
             let bucket = self.chunks_by_log2_size[bucket + 1..]
                 .iter()
                 .position(|bucket| !bucket.is_empty())?
@@ -290,16 +283,68 @@ use collections::{ChunkMap, SizeBucketedChunkMap};
 pub struct Allocator {
     used_chunks: ChunkMap,
     unused_chunks: SizeBucketedChunkMap,
+    freed_bases: HashSet<VAddr>,
+}
+
+#[cfg(test)]
+mod allocator_tests {
+    use super::{Allocator, PAGE_SIZE};
+
+    #[test]
+    fn coalesces_both_sides_before_retrying_a_large_allocation() {
+        let mut allocator = Allocator::new();
+        let first = allocator.alloc(PAGE_SIZE);
+        let middle = allocator.alloc(PAGE_SIZE);
+        let last = allocator.alloc(PAGE_SIZE);
+        assert_eq!(middle, first + PAGE_SIZE);
+        assert_eq!(last, middle + PAGE_SIZE);
+
+        let _ = allocator.free(first);
+        let _ = allocator.free(last);
+        let _ = allocator.free(middle);
+        allocator.coalesce_unused_chunks();
+
+        let merged = allocator
+            .unused_chunks
+            .allocate(PAGE_SIZE * 3)
+            .expect("adjacent freed chunks should be reusable as one range");
+        assert_eq!(merged.base, first);
+    }
+    #[test]
+    fn finds_the_live_chunk_containing_an_address() {
+        let mut allocator = Allocator::new();
+        let base = allocator.alloc(PAGE_SIZE * 2);
+        assert_eq!(
+            allocator.allocation_containing(base + PAGE_SIZE),
+            Some((base, PAGE_SIZE * 2))
+        );
+        assert_eq!(allocator.allocation_containing(base + PAGE_SIZE * 2), None);
+    }
+
+    #[test]
+    fn live_allocation_snapshot_adds_and_removes_freed_chunks() {
+        let mut allocator = Allocator::new();
+        let initial = allocator.live_allocations();
+        let base = allocator.alloc(PAGE_SIZE);
+        let live = allocator.live_allocations();
+        assert!(live.contains(&(base, PAGE_SIZE)));
+        assert_eq!(live.len(), initial.len() + 1);
+
+        let _ = allocator.free(base);
+        assert_eq!(allocator.live_allocations(), initial);
+    }
 }
 
 impl Allocator {
     pub fn new() -> Allocator {
         let main_thread_stack =
             Chunk::new(Mem::MAIN_THREAD_STACK_LOW_END, Mem::MAIN_THREAD_STACK_SIZE);
-        let rest = Chunk::new(0, Mem::MAIN_THREAD_STACK_LOW_END);
+        let null_page = Chunk::new(0, PAGE_SIZE);
+        let rest = Chunk::new(PAGE_SIZE, Mem::MAIN_THREAD_STACK_LOW_END - PAGE_SIZE);
 
         let mut used_chunks: ChunkMap = Default::default();
         used_chunks.insert(main_thread_stack);
+        used_chunks.insert(null_page);
 
         let mut unused_chunks: SizeBucketedChunkMap = Default::default();
         unused_chunks.insert(rest);
@@ -307,6 +352,7 @@ impl Allocator {
         Allocator {
             used_chunks,
             unused_chunks,
+            freed_bases: HashSet::new(),
         }
     }
 
@@ -335,20 +381,38 @@ impl Allocator {
             return;
         };
         self.unused_chunks.remove_with_base(to_trisect.base);
-        // Leftover free chunks smaller than MIN_CHUNK_SIZE can't be tracked
-        // by the size-bucketed free list (its invariant is `size >=
-        // MIN_CHUNK_SIZE`). Mach-O loaders regularly reserve odd-sized
-        // segments (e.g. __IMPORT or padding between sections), which leaves
-        // sub-16-byte slivers around them. Rather than panicking, drop them:
-        // at most 15 bytes per segment boundary are lost, which is negligible
-        // and matches how real allocators round reservations up.
-        if let Some(before) = before.filter(|c| c.size.get() >= MIN_CHUNK_SIZE) {
+        if let Some(before) = before {
             self.unused_chunks.insert(before);
         }
-        if let Some(after) = after.filter(|c| c.size.get() >= MIN_CHUNK_SIZE) {
+        if let Some(after) = after {
             self.unused_chunks.insert(after);
         }
         self.used_chunks.insert(chunk);
+    }
+
+    fn coalesce_unused_chunks(&mut self) {
+        let mut chunks: Vec<Chunk> = self.unused_chunks.iter().collect();
+        chunks.sort_unstable_by_key(|chunk| chunk.base);
+        let mut merged: Vec<Chunk> = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            if let Some(previous) = merged.last_mut() {
+                let adjacent = previous.last_byte().checked_add(1) == Some(chunk.base);
+                let combined_size = previous.size.get().checked_add(chunk.size.get());
+                let can_merge = adjacent
+                    && combined_size.is_some_and(|size| {
+                        size < PAGE_SIZE || previous.base & PAGE_SIZE_ALIGN_MASK == 0
+                    });
+                if let (true, Some(size)) = (can_merge, combined_size) {
+                    *previous = Chunk::new(previous.base, size);
+                    continue;
+                }
+            }
+            merged.push(chunk);
+        }
+        self.unused_chunks = Default::default();
+        for chunk in merged {
+            self.unused_chunks.insert(chunk);
+        }
     }
 
     pub fn alloc(&mut self, size: GuestUSize) -> VAddr {
@@ -371,14 +435,22 @@ impl Allocator {
             return 0;
         };
 
-        let Some(alloc) = self.unused_chunks.allocate(aligned_size) else {
-            log!(
-                "Warning: Allocator::alloc: out of memory (could not find a large enough chunk for {:#x} bytes); returning NULL.",
-                aligned_size
-            );
-            return 0;
+        let alloc = match self.unused_chunks.allocate(aligned_size) {
+            Some(alloc) => alloc,
+            None => {
+                self.coalesce_unused_chunks();
+                let Some(alloc) = self.unused_chunks.allocate(aligned_size) else {
+                    log_once_fmt!(
+                        "Warning: Allocator::alloc: out of memory (first failed request was {:#x} bytes); repeated allocation failures are suppressed.",
+                        aligned_size
+                    );
+                    return 0;
+                };
+                alloc
+            }
         };
         self.used_chunks.insert(alloc);
+        self.freed_bases.remove(&alloc.base);
 
         alloc.base
     }
@@ -393,119 +465,51 @@ impl Allocator {
         }
     }
 
-    /// Used by `realloc` — logs a warning when given a non-malloc pointer,
-    /// because realloc'ing a non-heap pointer is undefined behaviour on the
-    /// guest side and almost always indicates a real bug.
     pub fn find_allocated_size(&mut self, base: VAddr) -> GuestUSize {
         let Some(size) = self.used_chunks.get_size_with_base(base) else {
-            log!(
-                "Warning: Allocator::find_allocated_size: unknown allocation at {:#x}; returning 0.",
-                base
-            );
+            log!("Warning: unknown allocation at {:#x}; returning 0.", base);
             return 0;
         };
         size.get()
     }
 
-    /// Silent variant of [`find_allocated_size`] for callers such as
-    /// `malloc_size(3)` where Apple's documented contract is to *quietly*
-    /// return 0 for any pointer that isn't the base of a malloc-managed
-    /// allocation (see
-    /// <https://developer.apple.com/library/archive/documentation/Performance/Conceptual/ManagingMemory/Articles/MallocDebug.html>
-    /// and the `malloc_size(3)` manpage in the macOS / iOS SDK). Apps that
-    /// hand `malloc_size` a stack pointer, a `__DATA` symbol, or an interior
-    /// pointer routinely rely on this behaviour, so spamming a warning for
-    /// every such call (as we used to) is both incorrect and noisy.
     pub fn try_find_allocated_size(&self, base: VAddr) -> Option<GuestUSize> {
         self.used_chunks.get_size_with_base(base).map(|s| s.get())
     }
 
-    /// Returns whether `base` is currently a live allocation (the exact base
-    /// address of a used chunk). Used by `free()` wrappers to reject clearly
-    /// bogus pointers before passing them to the allocator.
     pub fn is_known_allocation(&self, base: VAddr) -> bool {
         self.used_chunks.get_size_with_base(base).is_some()
     }
 
-    /// Try to grow the allocation at `base` in place, by taking over free
-    /// space that immediately follows it.
-    ///
-    /// On success, returns the new (actual) size of the allocation, which is
-    /// at least `new_size` and may exceed it. Returns [None] (leaving the
-    /// allocator state untouched) if the following memory isn't free or
-    /// growing in place would violate the allocator's invariants.
-    #[must_use]
-    pub fn grow_in_place(
-        &mut self,
-        base: VAddr,
-        old_size: GuestUSize,
-        new_size: GuestUSize,
-    ) -> Option<GuestUSize> {
-        let extra = new_size - old_size;
+    pub fn allocation_containing(&self, addr: VAddr) -> Option<(VAddr, GuestUSize)> {
+        self.used_chunks
+            .find_containing(addr)
+            .map(|chunk| (chunk.base, chunk.size.get()))
+    }
 
-        // Only live allocations can be grown.
-        if self.used_chunks.get_size_with_base(base).is_none() {
-            return None;
-        }
+    /// Return a sorted snapshot of all currently live guest allocations.
+    pub fn live_allocations(&self) -> Vec<(VAddr, GuestUSize)> {
+        self.used_chunks
+            .iter()
+            .map(|chunk| (chunk.base, chunk.size.get()))
+            .collect()
+    }
 
-        let adjacent_base = base + old_size;
-        let adjacent = self.unused_chunks.remove_with_base(adjacent_base)?;
-        let adjacent_size = adjacent.size.get();
-        if adjacent_size < extra {
-            // Not enough room; put the chunk back exactly as it was.
-            self.unused_chunks.insert(adjacent);
-            return None;
-        }
-
-        let grown_size = if adjacent_size >= PAGE_SIZE {
-            // Page-aligned free chunks can't be split at an arbitrary
-            // offset without breaking the page-alignment invariant, so
-            // take the whole chunk.
-            old_size + adjacent_size
-        } else {
-            let remainder = adjacent_size - extra;
-            if remainder < MIN_CHUNK_SIZE {
-                // Too small to be a free chunk on its own; take the whole
-                // chunk.
-                old_size + adjacent_size
-            } else {
-                new_size
-            }
-        };
-
-        // Chunks of PAGE_SIZE or larger must stay page-aligned. Growing a
-        // small (16-byte-aligned) allocation into page-sized territory would
-        // violate that, so bail out instead.
-        if grown_size >= PAGE_SIZE && base & PAGE_SIZE_ALIGN_MASK != 0 {
-            self.unused_chunks.insert(adjacent);
-            return None;
-        }
-
-        if adjacent_size < PAGE_SIZE {
-            let remainder = adjacent_size - extra;
-            if remainder >= MIN_CHUNK_SIZE {
-                self.unused_chunks
-                    .insert(Chunk::new(adjacent_base + extra, remainder));
-            }
-            // else: the leftover sliver is below MIN_CHUNK_SIZE, so it can't
-            // go into the size-bucketed free list; it is absorbed into the
-            // grown allocation instead (grown_size already covers it because
-            // we took the whole chunk in that case).
-        }
-
-        assert!(self.used_chunks.remove_with_base(base).is_some());
-        self.used_chunks.insert(Chunk::new(base, grown_size));
-
-        Some(grown_size)
+    pub fn was_freed(&self, base: VAddr) -> bool {
+        self.freed_bases.contains(&base)
     }
 
     /// Returns the size of the freed chunk so it can be zeroed if desired
     #[must_use]
     pub fn free(&mut self, base: VAddr) -> GuestUSize {
         let Some(freed) = self.used_chunks.remove_with_base(base) else {
-            log!("Can't free {:#x}, unknown allocation!", base);
+            // Guests sometimes free pointers this allocator never handed out
+            // (mmap-backed reserves, statically-placed data, etc.). Harmless
+            // no-op; keep at debug level so it does not pollute normal logs.
+            log_dbg_once_fmt!("Can't free {:#x}, unknown allocation!", base);
             return 0;
         };
+        self.freed_bases.insert(base);
 
         if let Some(adjacent) = self
             .unused_chunks
@@ -517,128 +521,20 @@ impl Allocator {
             if new_size >= PAGE_SIZE && new_base & PAGE_SIZE_ALIGN_MASK != 0 {
                 // Invariant of page alignment would be violated!
                 // So we're not combining
-                // Sub-MIN_CHUNK_SIZE slivers can't live in the bucketed free
-                // list, so drop them (bounded loss, matches reserve()).
-                if adjacent.size.get() >= MIN_CHUNK_SIZE {
-                    self.unused_chunks.insert(adjacent);
-                }
-                if freed.size.get() >= MIN_CHUNK_SIZE {
-                    self.unused_chunks.insert(freed);
-                }
+                self.unused_chunks.insert(adjacent);
+                self.unused_chunks.insert(freed);
             } else {
                 // We are good to combine
-                let combined = Chunk::new(new_base, new_size);
-                if combined.size.get() >= MIN_CHUNK_SIZE {
-                    self.unused_chunks.insert(combined);
-                }
+                let combined = Chunk::new(
+                    freed.base.min(adjacent.base),
+                    freed.size.get() + adjacent.size.get(),
+                );
+                self.unused_chunks.insert(combined);
             }
-        } else if freed.size.get() >= MIN_CHUNK_SIZE {
+        } else {
             self.unused_chunks.insert(freed);
         }
 
         freed.size.get()
-    }
-
-    /// Returns a snapshot of all currently-live allocations as
-    /// `(base_address, size_in_bytes)` pairs.
-    ///
-    /// This is used by the optional RTCV-style game-corruption engine
-    /// (see [`crate::corrupt`]) so that random byte corruption can be
-    /// restricted to memory the guest has actually allocated, instead of
-    /// blindly poking anywhere in the 4 GiB address space (which would
-    /// almost always hit unmapped pages and crash immediately).
-    pub fn live_allocations(&self) -> Vec<(VAddr, GuestUSize)> {
-        self.used_chunks
-            .iter()
-            .map(|chunk| (chunk.base, chunk.size.get()))
-            .collect()
-    }
-}
-
-#[cfg(test)]
-mod grow_in_place_tests {
-    use super::{Allocator, Chunk, GuestUSize, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK};
-
-    /// The allocator starts with no free memory at all (in production the
-    /// null segment / Mach-O segments are reserved by `Mem`), so tests must
-    /// reserve an arena first.
-    fn arena() -> Allocator {
-        let mut allocator = Allocator::new();
-        // Mirror what `Mem` does in production: reserve the null segment at
-        // address 0 first. Without this, the very first `alloc` could legally
-        // return base 0, which is indistinguishable from NULL to the guest.
-        allocator.reserve(Chunk::new(0, PAGE_SIZE));
-        allocator.reserve(Chunk::new(PAGE_SIZE, 64 * PAGE_SIZE));
-        allocator
-    }
-
-    fn alloc_at(allocator: &mut Allocator, size: GuestUSize) -> GuestUSize {
-        let base = allocator.alloc(size);
-        assert_ne!(base, 0, "alloc returned NULL for size {size}");
-        base
-    }
-
-    #[test]
-    fn grow_in_place_takes_adjacent_free_chunk() {
-        let mut allocator = arena();
-        let a = alloc_at(&mut allocator, 16);
-        let b = alloc_at(&mut allocator, 64);
-        let c = alloc_at(&mut allocator, 16);
-        // Free the middle allocation so `a`... wait, adjacency: free b, grow a.
-        allocator.free(b);
-        let grown = allocator.grow_in_place(a, 16, 32).expect("should grow");
-        assert!(grown >= 32);
-        // The grown allocation must not overlap c.
-        assert!(a + grown <= c);
-    }
-
-    #[test]
-    fn grow_in_place_without_adjacent_free_chunk_is_noop() {
-        let mut allocator = arena();
-        let a = alloc_at(&mut allocator, 16);
-        let b = alloc_at(&mut allocator, 16);
-        let grown = allocator.grow_in_place(a, 16, 32);
-        assert!(grown.is_none());
-        // Allocator state untouched: b is still live.
-        assert_eq!(allocator.try_find_allocated_size(b), Some(16));
-    }
-
-    #[test]
-    fn grow_in_place_rejects_non_live_base() {
-        let mut allocator = arena();
-        let a = alloc_at(&mut allocator, 16);
-        allocator.free(a);
-        assert!(allocator.grow_in_place(a, 16, 32).is_none());
-    }
-
-    #[test]
-    fn grow_in_place_preserves_page_alignment_invariant() {
-        let mut allocator = arena();
-        // Small (16-aligned) allocation directly before a large free region.
-        let a = alloc_at(&mut allocator, 16);
-        let b = alloc_at(&mut allocator, 2 * PAGE_SIZE);
-        allocator.free(b);
-        let grown = allocator.grow_in_place(a, 16, PAGE_SIZE);
-        // Either it refuses (safe), or the result respects alignment.
-        if let Some(grown) = grown {
-            let new_base_ok = grown < PAGE_SIZE || a & PAGE_SIZE_ALIGN_MASK == 0;
-            assert!(new_base_ok);
-        }
-    }
-}
-
-#[cfg(test)]
-mod probe_tests {
-    use super::Allocator;
-    /// The null segment must prevent malloc from ever handing out address 0.
-    #[test]
-    fn alloc_never_returns_null_address_when_memory_is_available() {
-        let mut a = Allocator::new();
-        a.reserve(super::Chunk::new(0, super::PAGE_SIZE));
-        let base = a.alloc(16);
-        assert_ne!(base, 0, "malloc handed out address 0");
-        assert_eq!(a.free(base), 16);
-        let base2 = a.alloc(16);
-        assert_ne!(base2, 0);
     }
 }

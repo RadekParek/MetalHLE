@@ -124,7 +124,9 @@ fn objc_msgSend_inner(
     tolerate_type_mismatch: bool,
     skip_initialize: bool,
 ) {
-    log_dbg!(
+    let _perf_scope = crate::perf::objc_scope();
+    log_sampled!(
+        1024,
         "Dispatching {} for {:?}",
         selector.as_str(&env.mem),
         receiver
@@ -234,7 +236,17 @@ fn objc_msgSend_inner(
 
     if receiver == nil {
         // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjectiveC/Chapters/ocObjectsClasses.html#//apple_ref/doc/uid/TP30001163-CH11-SW7
-        log_dbg!("[nil {}]", selector.as_str(&env.mem));
+        log_once_fmt!("[nil {}] (repeated nil receivers suppressed)", selector.as_str(&env.mem));
+        env.cpu.regs_mut()[0..2].fill(0);
+        return;
+    }
+
+    if env.mem.was_freed(receiver.to_bits()) {
+        log_once_fmt!(
+            "Warning: ignoring message \"{}\" sent to previously freed object {:?}",
+            selector.as_str(&env.mem),
+            receiver
+        );
         env.cpu.regs_mut()[0..2].fill(0);
         return;
     }
@@ -491,17 +503,6 @@ fn objc_msgSend_inner(
                 )
             };
 
-            // `+[Class self]` must return the class itself. The real objc
-            // runtime resolves `self` via the metaclass root NSObject chain,
-            // but a bare metaclass registered for an unimplemented class
-            // falls through here and previously returned 0 — breaking e.g.
-            // the Burstly ad SDK which calls `+[BurstlyCurrency... self]`.
-            if selector.as_str(&env.mem) == "self" {
-                env.cpu.regs_mut()[0] = receiver.to_bits();
-                env.cpu.regs_mut()[1] = 0;
-                return;
-            }
-
             let missing_selector_name = selector.as_str(&env.mem).to_owned();
 
             if try_cocos_missing_selector_compat(
@@ -595,7 +596,7 @@ fn objc_msgSend_inner(
             }
 
             if let Some(imp) = methods.get(&selector) {
-                log_dbg!("Found method on: {}", name);
+                log_sampled!(1024, "Found method on: {}", name);
                 match imp {
                     IMP::Host(host_imp) => {
                         // TODO: do type checks when calling GuestIMPs too.
@@ -811,13 +812,6 @@ Type mismatch when sending message {} to {:?}!
             ) {
                 return;
             }
-            // XaView A8 fix (2e1549e3): messages to the unimplemented
-            // GCController class behave as if sent to nil, instead of
-            // panicking the guest.
-            if class_name_for_log == "GCController" {
-                env.cpu.regs_mut()[0..2].fill(0);
-                return;
-            }
             log!(
                 "Class \"{}\" ({:?}) is unimplemented. Call to {} method \"{}\".",
                 class_name_for_log,
@@ -842,13 +836,6 @@ Type mismatch when sending message {} to {:?}!
             ) {
                 return;
             }
-            log!(
-                "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
-                class_name_for_log,
-                class,
-                if is_metaclass { "class" } else { "instance" },
-                sel_name,
-            );
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else {
@@ -1258,7 +1245,9 @@ fn try_cocos_missing_selector_compat(
             "supportedInterfaceOrientations"
             | "application:supportedInterfaceOrientationsForWindow:"
             | "supportedInterfaceOrientationsForWindow:" => 0x18, // landscape left/right mask on old UIKit-style callers.
-            "targetFrameRate" | "preferredFramesPerSecond" => 60,
+            "targetFrameRate" | "preferredFramesPerSecond" => {
+                env.options.fps_limit.unwrap_or(60.0).round() as u32
+            }
             _ => 0,
         };
         cocos_selector_log_once(class_name, selector_name, "integer default");
@@ -1414,18 +1403,15 @@ fn try_nsarray_indexed_subscript_interpose(
     selector: SEL,
     orig_class: Class,
 ) -> bool {
-    // PERF: this probe runs on *every* guest message send, before the real
-    // method lookup. Compare in place instead of allocating selector and
-    // class-name Strings each time.
-    if selector.as_str(&env.mem) != "objectAtIndexedSubscript:" {
+    let sel_name = selector.as_str(&env.mem).to_string();
+    if sel_name != "objectAtIndexedSubscript:" {
         return false;
     }
 
-    let class_name = env.objc.get_class_name(orig_class);
+    let class_name = env.objc.get_class_name(orig_class).to_owned();
     if !class_name.contains("NSArray") && !class_name.contains("NSMutableArray") {
         return false;
     }
-    let class_name = class_name.to_owned();
 
     let index = env.cpu.regs()[2];
 
@@ -1450,13 +1436,11 @@ fn try_nsarray_indexed_subscript_interpose(
 // GDataXML compatibility layer
 // ============================================================================
 //
-// Some games bundle Google's GDataXML classes. Those classes directly
-// dereference libxml2's xmlNode/xmlAttr structs, but touchHLE's libxml2 shim
-// intentionally gives the guest opaque handle IDs instead of guest-visible
-// structs. Trying to fake libxml2 structs in libxml2.rs can make the guest walk
-// bad/cyclic XML graphs. Intercepting the tiny GDataXML surface the game uses
-// is safer: parse XML into a small Rust DOM and return real Objective-C objects
-// for GDataXMLDocument/GDataXMLElement/GDataXMLNode/GDataXMLAttribute methods.
+// Some games bundle Google's GDataXML classes. These classes directly
+// dereference libxml2's xmlNode/xmlAttr structs. The normal path now uses the
+// real guest libxml2 dylib, but older RadekHLE builds used opaque host handles;
+// this compatibility layer accepts either representation and parses the small
+// GDataXML surface used by affected games into Objective-C objects.
 
 #[derive(Clone)]
 struct GDataCompatNode {
@@ -1817,31 +1801,14 @@ fn try_gdataxml_interpose(
     selector: SEL,
     orig_class: Class,
 ) -> bool {
-    // PERF: this probe runs on *every* guest message send. Reject non-GData
-    // classes with a zero-allocation borrowed-name check first; only actual
-    // GDataXML classes fall through to the name clones below (the clones
-    // exist so the borrow of `env.objc` ends before handler arms use
-    // `&mut env`).
-    {
-        let class_ref = env.objc.get_host_object(orig_class).and_then(|ho| {
-            if let Some(co) = ho.as_any().downcast_ref::<super::ClassHostObject>() {
-                Some(co.name.as_str())
-            } else if let Some(co) = ho.as_any().downcast_ref::<super::UnimplementedClass>() {
-                Some(co.name.as_str())
-            } else if let Some(co) = ho.as_any().downcast_ref::<super::FakeClass>() {
-                Some(co.name.as_str())
-            } else {
-                None
-            }
-        });
-        let is_gdata = class_ref.is_some_and(gdata_is_class);
-        if !is_gdata {
-            return false;
-        }
-    }
-
     let sel = selector.as_str(&env.mem).to_string();
-    let class_name = gdata_class_name(env, orig_class).unwrap_or_default();
+    let Some(class_name) = gdata_class_name(env, orig_class) else {
+        return false;
+    };
+
+    if !gdata_is_class(&class_name) {
+        return false;
+    }
 
     // Pull raw objc_msgSend argument registers before any nested host call can
     // clobber them.

@@ -8,12 +8,10 @@
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef;
 use crate::frameworks::core_foundation::cf_string::CFStringRef;
-use crate::frameworks::core_foundation::cf_url::{kCFURLPOSIXPathStyle, CFURLCopyFileSystemPath};
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
-use crate::fs::GuestPath;
-use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
-use crate::objc::{msg, nil, objc_classes, ClassExports, HostObject};
+use crate::mem::{ConstPtr, MutPtr, MutVoidPtr};
+use crate::objc::{nil, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 pub type CFReadStreamRef = CFTypeRef;
@@ -281,12 +279,18 @@ pub const CONSTANTS: ConstantExports = &[
 
 // MARK: - ObjC backing classes
 
+#[derive(Clone)]
+struct CFReadStreamHttpResponse {
+    status_code: u16,
+    headers: Vec<(String, String)>,
+}
+
 #[derive(Default)]
 struct CFReadStreamHostObject {
     status: CFStreamStatus,
     offset: usize,
     data: Vec<u8>,
-    buffer: Option<MutPtr<u8>>,
+    http_response: Option<CFReadStreamHttpResponse>,
 }
 impl HostObject for CFReadStreamHostObject {}
 
@@ -294,9 +298,6 @@ impl HostObject for CFReadStreamHostObject {}
 struct CFWriteStreamHostObject {
     status: CFStreamStatus,
     data: Vec<u8>,
-    file_path: Option<String>,
-    append: bool,
-    offset: usize,
 }
 impl HostObject for CFWriteStreamHostObject {}
 
@@ -306,10 +307,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CFReadStream: NSObject
 - (())dealloc {
-    let buffer = env.objc.borrow_mut::<CFReadStreamHostObject>(this).buffer.take();
-    if let Some(buffer) = buffer {
-        env.mem.free(buffer.cast());
-    }
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -334,10 +331,26 @@ fn alloc_read_stream(env: &mut Environment) -> CFReadStreamRef {
             status: kCFStreamStatusNotOpen,
             offset: 0,
             data: Vec::new(),
-            buffer: None,
+            http_response: None,
         }),
         &mut env.mem,
     )
+}
+
+pub(crate) fn create_read_stream_with_http_response(
+    env: &mut Environment,
+    status_code: u16,
+    headers: Vec<(String, String)>,
+    data: Vec<u8>,
+) -> CFReadStreamRef {
+    let stream = alloc_read_stream(env);
+    let host = env.objc.borrow_mut::<CFReadStreamHostObject>(stream);
+    host.data = data;
+    host.http_response = Some(CFReadStreamHttpResponse {
+        status_code,
+        headers,
+    });
+    stream
 }
 
 fn alloc_write_stream(env: &mut Environment) -> CFWriteStreamRef {
@@ -349,9 +362,6 @@ fn alloc_write_stream(env: &mut Environment) -> CFWriteStreamRef {
         Box::new(CFWriteStreamHostObject {
             status: kCFStreamStatusNotOpen,
             data: Vec::new(),
-            file_path: None,
-            append: false,
-            offset: 0,
         }),
         &mut env.mem,
     )
@@ -389,70 +399,30 @@ pub fn CFWriteStreamRelease(env: &mut Environment, stream: CFWriteStreamRef) {
 fn CFReadStreamCreateWithBytesNoCopy(
     env: &mut Environment,
     _allocator: CFAllocatorRef,
-    bytes: ConstPtr<u8>,
-    length: i32,
+    _bytes: ConstPtr<u8>,
+    _length: i32,
     _bytes_deallocator: CFAllocatorRef,
 ) -> CFReadStreamRef {
-    if length < 0 || (length > 0 && bytes.is_null()) {
-        log!("CFReadStreamCreateWithBytesNoCopy: invalid byte buffer");
-        return nil;
-    }
-
-    let data = if length == 0 {
-        Vec::new()
-    } else {
-        env.mem.bytes_at(bytes, length as u32).to_vec()
-    };
-    let stream = alloc_read_stream(env);
-    env.objc.borrow_mut::<CFReadStreamHostObject>(stream).data = data;
-    stream
+    log!("CFReadStreamCreateWithBytesNoCopy: stubbed");
+    alloc_read_stream(env)
 }
 
 fn CFReadStreamCreateWithFile(
     env: &mut Environment,
     _allocator: CFAllocatorRef,
-    file_url: CFTypeRef, // CFURLRef
+    _file_url: CFTypeRef, // CFURLRef
 ) -> CFReadStreamRef {
-    if file_url.is_null() {
-        return nil;
-    }
-
-    let path_string = CFURLCopyFileSystemPath(env, file_url, kCFURLPOSIXPathStyle);
-    if path_string.is_null() {
-        return nil;
-    }
-    let path = ns_string::to_rust_string(env, path_string).into_owned();
-    CFRelease(env, path_string);
-
-    let Ok(data) = env.fs.read(GuestPath::new(&path)) else {
-        log_dbg!("CFReadStreamCreateWithFile: unable to read {:?}", path);
-        return nil;
-    };
-
-    let stream = alloc_read_stream(env);
-    env.objc.borrow_mut::<CFReadStreamHostObject>(stream).data = data;
-    stream
+    log_dbg!("CFReadStreamCreateWithFile: stubbed");
+    alloc_read_stream(env)
 }
 
 fn CFWriteStreamCreateWithFile(
     env: &mut Environment,
     _allocator: CFAllocatorRef,
-    file_url: CFTypeRef,
+    _file_url: CFTypeRef, // CFURLRef
 ) -> CFWriteStreamRef {
-    if file_url.is_null() {
-        return nil;
-    }
-    let path_string = CFURLCopyFileSystemPath(env, file_url, kCFURLPOSIXPathStyle);
-    if path_string.is_null() {
-        return nil;
-    }
-    let path = ns_string::to_rust_string(env, path_string).into_owned();
-    CFRelease(env, path_string);
-    let stream = alloc_write_stream(env);
-    env.objc
-        .borrow_mut::<CFWriteStreamHostObject>(stream)
-        .file_path = Some(path);
-    stream
+    log_dbg!("CFWriteStreamCreateWithFile: stubbed");
+    alloc_write_stream(env)
 }
 
 fn CFWriteStreamCreateWithAllocatedBuffers(
@@ -543,38 +513,6 @@ fn CFReadStreamOpen(env: &mut Environment, stream: CFReadStreamRef) -> bool {
     true
 }
 
-// MARK: - CFNetwork bridge (real host objects instead of dummy handles)
-
-/// Allocate a `_touchHLE_CFReadStream` for CFNetwork's dummy handle.
-pub(crate) fn alloc_read_stream_for_cf_network(env: &mut Environment) -> u32 {
-    alloc_read_stream(env).to_bits() as _
-}
-
-pub(crate) fn cf_network_read_stream_open(env: &mut Environment, stream: u32) -> bool {
-    CFReadStreamOpen(env, Ptr::from_bits(stream as _))
-}
-
-pub(crate) fn cf_network_read_stream_has_bytes_available(
-    env: &mut Environment,
-    stream: u32,
-) -> bool {
-    // No real networking: report "no bytes" so app polling loops terminate.
-    CFReadStreamHasBytesAvailable(env, Ptr::from_bits(stream as _))
-}
-
-pub(crate) fn cf_network_read_stream_read(
-    env: &mut Environment,
-    stream: u32,
-    buffer: MutPtr<u8>,
-    buffer_length: i32,
-) -> i32 {
-    CFReadStreamRead(env, Ptr::from_bits(stream as _), buffer, buffer_length)
-}
-
-pub(crate) fn cf_network_read_stream_close(env: &mut Environment, stream: u32) {
-    CFReadStreamClose(env, Ptr::from_bits(stream as _))
-}
-
 fn CFReadStreamClose(env: &mut Environment, stream: CFReadStreamRef) {
     if stream.is_null() {
         return;
@@ -587,19 +525,9 @@ fn CFWriteStreamOpen(env: &mut Environment, stream: CFWriteStreamRef) -> bool {
     if stream.is_null() {
         return false;
     }
-
-    let (path, append) = {
-        let host = env.objc.borrow::<CFWriteStreamHostObject>(stream);
-        (host.file_path.clone(), host.append)
-    };
-    let initial_data = match path.as_deref() {
-        Some(path) if append => env.fs.read(GuestPath::new(path)).unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
-    host.data = initial_data;
-    host.offset = host.data.len();
-    host.status = kCFStreamStatusOpen;
+    env.objc
+        .borrow_mut::<CFWriteStreamHostObject>(stream)
+        .status = kCFStreamStatusOpen;
     true
 }
 
@@ -669,48 +597,12 @@ fn CFReadStreamRead(
 }
 
 fn CFReadStreamGetBuffer(
-    env: &mut Environment,
-    stream: CFReadStreamRef,
-    max_bytes_to_read: i32,
-    num_bytes_read: MutPtr<i32>,
+    _env: &mut Environment,
+    _stream: CFReadStreamRef,
+    _max_bytes_to_read: i32,
+    _num_bytes_read: MutPtr<i32>,
 ) -> ConstPtr<u8> {
-    if stream.is_null() || max_bytes_to_read < 0 {
-        if !num_bytes_read.is_null() {
-            env.mem.write(num_bytes_read, 0);
-        }
-        return ConstPtr::null();
-    }
-
-    let (data, old_buffer) = {
-        let host = env.objc.borrow_mut::<CFReadStreamHostObject>(stream);
-        if host.status != kCFStreamStatusOpen && host.status != kCFStreamStatusReading {
-            if !num_bytes_read.is_null() {
-                env.mem.write(num_bytes_read, 0);
-            }
-            return ConstPtr::null();
-        }
-        let remaining = host.data.len().saturating_sub(host.offset);
-        let available = remaining.min(max_bytes_to_read as usize);
-        let data = host.data[host.offset..host.offset + available].to_vec();
-        (data, host.buffer.take())
-    };
-
-    if let Some(old_buffer) = old_buffer {
-        env.mem.free(old_buffer.cast());
-    }
-    if !num_bytes_read.is_null() {
-        env.mem.write(num_bytes_read, data.len() as i32);
-    }
-    if data.is_empty() {
-        return ConstPtr::null();
-    }
-
-    let buffer: MutPtr<u8> = env.mem.alloc(data.len() as u32).cast();
-    env.mem
-        .bytes_at_mut(buffer, data.len() as u32)
-        .copy_from_slice(&data);
-    env.objc.borrow_mut::<CFReadStreamHostObject>(stream).buffer = Some(buffer);
-    buffer.cast_const()
+    ConstPtr::null()
 }
 
 fn CFReadStreamHasBytesAvailable(env: &mut Environment, stream: CFReadStreamRef) -> bool {
@@ -730,24 +622,12 @@ fn CFWriteStreamWrite(
     if stream.is_null() || buffer.is_null() || buffer_length < 0 {
         return -1;
     }
-    let bytes = env.mem.bytes_at(buffer, buffer_length as u32).to_vec();
-    let (path, mut data, offset) = {
-        let host = env.objc.borrow::<CFWriteStreamHostObject>(stream);
-        if host.status != kCFStreamStatusOpen && host.status != kCFStreamStatusWriting {
-            return -1;
-        }
-        (host.file_path.clone(), host.data.clone(), host.offset)
-    };
-    data.extend_from_slice(&bytes);
-    if let Some(path) = path {
-        if env.fs.write(GuestPath::new(&path), &data).is_err() {
-            return -1;
-        }
-    }
     let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
-    host.data = data;
-    host.offset = offset.saturating_add(bytes.len());
-    host.status = kCFStreamStatusWriting;
+    if host.status != kCFStreamStatusOpen && host.status != kCFStreamStatusWriting {
+        return -1;
+    }
+    let bytes = env.mem.bytes_at(buffer, buffer_length as u32);
+    host.data.extend_from_slice(bytes);
     buffer_length
 }
 
@@ -762,11 +642,30 @@ fn CFWriteStreamCanAcceptBytes(env: &mut Environment, stream: CFWriteStreamRef) 
 // MARK: - Properties
 
 fn CFReadStreamCopyProperty(
-    _env: &mut Environment,
-    _stream: CFReadStreamRef,
-    _property_name: CFStringRef,
+    env: &mut Environment,
+    stream: CFReadStreamRef,
+    property_name: CFStringRef,
 ) -> CFTypeRef {
-    nil
+    if stream.is_null() || property_name.is_null() {
+        return nil;
+    }
+    let property_name = ns_string::to_rust_string(env, property_name).into_owned();
+    if property_name != "kCFStreamPropertyHTTPResponseHeader" {
+        return nil;
+    }
+    let response = env
+        .objc
+        .borrow::<CFReadStreamHostObject>(stream)
+        .http_response
+        .clone();
+    match response {
+        Some(response) => crate::frameworks::cf_http_message::create_response_message(
+            env,
+            response.status_code,
+            response.headers,
+        ),
+        None => nil,
+    }
 }
 
 fn CFReadStreamSetProperty(
@@ -788,23 +687,13 @@ fn CFWriteStreamCopyProperty(
 }
 
 fn CFWriteStreamSetProperty(
-    env: &mut Environment,
-    stream: CFWriteStreamRef,
-    property_name: CFStringRef,
-    property_value: CFTypeRef,
+    _env: &mut Environment,
+    _stream: CFWriteStreamRef,
+    _property_name: CFStringRef,
+    _property_value: CFTypeRef,
 ) -> bool {
-    if stream.is_null() || property_name.is_null() || property_value.is_null() {
-        return false;
-    }
-    let name = ns_string::to_rust_string(env, property_name);
-    if name.as_ref() != kCFStreamPropertyAppendToFile {
-        return false;
-    }
-    let append = msg![env; property_value boolValue];
-    env.objc
-        .borrow_mut::<CFWriteStreamHostObject>(stream)
-        .append = append;
-    true
+    log_dbg!("CFWriteStreamSetProperty: stubbed -> false");
+    false
 }
 
 // MARK: - Client / Run loop scheduling
